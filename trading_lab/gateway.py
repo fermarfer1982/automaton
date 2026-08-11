@@ -71,6 +71,17 @@ class MT5Gateway:
         # Serializing the whole decision prevents duplicate races and interleaved MT5 calls.
         self._submit_lock = threading.Lock()
 
+    def execution_control_state(self) -> dict[str, object]:
+        if self._mode is not TradingMode.DEMO_EXECUTION:
+            return {"trading_enabled": False, "kill_switch": "NOT_APPLICABLE"}
+        decision = self._execution_authorization.evaluate()
+        return {
+            "trading_enabled": decision.allowed,
+            "kill_switch": (
+                "ENGAGED" if decision.code == "KILL_SWITCH_ENGAGED" else "CLEAR"
+            ),
+        }
+
     @staticmethod
     def _management_response(
         *,

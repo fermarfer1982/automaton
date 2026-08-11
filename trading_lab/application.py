@@ -351,6 +351,11 @@ class GatewayApplication:
     def status(self) -> dict[str, Any]:
         health = self.health()
         daily = self.daily_stats(audit_event=False)
+        execution_control = (
+            self._gateway.execution_control_state()
+            if self._gateway is not None
+            else {"trading_enabled": False, "kill_switch": "UNKNOWN"}
+        )
         last_decision = (
             self._research_store.latest_agent_decision()
             if self._research_store is not None else None
@@ -364,8 +369,8 @@ class GatewayApplication:
             "connected": health["account_guard"]["allowed"],
             "account_allowed": health["account_guard"]["allowed"],
             "demo_verified": health["account_guard"]["allowed"],
-            "trading_enabled": False,
-            "kill_switch": "UNKNOWN" if self._mode is TradingMode.DEMO_EXECUTION else "NOT_APPLICABLE",
+            "trading_enabled": execution_control["trading_enabled"],
+            "kill_switch": execution_control["kill_switch"],
             "open_positions": health["exposure"]["position_count"],
             "daily_pnl": daily["realized_pnl"],
             "daily_r": daily["daily_r"],

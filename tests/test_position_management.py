@@ -96,6 +96,10 @@ class PositionManagementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             gateway, adapter, _, _ = self.build(Path(temporary), TradingMode.DEMO_EXECUTION)
             adapter.open_positions = [self.owned_position(magic=999)]
+            self.assertEqual(
+                {"trading_enabled": True, "kill_switch": "CLEAR"},
+                gateway.execution_control_state(),
+            )
             rejected = gateway.manage_position("CLOSE", {"ticket": 77, "reason": "exit"})
             self.assertIn("POSITION_NOT_OWNED", rejected["failed_codes"])
             self.assertNotIn("order_check", adapter.calls)
@@ -128,6 +132,7 @@ class PositionManagementTests(unittest.TestCase):
             self.assertNotIn("order_check", adapter.calls)
 
             (root / "KILL_SWITCH").write_text("HALT\n", encoding="ascii")
+            self.assertEqual("ENGAGED", gateway.execution_control_state()["kill_switch"])
             adapter.calls.clear()
             allowed = gateway.manage_position("CLOSE", {"ticket": 77, "reason": "exit"})
             self.assertEqual("EXECUTED", allowed["status"])
