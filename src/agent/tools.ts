@@ -37,10 +37,10 @@ const SANDBOX_HOME = "/root";
 function confinePathToSandbox(filePath: string): string | { error: string } {
   // Resolve ~ to SANDBOX_HOME
   const expanded = filePath.startsWith("~")
-    ? nodePath.join(SANDBOX_HOME, filePath.slice(1))
+    ? nodePath.posix.join(SANDBOX_HOME, filePath.slice(1))
     : filePath;
   // Resolve to absolute (relative paths resolve against SANDBOX_HOME)
-  const resolved = nodePath.resolve(SANDBOX_HOME, expanded);
+  const resolved = nodePath.posix.resolve(SANDBOX_HOME, expanded);
   // Ensure the resolved path is within the sandbox home
   if (resolved !== SANDBOX_HOME && !resolved.startsWith(SANDBOX_HOME + "/")) {
     return {

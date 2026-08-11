@@ -67,6 +67,11 @@ describe("estimateTokens", () => {
   it("handles empty string as zero tokens", () => {
     expect(estimateTokens("")).toBe(0);
   });
+
+  it("uses a conservative bounded estimate for oversized input", () => {
+    const oversized = "x".repeat(500_000);
+    expect(estimateTokens(oversized)).toBe(oversized.length);
+  });
 });
 
 // ─── truncateToolResult ────────────────────────────────────────

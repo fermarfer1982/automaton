@@ -19,13 +19,21 @@ import {
 } from "./mocks.js";
 import type { AutomatonDatabase, AgentTurn, AgentState } from "../types.js";
 
+vi.mock("../registry/discovery.js", () => ({
+  discoverAgents: vi.fn(async () => []),
+  searchAgents: vi.fn(async () => []),
+}));
+
 describe("Agent Loop", () => {
   let db: AutomatonDatabase;
   let conway: MockConwayClient;
   let identity: ReturnType<typeof createTestIdentity>;
   let config: ReturnType<typeof createTestConfig>;
+  let originalRuntimeProfile: string | undefined;
 
   beforeEach(() => {
+    originalRuntimeProfile = process.env.AUTOMATON_RUNTIME_PROFILE;
+    process.env.AUTOMATON_RUNTIME_PROFILE = "upstream";
     db = createTestDb();
     conway = new MockConwayClient();
     identity = createTestIdentity();
@@ -33,6 +41,8 @@ describe("Agent Loop", () => {
   });
 
   afterEach(() => {
+    if (originalRuntimeProfile === undefined) delete process.env.AUTOMATON_RUNTIME_PROFILE;
+    else process.env.AUTOMATON_RUNTIME_PROFILE = originalRuntimeProfile;
     vi.restoreAllMocks();
     db.close();
   });
@@ -708,7 +718,7 @@ describe("Agent Loop", () => {
     expect(enforcementTurn).toBeUndefined();
   });
 
-  it("discover_agents turns are retained in context (not classified as idle)", { timeout: 180_000 }, async () => {
+  it("discover_agents turns are retained in context (not classified as idle)", async () => {
     // A turn with only discover_agents should NOT trigger maintenance loop detection
     // because discover_agents is no longer in IDLE_ONLY_TOOLS
     function discoverResponse(uid: string): ReturnType<typeof toolCallResponse> {

@@ -19,6 +19,7 @@ import { createTokenCounter } from "../memory/context-manager.js";
 
 const MAX_CONTEXT_TURNS = 20;
 const SUMMARY_THRESHOLD = 15;
+const MAX_EXACT_TOKEN_COUNT_CHARS = 4_096;
 
 let tokenCounter: ReturnType<typeof createTokenCounter> | null = null;
 
@@ -36,6 +37,13 @@ export { DEFAULT_TOKEN_BUDGET };
 export function estimateTokens(text: string): number {
   const content = text ?? "";
   const legacyEstimate = Math.ceil(content.length / 4);
+  // Exact BPE tokenization can become CPU-bound on very large or adversarial
+  // repeated inputs. Above this bound, count every character as a token. This
+  // deliberately overestimates common text and therefore fails closed on the
+  // context budget while keeping the work constant-time.
+  if (content.length > MAX_EXACT_TOKEN_COUNT_CHARS) {
+    return content.length;
+  }
   try {
     if (!tokenCounter) {
       tokenCounter = createTokenCounter();
