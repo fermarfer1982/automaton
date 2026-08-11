@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
-from trading_lab.domain import OpenAction, SemanticTradeRequest
+from trading_lab.config import security_config_hash
+from trading_lab.domain import OpenAction, OrderCheckResult, SemanticTradeRequest, TradingMode
 from trading_lab.factory import build_application
+from trading_lab.research_store import ResearchStore
 from tests.fakes import FakeMT5Adapter
 from tests.test_readiness import security_config
 
@@ -84,6 +88,34 @@ class SemanticProposalTests(unittest.TestCase):
             self.assertEqual("REJECTED_RISK", result["status"])
             self.assertIn("DENIED_RISK_LIMIT", result["failed_codes"])
             self.assertNotIn("order_check", adapter.calls)
+
+    def test_execution_failure_has_distinct_durable_lifecycle_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            adapter = FakeMT5Adapter()
+            adapter.order_check_result = OrderCheckResult(False, 10030, "invalid")
+            config = replace(
+                security_config(root), trading_mode=TradingMode.DEMO_EXECUTION
+            )
+            config.demo_authorization_path.parent.mkdir(parents=True, exist_ok=True)
+            config.demo_authorization_path.write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "authorization": "ALLOW_DEMO_EXECUTION",
+                    "authorized_account": config.authorized_account,
+                    "authorized_server": config.authorized_server,
+                    "config_sha256": security_config_hash(config),
+                    "readiness_sha256": "a" * 64,
+                }),
+                encoding="utf-8",
+            )
+            app = build_application(config, adapter, runtime_identity_verified=True)
+            result = app.propose_semantic(semantic_request())
+            self.assertEqual("REJECTED", result["status"])
+            self.assertIn("ORDER_CHECK_FAILED", result["failed_codes"])
+            lifecycle = ResearchStore(config.research_db_path).latest_lifecycle_event()
+            self.assertEqual("EXECUTION_FAILED", lifecycle["state"])
+            self.assertNotIn("order_send", adapter.calls)
 
 
 if __name__ == "__main__":

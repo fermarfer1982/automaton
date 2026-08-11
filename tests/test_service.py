@@ -107,6 +107,8 @@ class GatewayApplicationTests(unittest.TestCase):
             self.assertNotIn("terminal64", sanitized)
             self.assertIn("asia_range", market)
             self.assertEqual(0.0, status["daily_r"])
+            self.assertIn("tick_time_utc", status["last_market_data"])
+            self.assertIsNone(status["last_execution"])
             self.assertNotIn("order_check", adapter.calls)
             self.assertNotIn("order_send", adapter.calls)
 

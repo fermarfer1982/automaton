@@ -51,6 +51,7 @@ class MarketAnalysisTests(unittest.TestCase):
         self.assertTrue(result["complete"])
         self.assertEqual(107.0, result["high"])
         self.assertEqual(92.0, result["low"])
+        self.assertEqual(15.0, result["range"])
 
 
 if __name__ == "__main__":

@@ -55,6 +55,12 @@ class TradeResultRecord:
     primary_session: str | None = None
     active_sessions: str = "[]"
     data_quality: str = "UNKNOWN"
+    confidence: float = 0.0
+    exit_session: str = "UNKNOWN"
+    exit_active_sessions: str = "[]"
+    tp_distance_points: float | None = None
+    volatility_regime: str = "UNCLASSIFIED"
+    agent_version: str = "trading-profile-v1"
 
 
 @dataclass(frozen=True)
@@ -139,6 +145,18 @@ CREATE TABLE IF NOT EXISTS trade_results (
 );
 CREATE INDEX IF NOT EXISTS idx_trade_results_strategy
   ON trade_results(strategy_id, strategy_version, closed_at);
+CREATE TRIGGER IF NOT EXISTS trade_results_no_update
+BEFORE UPDATE ON trade_results
+BEGIN SELECT RAISE(ABORT, 'trade results are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trade_results_no_delete
+BEFORE DELETE ON trade_results
+BEGIN SELECT RAISE(ABORT, 'trade results are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS hypotheses_no_update
+BEFORE UPDATE ON hypotheses
+BEGIN SELECT RAISE(ABORT, 'hypotheses are immutable; create a new version'); END;
+CREATE TRIGGER IF NOT EXISTS hypotheses_no_delete
+BEFORE DELETE ON hypotheses
+BEGIN SELECT RAISE(ABORT, 'hypotheses are append-only'); END;
 CREATE TABLE IF NOT EXISTS paper_positions (
   proposal_id TEXT PRIMARY KEY,
   paper_trade_id TEXT NOT NULL UNIQUE,
@@ -325,6 +343,12 @@ class ResearchStore:
             "duration_seconds": "REAL NOT NULL DEFAULT 0",
             "weekday_utc": "INTEGER NOT NULL DEFAULT 0",
             "hour_utc": "INTEGER NOT NULL DEFAULT 0",
+            "confidence": "REAL NOT NULL DEFAULT 0",
+            "exit_session": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+            "exit_active_sessions": "TEXT NOT NULL DEFAULT '[]'",
+            "tp_distance_points": "REAL",
+            "volatility_regime": "TEXT NOT NULL DEFAULT 'UNCLASSIFIED'",
+            "agent_version": "TEXT NOT NULL DEFAULT 'trading-profile-v1'",
         }
         for name, declaration in additions.items():
             if name not in trade_columns:
@@ -342,6 +366,30 @@ class ResearchStore:
         )
         connection.execute(
             "INSERT OR IGNORE INTO research_schema(version) VALUES (7)"
+        )
+        proposal_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(proposals)")
+        }
+        proposal_additions = {
+            "confidence": "REAL NOT NULL DEFAULT 0",
+            "timeframe": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+            "active_sessions": "TEXT NOT NULL DEFAULT '[]'",
+            "atr_at_entry": "REAL",
+            "entry_spread_points": "REAL",
+            "point_at_entry": "REAL",
+            "stop_distance_points": "REAL",
+            "initial_reward_risk": "REAL",
+            "volatility_regime": "TEXT NOT NULL DEFAULT 'UNCLASSIFIED'",
+            "data_quality": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+            "agent_version": "TEXT NOT NULL DEFAULT 'trading-profile-v1'",
+        }
+        for name, declaration in proposal_additions.items():
+            if name not in proposal_columns:
+                connection.execute(
+                    f"ALTER TABLE proposals ADD COLUMN {name} {declaration}"
+                )
+        connection.execute(
+            "INSERT OR IGNORE INTO research_schema(version) VALUES (8)"
         )
 
     def _connect(self) -> sqlite3.Connection:
@@ -373,21 +421,34 @@ class ResearchStore:
         with self._lock, closing(self._connect()) as connection:
             connection.execute(
                 """
-                INSERT INTO hypotheses(hypothesis_id, thesis, created_at, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(hypothesis_id) DO UPDATE SET
-                  thesis=excluded.thesis,
-                  updated_at=excluded.updated_at
+                INSERT OR IGNORE INTO hypotheses(
+                  hypothesis_id, thesis, created_at, updated_at
+                ) VALUES (?, ?, ?, ?)
                 """,
                 (proposal.hypothesis_id, proposal.thesis, now, now),
             )
+            existing_hypothesis = connection.execute(
+                "SELECT thesis FROM hypotheses WHERE hypothesis_id = ?",
+                (proposal.hypothesis_id,),
+            ).fetchone()
+            if (
+                existing_hypothesis is None
+                or str(existing_hypothesis["thesis"]) != proposal.thesis
+            ):
+                raise ValueError(
+                    "Hypothesis IDs are immutable; create a new hypothesis version"
+                )
             connection.execute(
                 """
                 INSERT INTO proposals(
                   proposal_id, hypothesis_id, strategy_id, setup_id, strategy_version,
                   session, market_regime, symbol, side, volume, stop_loss, take_profit,
-                  mode, status, fingerprint, estimated_risk_amount, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  mode, status, fingerprint, estimated_risk_amount, created_at, updated_at,
+                  confidence, timeframe, active_sessions, atr_at_entry,
+                  entry_spread_points, point_at_entry, stop_distance_points,
+                  initial_reward_risk, volatility_regime, data_quality, agent_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(proposal_id) DO UPDATE SET
                   status=excluded.status,
                   estimated_risk_amount=excluded.estimated_risk_amount,
@@ -399,6 +460,11 @@ class ResearchStore:
                     proposal.market_regime, proposal.symbol, proposal.side.value,
                     proposal.volume, proposal.stop_loss, proposal.take_profit,
                     mode.value, status, fingerprint, estimated_risk_amount, now, now,
+                    proposal.confidence, proposal.timeframe, proposal.active_sessions,
+                    proposal.atr_at_entry, proposal.entry_spread_points,
+                    proposal.point_at_entry, proposal.stop_distance_points,
+                    proposal.initial_reward_risk, proposal.volatility_regime,
+                    proposal.data_quality, proposal.agent_version,
                 ),
             )
             connection.commit()
@@ -540,6 +606,20 @@ class ResearchStore:
             ).fetchone()
         return dict(row) if row else None
 
+    def latest_execution_event(self) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT event_id, proposal_id, state, created_at_utc
+                FROM lifecycle_events
+                WHERE state IN (
+                  'EXECUTED', 'EXECUTION_FAILED', 'EXECUTION_UNCERTAIN', 'CLOSED'
+                )
+                ORDER BY created_at_utc DESC, event_id DESC LIMIT 1
+                """
+            ).fetchone()
+        return dict(row) if row else None
+
     def daily_research_summary(self, day: date | None = None) -> dict[str, float | int]:
         target = (day or datetime.now(UTC).date()).isoformat()
         with closing(self._connect()) as connection:
@@ -656,6 +736,7 @@ class ResearchStore:
             "commission": record.commission,
             "swap": record.swap,
             "fee": record.fee,
+            "confidence": record.confidence,
         })
         optional = {
             "entry_spread_points": record.entry_spread_points,
@@ -663,6 +744,7 @@ class ResearchStore:
             "atr_at_entry": record.atr_at_entry,
             "stop_distance_points": record.stop_distance_points,
             "initial_reward_risk": record.initial_reward_risk,
+            "tp_distance_points": record.tp_distance_points,
         }
         self._validate_finite({key: value for key, value in optional.items() if value is not None})
 
@@ -679,9 +761,12 @@ class ResearchStore:
               exit_spread_points, timeframe, atr_at_entry, stop_distance_points,
               initial_reward_risk, primary_session, active_sessions, data_quality,
               duration_seconds, weekday_utc, hour_utc
+              , confidence, exit_session, exit_active_sessions,
+              tp_distance_points, volatility_regime, agent_version
             ) VALUES (
               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+              ?, ?, ?, ?, ?, ?
             )
             """,
             (
@@ -701,6 +786,9 @@ class ResearchStore:
                 max(0.0, (record.closed_at - record.opened_at).total_seconds()),
                 record.closed_at.astimezone(UTC).weekday(),
                 record.closed_at.astimezone(UTC).hour,
+                record.confidence, record.exit_session, record.exit_active_sessions,
+                record.tp_distance_points, record.volatility_regime,
+                record.agent_version,
             ),
         )
 
@@ -769,7 +857,11 @@ class ResearchStore:
                 """
                 SELECT pp.*, p.hypothesis_id, p.strategy_id, p.setup_id,
                        p.strategy_version, p.session, p.market_regime,
-                       p.symbol, p.side
+                       p.symbol, p.side, p.confidence, p.timeframe,
+                       p.active_sessions, p.atr_at_entry, p.entry_spread_points,
+                       p.point_at_entry, p.stop_distance_points,
+                       p.initial_reward_risk, p.volatility_regime,
+                       p.data_quality, p.agent_version
                 FROM paper_positions pp
                 JOIN proposals p ON p.proposal_id = pp.proposal_id
                 WHERE pp.status = 'OPEN'
@@ -949,6 +1041,7 @@ class ResearchStore:
             "direction": "side",
             "regime": "market_regime",
             "timeframe": "timeframe",
+            "volatility_regime": "volatility_regime",
         }
         output: list[dict[str, Any]] = []
         with closing(self._connect()) as connection:
@@ -1085,6 +1178,6 @@ class ResearchStore:
         try:
             with closing(self._connect()) as connection:
                 version = connection.execute("SELECT MAX(version) FROM research_schema").fetchone()[0]
-            return version == 7
+            return version == 8
         except sqlite3.Error:
             return False

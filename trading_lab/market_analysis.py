@@ -79,10 +79,9 @@ def utc_day_range(candles: list[CandleSnapshot], now: datetime) -> dict[str, flo
         item for item in candles
         if datetime.fromtimestamp(item.time_msc / 1000, UTC).date() == today
     ]
-    return {
-        "high": max((item.high for item in selected), default=None),
-        "low": min((item.low for item in selected), default=None),
-    }
+    high = max((item.high for item in selected), default=None)
+    low = min((item.low for item in selected), default=None)
+    return {"high": high, "low": low, "range": high - low if high is not None and low is not None else None}
 
 
 def asian_session_range(
@@ -108,10 +107,13 @@ def asian_session_range(
         timestamp = datetime.fromtimestamp(item.time_msc / 1000, UTC).astimezone(zone)
         if start <= timestamp < end and timestamp <= local_now:
             selected.append(item)
+    high = max((item.high for item in selected), default=None)
+    low = min((item.low for item in selected), default=None)
     return {
         "available": bool(selected),
-        "high": max((item.high for item in selected), default=None),
-        "low": min((item.low for item in selected), default=None),
+        "high": high,
+        "low": low,
+        "range": high - low if high is not None and low is not None else None,
         "start_utc": start.astimezone(UTC).isoformat(),
         "end_utc": end.astimezone(UTC).isoformat(),
         "complete": local_now >= end,

@@ -179,6 +179,17 @@ class TradeProposal:
     thesis: str
     session: str
     market_regime: str
+    confidence: float = 0.0
+    timeframe: str = "UNKNOWN"
+    active_sessions: str = "[]"
+    atr_at_entry: float | None = None
+    entry_spread_points: float | None = None
+    point_at_entry: float | None = None
+    stop_distance_points: float | None = None
+    initial_reward_risk: float | None = None
+    volatility_regime: str = "UNCLASSIFIED"
+    data_quality: str = "UNKNOWN"
+    agent_version: str = "trading-profile-v1"
 
 
 @dataclass(frozen=True)

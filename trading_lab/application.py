@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 from .account_guard import AccountGuard
 from .audit import HashChainAuditLog
 from .domain import OpenAction, SemanticTradeRequest, Side, TradingMode, TradeProposal
-from .market_analysis import asian_session_range, session_context, summarize_candles, utc_day_range
+from .market_analysis import asian_session_range, atr, session_context, summarize_candles, utc_day_range
 
 
 class GatewayApplication:
@@ -84,6 +84,9 @@ class GatewayApplication:
             "market_data": {
                 "available": market.visible and market.bid > 0 and market.ask >= market.bid and tick_fresh,
                 "symbol": market.symbol,
+                "tick_time_utc": datetime.fromtimestamp(
+                    market.tick_time_msc / 1000, UTC
+                ).isoformat(),
             },
             "exposure": {
                 "clear": exposure_clear,
@@ -361,7 +364,7 @@ class GatewayApplication:
             if self._research_store is not None else None
         )
         last_execution = (
-            self._research_store.latest_lifecycle_event()
+            self._research_store.latest_execution_event()
             if self._research_store is not None else None
         )
         response = {
@@ -397,12 +400,15 @@ class GatewayApplication:
 
     @staticmethod
     def _gateway_result_payload(result) -> dict[str, Any]:
+        failed_codes = list(result.failed_codes)
+        if result.execution is not None and result.execution.failed_code:
+            failed_codes.append(result.execution.failed_code)
         return {
             "status": result.status.value,
             "proposal_id": result.proposal_id,
             "mode": result.mode.value,
             "checks": [asdict(item) for item in result.checks],
-            "failed_codes": list(result.failed_codes),
+            "failed_codes": list(dict.fromkeys(failed_codes)),
             "estimated_risk_amount": result.estimated_risk_amount,
             "execution": asdict(result.execution) if result.execution else None,
         }
@@ -482,7 +488,16 @@ class GatewayApplication:
             self._research_store.complete_idempotency(request.idempotency_key, response)
             return response
 
-        session = session_context(datetime.now(UTC))["primary"]
+        context = session_context(datetime.now(UTC))
+        session = context["primary"]
+        context_candles = self._adapter.candles(request.symbol, request.timeframe, 15)
+        entry_atr = atr(context_candles)
+        entry_price = market.ask if side is Side.BUY else market.bid
+        stop_distance = abs(entry_price - request.stop_loss)
+        reward_risk = (
+            abs(request.take_profit - entry_price) / stop_distance
+            if request.take_profit is not None and stop_distance > 0 else None
+        )
         proposal = TradeProposal(
             proposal_id=proposal_id,
             hypothesis_id=request.hypothesis_id,
@@ -499,6 +514,18 @@ class GatewayApplication:
             thesis=request.reason.strip(),
             session=str(session),
             market_regime=request.market_regime,
+            confidence=request.confidence,
+            timeframe=request.timeframe,
+            active_sessions=json.dumps(context["active"], separators=(",", ":")),
+            atr_at_entry=entry_atr,
+            entry_spread_points=(market.ask - market.bid) / market.point,
+            point_at_entry=market.point,
+            stop_distance_points=stop_distance / market.point,
+            initial_reward_risk=reward_risk,
+            data_quality=(
+                "LIVE_TICK_AND_CLOSED_CANDLES" if entry_atr is not None
+                else "LIVE_TICK_ONLY"
+            ),
         )
         result = self._gateway.submit(proposal)
         response = {
@@ -511,7 +538,7 @@ class GatewayApplication:
         }
         lifecycle_payload = {
             "gateway_status": result.status.value,
-            "failed_codes": list(result.failed_codes),
+            "failed_codes": response["failed_codes"],
         }
         if result.status.value == "OBSERVED":
             self._research_store.append_lifecycle(
@@ -527,7 +554,7 @@ class GatewayApplication:
                 str(uuid4()), proposal_id, "EXECUTION_UNCERTAIN", lifecycle_payload
             )
         else:
-            failed = set(result.failed_codes)
+            failed = set(response["failed_codes"])
             market_codes = {
                 "MARKET_CLOSED", "MARKET_TICK_STALE", "SPREAD_TOO_WIDE",
                 "MARKET_DATA_INVALID", "SYMBOL_TRADE_MODE_FORBIDDEN",
@@ -536,8 +563,13 @@ class GatewayApplication:
                 "ACCOUNT_NOT_DEMO", "ACCOUNT_LOGIN_MISMATCH", "ACCOUNT_SERVER_MISMATCH",
                 "AUDIT_CHAIN_INVALID", "DEMO_EXECUTION_NOT_AUTHORIZED", "KILL_SWITCH_ENGAGED",
             }
+            execution_codes = {
+                "ORDER_CHECK_FAILED", "ORDER_SEND_FAILED", "PRE_SEND_GUARD_REJECTED",
+                "EXECUTION_AUTHORIZATION_REVOKED", "POST_EXECUTION_OUTCOME_AUDIT_FAILED",
+            }
             state = (
-                "REJECTED_SECURITY" if failed & security_codes
+                "EXECUTION_FAILED" if failed & execution_codes
+                else "REJECTED_SECURITY" if failed & security_codes
                 else "REJECTED_MARKET" if failed & market_codes
                 else "REJECTED_RISK"
             )

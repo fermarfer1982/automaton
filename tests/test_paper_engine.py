@@ -36,7 +36,14 @@ class PaperEngineTests(unittest.TestCase):
         self.assertEqual(1, len(self.store.list_open_paper_positions()))
 
     def test_updates_excursions_and_closes_take_profit(self) -> None:
-        item = proposal(take_profit=2404.0)
+        item = replace(
+            proposal(take_profit=2404.0),
+            confidence=0.72, timeframe="M1", active_sessions='["LONDON"]',
+            atr_at_entry=2.5, entry_spread_points=20.0,
+            point_at_entry=0.01, stop_distance_points=220.0,
+            initial_reward_risk=1.8, volatility_regime="NORMAL",
+            data_quality="LIVE_TICK_AND_CLOSED_CANDLES",
+        )
         self.engine.open(item, self.adapter.symbol, opened_at=self.opened_at)
         mid_market = replace(
             self.adapter.symbol, bid=2401.30, ask=2401.50,
@@ -55,6 +62,15 @@ class PaperEngineTests(unittest.TestCase):
         self.assertEqual(1, len(closed))
         self.assertAlmostEqual(2.0, closed[0].pnl)
         self.assertAlmostEqual(4.0 / 2.2, closed[0].r_multiple)
+        self.assertEqual(0.72, closed[0].confidence)
+        self.assertEqual("M1", closed[0].timeframe)
+        self.assertEqual(2.5, closed[0].atr_at_entry)
+        self.assertEqual(20.0, closed[0].entry_spread_points)
+        self.assertAlmostEqual(20.0, closed[0].exit_spread_points)
+        self.assertEqual(220.0, closed[0].stop_distance_points)
+        self.assertAlmostEqual(380.0, closed[0].tp_distance_points)
+        self.assertEqual("NORMAL", closed[0].volatility_regime)
+        self.assertEqual('["LONDON"]', closed[0].active_sessions)
         self.assertEqual([], self.store.list_open_paper_positions())
         metrics = self.store.strategy_metrics("emergent-research", "0.1.0")
         self.assertEqual(1, metrics.sample_size)

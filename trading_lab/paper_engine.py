@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 from datetime import datetime
 
 from .audit import HashChainAuditLog
 from .domain import PositionSnapshot, Side, SymbolSnapshot, TradingMode, TradeProposal
+from .market_analysis import session_context
 from .research_store import ResearchStore, TradeResultRecord
 
 
@@ -23,6 +25,66 @@ class PaperEngine:
             hashlib.sha256(proposal_id.encode("utf-8")).digest()[:7], "big"
         )
         return value or 1
+
+    @staticmethod
+    def _trade_result(
+        row: dict,
+        market: SymbolSnapshot,
+        at: datetime,
+        *,
+        exit_price: float,
+        pnl: float,
+        r_multiple: float,
+        mfe_r: float,
+        mae_r: float,
+    ) -> TradeResultRecord:
+        exit_context = session_context(at)
+        point = float(row["point_at_entry"] or market.point)
+        take_profit = row["take_profit"]
+        tp_distance = (
+            abs(float(take_profit) - float(row["entry_price"])) / point
+            if take_profit is not None and point > 0 else None
+        )
+        return TradeResultRecord(
+            trade_id=str(row["paper_trade_id"]),
+            proposal_id=str(row["proposal_id"]),
+            hypothesis_id=str(row["hypothesis_id"]),
+            strategy_id=str(row["strategy_id"]),
+            setup_id=str(row["setup_id"]),
+            strategy_version=str(row["strategy_version"]),
+            session=str(row["session"]),
+            market_regime=str(row["market_regime"]),
+            symbol=str(row["symbol"]),
+            side=Side(str(row["side"])),
+            volume=float(row["volume"]),
+            entry_price=float(row["entry_price"]),
+            exit_price=exit_price,
+            initial_stop_loss=float(row["initial_stop_loss"]),
+            opened_at=datetime.fromisoformat(str(row["opened_at"])),
+            closed_at=at,
+            pnl=pnl,
+            r_multiple=r_multiple,
+            mfe_r=mfe_r,
+            mae_r=mae_r,
+            gross_pnl=pnl,
+            entry_spread_points=row["entry_spread_points"],
+            exit_spread_points=(market.ask - market.bid) / market.point,
+            timeframe=str(row["timeframe"]),
+            atr_at_entry=row["atr_at_entry"],
+            stop_distance_points=row["stop_distance_points"],
+            initial_reward_risk=row["initial_reward_risk"],
+            primary_session=str(row["session"]),
+            active_sessions=str(row["active_sessions"]),
+            data_quality=str(row["data_quality"]),
+            confidence=float(row["confidence"]),
+            exit_session=str(exit_context["primary"]),
+            exit_active_sessions=json.dumps(
+                exit_context["active"], separators=(",", ":")
+            ),
+            tp_distance_points=tp_distance,
+            volatility_regime=str(row["volatility_regime"]),
+            agent_version=str(row["agent_version"]),
+        )
 
     def open(
         self,
@@ -152,27 +214,9 @@ class PaperEngine:
             if tick_size <= 0 or tick_value <= 0 or volume <= 0:
                 raise ValueError("Persisted paper economics are invalid")
             pnl = direction * (exit_price - entry_price) / tick_size * tick_value * volume
-            record = TradeResultRecord(
-                trade_id=str(row["paper_trade_id"]),
-                proposal_id=str(row["proposal_id"]),
-                hypothesis_id=str(row["hypothesis_id"]),
-                strategy_id=str(row["strategy_id"]),
-                setup_id=str(row["setup_id"]),
-                strategy_version=str(row["strategy_version"]),
-                session=str(row["session"]),
-                market_regime=str(row["market_regime"]),
-                symbol=str(row["symbol"]),
-                side=side,
-                volume=volume,
-                entry_price=entry_price,
-                exit_price=exit_price,
-                initial_stop_loss=initial_stop,
-                opened_at=datetime.fromisoformat(str(row["opened_at"])),
-                closed_at=at,
-                pnl=pnl,
-                r_multiple=current_r,
-                mfe_r=mfe_r,
-                mae_r=mae_r,
+            record = self._trade_result(
+                row, market, at, exit_price=exit_price, pnl=pnl,
+                r_multiple=current_r, mfe_r=mfe_r, mae_r=mae_r,
             )
             reason = "SL" if hit_stop else "TP"
             closing_payload = {
@@ -264,27 +308,9 @@ class PaperEngine:
             mfe_r = max(float(row["mfe_r"]), current_r, 0.0)
             mae_r = min(float(row["mae_r"]), current_r, 0.0)
             pnl = direction * (exit_price - entry_price) / tick_size * tick_value * volume
-            record = TradeResultRecord(
-                trade_id=str(row["paper_trade_id"]),
-                proposal_id=str(row["proposal_id"]),
-                hypothesis_id=str(row["hypothesis_id"]),
-                strategy_id=str(row["strategy_id"]),
-                setup_id=str(row["setup_id"]),
-                strategy_version=str(row["strategy_version"]),
-                session=str(row["session"]),
-                market_regime=str(row["market_regime"]),
-                symbol=str(row["symbol"]),
-                side=side,
-                volume=volume,
-                entry_price=entry_price,
-                exit_price=exit_price,
-                initial_stop_loss=initial_stop,
-                opened_at=datetime.fromisoformat(str(row["opened_at"])),
-                closed_at=at,
-                pnl=pnl,
-                r_multiple=current_r,
-                mfe_r=mfe_r,
-                mae_r=mae_r,
+            record = self._trade_result(
+                row, market, at, exit_price=exit_price, pnl=pnl,
+                r_multiple=current_r, mfe_r=mfe_r, mae_r=mae_r,
             )
             payload = {
                 "proposal_id": record.proposal_id,
