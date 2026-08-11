@@ -13,6 +13,8 @@ import nacl from "tweetnacl";
 import bs58 from "bs58";
 import fs from "fs";
 import path from "path";
+import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 import type { WalletData } from "../types.js";
 import type { ChainType } from "./chain.js";
 import { EvmChainIdentity, SolanaChainIdentity } from "./chain.js";
@@ -41,10 +43,23 @@ function createSolanaStubAccount(solanaAddress: string): PrivateKeyAccount {
   } as unknown as PrivateKeyAccount;
 }
 
-const AUTOMATON_DIR = path.join(
-  process.env.HOME || "/root",
-  ".automaton",
-);
+function resolveAutomatonDir(): string {
+  const configured = process.env.AUTOMATON_STATE_DIR;
+  const resolved = configured
+    ? path.resolve(configured)
+    : path.join(process.env.HOME || homedir(), ".automaton");
+  if (configured && !path.isAbsolute(configured)) {
+    throw new Error("AUTOMATON_STATE_DIR must be absolute");
+  }
+  const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+  const relative = path.relative(projectRoot, resolved);
+  if (configured && (relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative)))) {
+    throw new Error("AUTOMATON_STATE_DIR must remain outside the project workspace");
+  }
+  return resolved;
+}
+
+const AUTOMATON_DIR = resolveAutomatonDir();
 const WALLET_FILE = path.join(AUTOMATON_DIR, "wallet.json");
 
 export function getAutomatonDir(): string {

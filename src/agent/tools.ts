@@ -55,6 +55,10 @@ const EXTERNAL_SOURCE_TOOLS = new Set([
   "exec",
   "web_fetch",
   "check_social_inbox",
+  "trading_lab_status",
+  "observe_xauusd",
+  "review_trading_evidence",
+  "propose_xauusd_trade",
 ]);
 
 // ─── Self-Preservation Guard ───────────────────────────────────

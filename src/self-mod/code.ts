@@ -69,13 +69,31 @@ const PROTECTED_FILES: readonly string[] = Object.freeze([
   "skills/registry.js",
   // Configuration and identity
   "automaton.json",
+  "config.ts",
+  "config.js",
+  "identity/wallet.ts",
+  "identity/wallet.js",
   "package.json",
   "SOUL.md",
+  // Runtime entry and loop contain the trading-profile enforcement boundary
+  "index.ts",
+  "index.js",
+  "agent/loop.ts",
+  "agent/loop.js",
+  "agent/tools.ts",
+  "agent/tools.js",
+  "conway/inference.ts",
+  "conway/inference.js",
   // Policy engine (protect from self-modification)
   "agent/policy-engine.ts",
   "agent/policy-engine.js",
   "agent/policy-rules/index.ts",
   "agent/policy-rules/index.js",
+  // Trading laboratory security configuration examples
+  "trading.security.json",
+  "trading-lab-identity.json",
+  "trading-lab-runtime-status.json",
+  "scripts/Initialize-TradingLabAcl.ps1",
 ]);
 
 /**
@@ -91,6 +109,9 @@ const BLOCKED_DIRECTORY_PATTERNS: readonly string[] = Object.freeze([
   ".gcloud",
   ".kube",
   ".docker",
+  // The MT5 gateway, guards, risk, execution, audit, and Automaton adapter
+  "trading_lab",
+  "trading",
   "/etc/systemd",
   "/etc/passwd",
   "/etc/shadow",

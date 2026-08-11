@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "trading_mode": "OBSERVE_ONLY",
+  "authorized_account": 12345678,
+  "authorized_server": "REPLACE_WITH_EXACT_DEMO_SERVER",
+  "allowed_symbol": "XAUUSD",
+  "magic_number": 26081101,
+  "mt5_terminal_path": "C:\\Program Files\\MetaTrader 5\\terminal64.exe",
+  "audit_path": "C:\\ProgramData\\AutomatonMT5Lab\\data\\audit.jsonl",
+  "research_db_path": "C:\\ProgramData\\AutomatonMT5Lab\\data\\research.db",
+  "demo_authorization_path": "C:\\ProgramData\\AutomatonMT5Lab\\control\\demo.authorization",
+  "kill_switch_path": "C:\\ProgramData\\AutomatonMT5Lab\\control\\KILL_SWITCH",
+  "automaton_state_dir": "C:\\Users\\AutomatonLabAgent\\.automaton",
+  "gateway_windows_identity": "REPLACE_WITH_MACHINE\\AutomatonMT5Gateway",
+  "automaton_windows_identity": "REPLACE_WITH_MACHINE\\AutomatonLabAgent",
+  "risk": {
+    "max_risk_per_trade_fraction": 0.0025,
+    "max_volume": 0.1,
+    "max_spread_points": 30.0,
+    "max_open_positions": 1,
+    "max_symbol_exposure_lots": 0.1,
+    "max_daily_loss_fraction": 0.01,
+    "min_stop_distance_points": 20,
+    "duplicate_window_seconds": 300,
+    "max_tick_age_seconds": 5.0
+  }
+}

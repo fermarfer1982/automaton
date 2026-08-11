@@ -29,6 +29,8 @@ interface InferenceClientOptions {
   ollamaBaseUrl?: string;
   /** Optional registry lookup — if provided, used before name heuristics */
   getModelProvider?: (modelId: string) => string | undefined;
+  /** Force a direct non-Conway backend in a restricted runtime profile. */
+  forcedBackend?: Exclude<InferenceBackend, "conway">;
 }
 
 type InferenceBackend = "conway" | "openai" | "anthropic" | "ollama";
@@ -64,12 +66,12 @@ export function createInferenceClient(
     const model = opts?.model || currentModel;
     const tools = opts?.tools;
 
-    const backend = resolveInferenceBackend(model, {
-      openaiApiKey,
-      anthropicApiKey,
-      ollamaBaseUrl,
-      getModelProvider,
-    });
+    const backend = options.forcedBackend ?? resolveInferenceBackend(model, {
+        openaiApiKey,
+        anthropicApiKey,
+        ollamaBaseUrl,
+        getModelProvider,
+      });
 
     // Newer models (o-series, gpt-5.x, gpt-4.1) require max_completion_tokens.
     // Ollama always uses max_tokens.

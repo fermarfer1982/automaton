@@ -1,0 +1,3 @@
+--only-binary=:all:
+MetaTrader5==5.0.5735 \
+    --hash=sha256:b69765be2eece9f884b60b6d008c7608ad77d7bfc5fbfbb8c23e3e3bb8dc88ba

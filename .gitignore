@@ -10,4 +10,6 @@ dist
 *.tgz
 .automaton/wallet.json
 .automaton/state.db
+config/trading.security.json
+*.jsonl
 

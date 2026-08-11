@@ -6,15 +6,29 @@
 
 import fs from "fs";
 import path from "path";
+import { homedir } from "node:os";
 import type { AutomatonConfig, TreasuryPolicy, ModelStrategyConfig, SoulConfig } from "./types.js";
 import { DEFAULT_CONFIG, DEFAULT_TREASURY_POLICY, DEFAULT_MODEL_STRATEGY_CONFIG, DEFAULT_SOUL_CONFIG } from "./types.js";
 import { getAutomatonDir } from "./identity/wallet.js";
 import { loadApiKeyFromConfig } from "./identity/provision.js";
 import { createLogger } from "./observability/logger.js";
 import type { ChainType } from "./identity/chain.js";
+import { resolveRuntimeProfile } from "./trading/runtime-profile.js";
 
 const logger = createLogger("config");
 const CONFIG_FILENAME = "automaton.json";
+const TRADING_LAB_TREASURY_POLICY: TreasuryPolicy = {
+  maxSingleTransferCents: 0,
+  maxHourlyTransferCents: 0,
+  maxDailyTransferCents: 0,
+  minimumReserveCents: 0,
+  maxX402PaymentCents: 0,
+  x402AllowedDomains: [],
+  transferCooldownMs: 86_400_000,
+  maxTransfersPerTurn: 0,
+  maxInferenceDailyCents: 0,
+  requireConfirmationAboveCents: 0,
+};
 
 export function getConfigPath(): string {
   return path.join(getAutomatonDir(), CONFIG_FILENAME);
@@ -32,13 +46,18 @@ export function loadConfig(): AutomatonConfig | null {
 
   try {
     const raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-    const apiKey = raw.conwayApiKey || loadApiKeyFromConfig();
+    const runtimeProfile = resolveRuntimeProfile();
+    const apiKey = runtimeProfile === "trading_lab"
+      ? ""
+      : raw.conwayApiKey || loadApiKeyFromConfig();
 
     // Deep-merge treasury policy with defaults
-    const treasuryPolicy: TreasuryPolicy = {
-      ...DEFAULT_TREASURY_POLICY,
-      ...(raw.treasuryPolicy ?? {}),
-    };
+    const treasuryPolicy: TreasuryPolicy = runtimeProfile === "trading_lab"
+      ? { ...TRADING_LAB_TREASURY_POLICY }
+      : {
+          ...DEFAULT_TREASURY_POLICY,
+          ...(raw.treasuryPolicy ?? {}),
+        };
 
     // Validate all treasury values are positive numbers
     for (const [key, value] of Object.entries(treasuryPolicy)) {
@@ -69,6 +88,15 @@ export function loadConfig(): AutomatonConfig | null {
           ? raw.sandboxId.trim()
           : DEFAULT_CONFIG.sandboxId,
       conwayApiKey: apiKey,
+      openaiApiKey: runtimeProfile === "trading_lab" ? undefined : raw.openaiApiKey,
+      anthropicApiKey: runtimeProfile === "trading_lab" ? undefined : raw.anthropicApiKey,
+      registeredWithConway: runtimeProfile === "trading_lab" ? false : raw.registeredWithConway,
+      socialRelayUrl: runtimeProfile === "trading_lab"
+        ? undefined
+        : (raw.socialRelayUrl ?? DEFAULT_CONFIG.socialRelayUrl),
+      maxChildren: runtimeProfile === "trading_lab"
+        ? 0
+        : (raw.maxChildren ?? DEFAULT_CONFIG.maxChildren ?? 3),
       treasuryPolicy,
       modelStrategy,
       soulConfig,
@@ -106,7 +134,7 @@ export function saveConfig(config: AutomatonConfig): void {
  */
 export function resolvePath(p: string): string {
   if (p.startsWith("~")) {
-    return path.join(process.env.HOME || "/root", p.slice(1));
+    return path.join(process.env.HOME || homedir(), p.slice(1));
   }
   return p;
 }

@@ -6,6 +6,7 @@
  */
 
 import path from "node:path";
+import { homedir } from "node:os";
 import type {
   AutomatonIdentity,
   AutomatonConfig,
@@ -23,6 +24,10 @@ import type {
   SpendTrackerInterface,
   InputSource,
   ModelStrategyConfig,
+  InferenceResult,
+  InferenceToolDefinition,
+  ChatMessage,
+  ModelProvider,
 } from "../types.js";
 import { DEFAULT_MODEL_STRATEGY_CONFIG } from "../types.js";
 import type { PolicyEngine } from "./policy-engine.js";
@@ -65,6 +70,12 @@ import { createWorkerInferenceBridge } from "./worker-inference-bridge.js";
 import { ProviderRegistry } from "../inference/provider-registry.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
 import { isIdleOnlyTool } from "./idle-only-tools.js";
+import { createTradingTools } from "../trading/tools.js";
+import {
+  resolveRuntimeProfile,
+  selectRuntimeTools,
+  tradingLabSystemContract,
+} from "../trading/runtime-profile.js";
 
 const logger = createLogger("loop");
 const MAX_TOOL_CALLS_PER_TURN = 10;
@@ -96,9 +107,13 @@ export async function runAgentLoop(
   const { identity, config, db, conway, inference, social, skills, policyEngine, spendTracker, onStateChange, onTurnComplete, ollamaBaseUrl } =
     options;
 
+  const runtimeProfile = resolveRuntimeProfile();
   const builtinTools = createBuiltinTools(identity.sandboxId);
-  const installedTools = loadInstalledTools(db);
-  const tools = [...builtinTools, ...installedTools];
+  const installedTools = runtimeProfile === "upstream" ? loadInstalledTools(db) : [];
+  const tools = selectRuntimeTools(
+    [...builtinTools, ...installedTools, ...createTradingTools()],
+    runtimeProfile,
+  );
   const toolContext: ToolContext = {
     identity,
     config,
@@ -129,7 +144,7 @@ export async function runAgentLoop(
   let orchestrator: Orchestrator | undefined;
   let workerPool: LocalWorkerPool | undefined;
 
-  if (hasTable(db.raw, "goals")) {
+  if (runtimeProfile === "upstream" && hasTable(db.raw, "goals")) {
     try {
       planModeController = new PlanModeController(db.raw);
 
@@ -157,7 +172,7 @@ export async function runAgentLoop(
       }
 
       const providersPath = path.join(
-        process.env.HOME || process.cwd(),
+        process.env.HOME || homedir(),
         ".automaton",
         "inference-providers.json",
       );
@@ -358,7 +373,9 @@ export async function runAgentLoop(
   onStateChange?.("waking");
 
   // Get financial state
-  let financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
+  let financial = await getRuntimeFinancialState(
+    runtimeProfile, conway, identity.address, db, config.chainType || identity.chainType || "evm",
+  );
 
   // Check if this is the first run
   const isFirstRun = db.getTurnCount() === 0;
@@ -426,7 +443,9 @@ export async function runAgentLoop(
       }
 
       // Refresh financial state periodically
-      financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
+      financial = await getRuntimeFinancialState(
+        runtimeProfile, conway, identity.address, db, config.chainType || identity.chainType || "evm",
+      );
 
       // Check survival tier
       // api_unreachable: creditsCents === -1 means API failed with no cache.
@@ -461,7 +480,9 @@ export async function runAgentLoop(
                 log(config, `[AUTO-TOPUP] Bought $${topupResult.amountUsd} credits from USDC mid-loop`);
                 // Re-fetch financial state after topup so the rest of
                 // the turn sees the updated balance.
-                financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
+                financial = await getRuntimeFinancialState(
+                  runtimeProfile, conway, identity.address, db, config.chainType || identity.chainType || "evm",
+                );
               }
             } catch (err: any) {
               logger.warn(`Inline auto-topup failed: ${err.message}`);
@@ -501,7 +522,7 @@ export async function runAgentLoop(
       const recentTurns = trimContext(
         meaningfulTurns.length > 0 ? meaningfulTurns : allTurns.slice(-2),
       );
-      const systemPrompt = buildSystemPrompt({
+      const baseSystemPrompt = buildSystemPrompt({
         identity,
         config,
         financial,
@@ -511,6 +532,9 @@ export async function runAgentLoop(
         skills,
         isFirstRun,
       });
+      const systemPrompt = runtimeProfile === "trading_lab"
+        ? `${tradingLabSystemContract()}\n\n${baseSystemPrompt}`
+        : baseSystemPrompt;
 
       // Phase 2.2: Pre-turn memory retrieval
       let memoryBlock: string | undefined;
@@ -600,17 +624,21 @@ export async function runAgentLoop(
       log(config, `[THINK] Routing inference (tier: ${survivalTier}, model: ${inference.getDefaultModel()})...`);
 
       const inferenceTools = toolsToInferenceFormat(tools);
-      const routerResult = await inferenceRouter.route(
-        {
-          messages: messages,
-          taskType: "agent_turn",
-          tier: survivalTier,
-          sessionId: db.getKV("session_id") || "default",
-          turnId: ulid(),
-          tools: inferenceTools,
-        },
-        (msgs, opts) => inference.chat(msgs, { ...opts, tools: inferenceTools }),
-      );
+      const routerResult = runtimeProfile === "trading_lab"
+        ? await runTradingLabInference(
+            inference, messages, inferenceTools, config, ollamaBaseUrl,
+          )
+        : await inferenceRouter.route(
+            {
+              messages: messages,
+              taskType: "agent_turn",
+              tier: survivalTier,
+              sessionId: db.getKV("session_id") || "default",
+              turnId: ulid(),
+              tools: inferenceTools,
+            },
+            (msgs, opts) => inference.chat(msgs, { ...opts, tools: inferenceTools }),
+          );
 
       // Build a compatible response for the rest of the loop
       const response = {
@@ -942,6 +970,54 @@ export async function runAgentLoop(
 // cause the automaton to believe it has $0 and kill itself.
 let _lastKnownCredits = 0;
 let _lastKnownUsdc = 0;
+
+async function runTradingLabInference(
+  inference: InferenceClient,
+  messages: ChatMessage[],
+  tools: InferenceToolDefinition[],
+  config: AutomatonConfig,
+  ollamaBaseUrl?: string,
+): Promise<InferenceResult> {
+  const startedAt = Date.now();
+  const response = await inference.chat(messages, {
+    model: config.inferenceModel,
+    maxTokens: config.maxTokensPerTurn,
+    tools,
+  });
+  const provider: ModelProvider = config.tradingLabProvider ||
+    (ollamaBaseUrl ? "ollama" : /^claude/i.test(config.inferenceModel) ? "anthropic" : "openai");
+  return {
+    content: response.message.content || "",
+    model: response.model || config.inferenceModel,
+    provider,
+    inputTokens: response.usage.promptTokens,
+    outputTokens: response.usage.completionTokens,
+    // Provider billing is intentionally not inferred from stale price tables.
+    costCents: 0,
+    latencyMs: Date.now() - startedAt,
+    toolCalls: response.toolCalls,
+    finishReason: response.finishReason,
+  };
+}
+
+async function getRuntimeFinancialState(
+  runtimeProfile: ReturnType<typeof resolveRuntimeProfile>,
+  conway: ConwayClient,
+  address: string,
+  db?: AutomatonDatabase,
+  chainType?: string,
+): Promise<FinancialState> {
+  if (runtimeProfile === "trading_lab") {
+    // A neutral non-critical sentinel prevents upstream survival/topup behavior.
+    // It is not an account balance and is never persisted as trading evidence.
+    return {
+      creditsCents: 100,
+      usdcBalance: 0,
+      lastChecked: new Date().toISOString(),
+    };
+  }
+  return getFinancialState(conway, address, db, chainType);
+}
 
 async function getFinancialState(
   conway: ConwayClient,

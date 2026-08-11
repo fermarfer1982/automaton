@@ -52,6 +52,12 @@ export interface AutomatonConfig {
   openaiApiKey?: string;
   anthropicApiKey?: string;
   ollamaBaseUrl?: string;
+  /** Non-secret provider selection used only by the restricted trading profile. */
+  tradingLabProvider?: "openai" | "anthropic" | "ollama";
+  /** Absolute non-secret state directory required by the trading profile. */
+  tradingLabStateDir?: string;
+  /** SID of the non-administrator Windows identity allowed to run Automaton. */
+  tradingLabWindowsSid?: string;
   inferenceModel: string;
   maxTokensPerTurn: number;
   heartbeatConfigPath: string;
@@ -161,7 +167,8 @@ export type ToolCategory =
   | "git"
   | "registry"
   | "replication"
-  | "memory";
+  | "memory"
+  | "trading";
 
 export interface ToolContext {
   identity: AutomatonIdentity;
