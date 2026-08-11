@@ -45,7 +45,10 @@ function Assert-MinimumGroupMembership(
         throw "$($User.Name) belongs to non-minimal local groups: $details"
     }
     if (-not ($memberships | Where-Object { $_.sid -eq $usersGroupSid.Value })) {
-        Add-LocalGroupMember -SID $usersGroupSid -Member $User.SID
+        # Add-LocalGroupMember requires a LocalPrincipal. Passing User.SID here
+        # fails parameter binding on Windows PowerShell 5.1.
+        $localUser = Get-LocalUser -Name $User.Name -ErrorAction Stop
+        Add-LocalGroupMember -SID $usersGroupSid -Member $localUser
         $memberships = @(Get-DirectLocalGroups $User.SID)
     }
     if (
@@ -78,6 +81,12 @@ foreach ($definition in $accountDefinitions) {
         } finally {
             if ($null -ne $password) { $password.Dispose() }
         }
+    }
+    # Always refresh the object so resumed runs and newly created users follow
+    # the same LocalPrincipal validation path. Existing passwords are untouched.
+    $existing = Get-LocalUser -Name $definition.Name -ErrorAction Stop
+    if ($existing.PrincipalSource.ToString() -ne 'Local') {
+        throw "$($definition.Name) is not a local Windows account."
     }
     if (-not $existing.Enabled) {
         throw "$($definition.Name) exists but is disabled; refusing to change it automatically."
