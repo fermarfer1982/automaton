@@ -15,9 +15,9 @@
   "log_dir": "C:\\ProgramData\\AutomatonMT5Lab\\data\\logs",
   "demo_authorization_path": "C:\\ProgramData\\AutomatonMT5Lab\\control\\demo.authorization",
   "kill_switch_path": "C:\\ProgramData\\AutomatonMT5Lab\\control\\KILL_SWITCH",
-  "automaton_state_dir": "C:\\Users\\AutomatonLabAgent\\.automaton",
-  "gateway_windows_identity": "REPLACE_WITH_MACHINE\\AutomatonMT5Gateway",
-  "automaton_windows_identity": "REPLACE_WITH_MACHINE\\AutomatonLabAgent",
+  "automaton_state_dir": "C:\\Users\\AutomatonAgent\\.automaton",
+  "gateway_windows_identity": "REPLACE_WITH_MACHINE\\AutomatonGateway",
+  "automaton_windows_identity": "REPLACE_WITH_MACHINE\\AutomatonAgent",
   "risk": {
     "max_risk_per_trade_fraction": 0.0025,
     "max_risk_per_trade_amount": 10.0,

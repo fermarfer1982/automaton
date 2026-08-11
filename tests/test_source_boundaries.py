@@ -31,6 +31,7 @@ class SourceBoundaryTests(unittest.TestCase):
             self.assertIn(protected, source)
         self.assertIn('"conway/inference.ts"', source)
         self.assertIn('"scripts/Initialize-TradingLabAcl.ps1"', source)
+        self.assertIn('"scripts/New-TradingLabUsers.ps1"', source)
         self.assertIn('"scripts/Resolve-TradingLabNode.ps1"', source)
         self.assertIn('"docs/SECURITY_INVARIANTS.md"', source)
         self.assertIn('"docs/READINESS_AUDIT.md"', source)
@@ -175,6 +176,31 @@ class SourceBoundaryTests(unittest.TestCase):
             self.assertIn("$LASTEXITCODE", source, script_name)
         start_gateway = (ROOT / "scripts" / "start_gateway.ps1").read_text(encoding="utf-8")
         self.assertLess(start_gateway.index("$LASTEXITCODE"), start_gateway.index("Start-Process"))
+
+    def test_manual_user_provisioning_never_persists_passwords_or_grants_privilege(self) -> None:
+        source = (ROOT / "scripts" / "New-TradingLabUsers.ps1").read_text(encoding="utf-8")
+        self.assertIn("#Requires -RunAsAdministrator", source)
+        self.assertIn("Read-Host", source)
+        self.assertIn("-AsSecureString", source)
+        self.assertIn("S-1-5-32-545", source)
+        self.assertIn("$unexpected.Count -gt 0", source)
+        self.assertIn("$password.Length -eq 0", source)
+        self.assertNotIn("ConvertFrom-SecureString", source)
+        self.assertNotIn("PasswordNeverExpires:$true", source)
+        self.assertNotIn("Add-LocalGroupMember -Name 'Administrators'", source)
+
+    def test_acl_dry_run_reports_explicit_allow_only_matrix(self) -> None:
+        source = (ROOT / "scripts" / "Initialize-TradingLabAcl.ps1").read_text(encoding="utf-8")
+        self.assertIn("acl_proposals", source)
+        self.assertIn("inherited_aces_preserved = $false", source)
+        self.assertIn("deny_aces = 0", source)
+        self.assertIn("'KILL_SWITCH'", source)
+        self.assertIn("'audit.db'", source)
+        self.assertIn("'research.db'", source)
+        dry_run_exit = source.index("if (-not $Apply)")
+        self.assertLess(dry_run_exit, source.index("New-Item -ItemType Directory"))
+        self.assertLess(dry_run_exit, source.index("WriteAllText"))
+        self.assertLess(dry_run_exit, source.index("Set-Acl -LiteralPath"))
 
 
 if __name__ == "__main__":

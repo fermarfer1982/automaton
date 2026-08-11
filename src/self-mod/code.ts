@@ -98,6 +98,7 @@ const PROTECTED_FILES: readonly string[] = Object.freeze([
   "trading-lab-identity.json",
   "trading-lab-runtime-status.json",
   "scripts/Initialize-TradingLabAcl.ps1",
+  "scripts/New-TradingLabUsers.ps1",
   "scripts/Resolve-TradingLabNode.ps1",
   "scripts/setup.ps1",
   "scripts/start_gateway.ps1",

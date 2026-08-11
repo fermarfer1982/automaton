@@ -63,6 +63,81 @@ if ($administratorMembers -contains $gatewaySid.Value -or $administratorMembers 
     throw 'Gateway and Automaton identities must be non-administrators.'
 }
 
+function New-AclProposal(
+    [string] $Path,
+    [string] $Domain,
+    [System.Security.Principal.SecurityIdentifier[]] $Principals,
+    [string[]] $Rights,
+    [string[]] $RepresentativeTargets
+) {
+    $entries = [System.Collections.Generic.List[object]]::new()
+    $entries.Add([pscustomobject]@{
+        principal = 'NT AUTHORITY\SYSTEM'
+        sid = $systemSid.Value
+        rights = 'FullControl'
+        type = 'Allow'
+    })
+    $entries.Add([pscustomobject]@{
+        principal = 'BUILTIN\Administrators'
+        sid = $administratorsSid.Value
+        rights = 'FullControl'
+        type = 'Allow'
+    })
+    for ($index = 0; $index -lt $Principals.Count; $index++) {
+        $entries.Add([pscustomobject]@{
+            principal = $Principals[$index].Value
+            sid = $Principals[$index].Value
+            rights = $Rights[$index]
+            type = 'Allow'
+        })
+    }
+    return [pscustomobject]@{
+        path = $Path
+        domain = $Domain
+        inheritance_protected = $true
+        inherited_aces_preserved = $false
+        deny_aces = 0
+        child_propagation = 'ContainerInherit,ObjectInherit'
+        owner = 'BUILTIN\Administrators'
+        entries = @($entries)
+        representative_targets = $RepresentativeTargets
+    }
+}
+
+$aclProposals = @(
+    New-AclProposal $root 'lab_root_navigation' @($gatewaySid, $automatonSid) @(
+        'ReadAndExecute', 'ReadAndExecute'
+    ) @('control', 'data', 'ipc')
+    New-AclProposal $workspace 'source_read_only' @($gatewaySid, $automatonSid) @(
+        'ReadAndExecute', 'ReadAndExecute'
+    ) @(
+        'Automaton source and prompt', 'trading_lab gateway source',
+        'risk_engine.py', 'account_guard.py', 'execution_engine.py',
+        'mt5_adapter.py', 'src\trading', 'scripts', '.runtime', '.venv'
+    )
+    New-AclProposal $control 'human_managed_control' @($gatewaySid) @(
+        'ReadAndExecute'
+    ) @(
+        'trading.yaml', 'KILL_SWITCH', 'demo.authorization',
+        'readiness.json', 'readiness.json.sha256'
+    )
+    New-AclProposal $data 'gateway_writable_data' @($gatewaySid) @(
+        'Modify'
+    ) @(
+        'audit.jsonl', 'audit.db', 'research.db', 'trading memory',
+        'gateway.lock', 'logs\gateway', 'logs\security', 'logs\trading'
+    )
+    New-AclProposal $ipc 'shared_read_only_ipc' @($gatewaySid, $automatonSid) @(
+        'ReadAndExecute', 'ReadAndExecute'
+    ) @('automaton.key')
+    New-AclProposal $state 'agent_private_state' @($automatonSid) @(
+        'Modify'
+    ) @(
+        'Automaton context', 'agent memory', 'procedural memory',
+        'agent logs', 'last_processed_bar_timestamp'
+    )
+)
+
 $plan = [pscustomobject]@{
     apply = [bool]$Apply
     gateway_sid = $gatewaySid.Value
@@ -73,8 +148,10 @@ $plan = [pscustomobject]@{
     automaton_state_directory = $state
     read_only_workspace = $workspace
     security_config = (Join-Path $control 'trading.yaml')
+    acl_model = 'protected inheritance with explicit Allow ACEs; no Deny ACEs'
+    acl_proposals = $aclProposals
 }
-$plan | ConvertTo-Json -Depth 4
+$plan | ConvertTo-Json -Depth 8
 if (-not $Apply) {
     Write-Host 'Dry run only. Re-run with -Apply after reviewing the resolved SIDs and paths.'
     exit 0
@@ -209,7 +286,7 @@ foreach ($relativeFile in @(
     'scripts\setup.ps1', 'scripts\start_gateway.ps1', 'scripts\start_automaton.ps1',
     'scripts\status.ps1', 'scripts\stop.ps1', 'scripts\test_gateway.ps1',
     'scripts\enable_demo_trading.ps1', 'scripts\disable_trading.ps1',
-    'scripts\emergency_stop.ps1',
+    'scripts\emergency_stop.ps1', 'scripts\New-TradingLabUsers.ps1',
     'config\trading.security.example.json', 'config\trading.example.yaml',
     'requirements-mt5.txt', 'requirements-gateway-win-py314.lock',
     'requirements-gateway.in', 'docs\TRADING_LAB.md',

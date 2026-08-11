@@ -72,19 +72,25 @@ C:\ProgramData\AutomatonMT5Lab\control\trading.yaml
 ```
 
 Escribir explícitamente el login/servidor DEMO observados por el humano, sin
-contraseña. No se acepta detección automática como autorización. Crear fuera de
-Codex dos usuarios Windows estándar distintos:
+contraseña. No se acepta detección automática como autorización. Crear
+manualmente dos usuarios Windows estándar distintos. El humano debe ejecutar el
+siguiente script en una consola elevada: solicita cada contraseña como
+`SecureString`, no la registra y no aplica ACL.
 
-- Gateway: terminal visible y gateway.
-- Agent: Automaton y su estado externo, sin wallet de firma.
+```powershell
+.\scripts\New-TradingLabUsers.ps1
+```
+
+- `AutomatonGateway`: terminal visible y gateway.
+- `AutomatonAgent`: Automaton y su estado externo, sin wallet de firma.
 
 El script ACL no crea usuarios, no pide contraseñas y es dry-run sin `-Apply`:
 
 ```powershell
 .\scripts\setup.ps1 `
-  -GatewayIdentity 'MACHINE\AutomatonMT5Gateway' `
-  -AutomatonIdentity 'MACHINE\AutomatonLabAgent' `
-  -AutomatonStateDir 'C:\Users\AutomatonLabAgent\.automaton'
+  -GatewayIdentity 'MACHINE\AutomatonGateway' `
+  -AutomatonIdentity 'MACHINE\AutomatonAgent' `
+  -AutomatonStateDir 'C:\Users\AutomatonAgent\.automaton'
 ```
 
 Tras revisar SIDs/rutas, un administrador puede repetir con `-Apply`. La opción
@@ -113,7 +119,7 @@ Ejecutar cada start bajo su identidad dedicada, nunca como administrador:
 $env:AUTOMATON_LAB_PROVIDER = 'openai' # o anthropic/ollama
 $env:AUTOMATON_LAB_MODEL = 'MODELO_EXPLICITO'
 .\scripts\start_automaton.ps1 `
-  -AutomatonStateDir 'C:\Users\AutomatonLabAgent\.automaton'
+  -AutomatonStateDir 'C:\Users\AutomatonAgent\.automaton'
 ```
 
 Comandos disponibles: `status.ps1`, `stop.ps1` (dry-run/`-Apply`),
