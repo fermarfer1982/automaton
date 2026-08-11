@@ -31,6 +31,7 @@ class SourceBoundaryTests(unittest.TestCase):
             self.assertIn(protected, source)
         self.assertIn('"conway/inference.ts"', source)
         self.assertIn('"scripts/Initialize-TradingLabAcl.ps1"', source)
+        self.assertIn('"scripts/Resolve-TradingLabNode.ps1"', source)
         self.assertIn('"docs/SECURITY_INVARIANTS.md"', source)
         self.assertIn('"docs/READINESS_AUDIT.md"', source)
         self.assertIn('"requirements-gateway-win-py314.lock"', source)
@@ -148,12 +149,32 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn("onlyBuiltDependencies:", workspace)
         self.assertIn("  - better-sqlite3", workspace)
         self.assertIn("  - esbuild", workspace)
+        resolver = (ROOT / "scripts" / "Resolve-TradingLabNode.ps1").read_text(encoding="utf-8")
+        self.assertIn("node-v22.22.0-win-x64", resolver)
+        self.assertIn("bae898add4643fcf890a83ad8ae56e20dce7e781cab161a53991ceba70c99ffb", resolver)
+        self.assertIn("Get-FileHash", resolver)
+        self.assertIn("ReparsePoint", resolver)
+        self.assertGreaterEqual(resolver.count("$LASTEXITCODE"), 2)
         for script_name in ("setup.ps1", "test_gateway.ps1"):
             source = (ROOT / "scripts" / script_name).read_text(encoding="utf-8")
-            self.assertIn("process.versions.node", source)
-            self.assertIn("[version]'20.18.0'", source)
-            self.assertIn("$nodeVersion.Major -eq 22", source)
-            self.assertIn("corepack pnpm@10.28.1", source)
+            self.assertIn("Resolve-TradingLabNode.ps1", source)
+            self.assertIn("pnpm@10.28.1", source)
+            self.assertIn("$LASTEXITCODE", source)
+        start = (ROOT / "scripts" / "start_automaton.ps1").read_text(encoding="utf-8")
+        self.assertIn("Resolve-TradingLabNode.ps1", start)
+        self.assertIn("-FilePath $nodeRuntime.Node", start)
+
+    def test_windows_operator_scripts_check_native_exit_codes(self) -> None:
+        for script_name in (
+            "disable_trading.ps1",
+            "enable_demo_trading.ps1",
+            "start_gateway.ps1",
+            "status.ps1",
+        ):
+            source = (ROOT / "scripts" / script_name).read_text(encoding="utf-8")
+            self.assertIn("$LASTEXITCODE", source, script_name)
+        start_gateway = (ROOT / "scripts" / "start_gateway.ps1").read_text(encoding="utf-8")
+        self.assertLess(start_gateway.index("$LASTEXITCODE"), start_gateway.index("Start-Process"))
 
 
 if __name__ == "__main__":

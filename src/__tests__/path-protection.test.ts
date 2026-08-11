@@ -104,7 +104,7 @@ describe("isProtectedFile", () => {
 
   it("allows normal unprotected files", () => {
     expect(isProtectedFile("/some/path/readme.md")).toBe(false);
-    expect(isProtectedFile("/some/path/src/index.ts")).toBe(false);
+    expect(isProtectedFile("/some/path/src/feature.ts")).toBe(false);
     expect(isProtectedFile("/some/path/data.csv")).toBe(false);
   });
 
@@ -113,6 +113,7 @@ describe("isProtectedFile", () => {
     expect(isProtectedFile("/home/user/.gnupg/keys")).toBe(true);
     expect(isProtectedFile("/etc/systemd/system/something.service")).toBe(true);
     expect(isProtectedFile("/proc/self/environ")).toBe(true);
+    expect(isProtectedFile(String.raw`C:\automaton\trading_lab\risk_engine.py`)).toBe(true);
   });
 });
 

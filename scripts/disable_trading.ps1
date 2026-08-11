@@ -10,3 +10,4 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'Reviewed .ven
 $arguments = @('-m', 'trading_lab.operator', '--config', $Config, 'disable')
 if ($Apply) { $arguments += '--apply' }
 & $python @arguments
+if ($LASTEXITCODE -ne 0) { throw "Disable-trading operation failed with exit code $LASTEXITCODE." }

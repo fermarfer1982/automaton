@@ -98,6 +98,7 @@ const PROTECTED_FILES: readonly string[] = Object.freeze([
   "trading-lab-identity.json",
   "trading-lab-runtime-status.json",
   "scripts/Initialize-TradingLabAcl.ps1",
+  "scripts/Resolve-TradingLabNode.ps1",
   "scripts/setup.ps1",
   "scripts/start_gateway.ps1",
   "scripts/start_automaton.ps1",
@@ -196,6 +197,8 @@ function resolveAndValidatePath(filePath: string): string | null {
  */
 export function isProtectedFile(filePath: string): boolean {
   const resolved = path.resolve(filePath);
+  const portableInput = filePath.replace(/\\/g, "/").replace(/\/{2,}/g, "/");
+  const portableResolved = resolved.replace(/\\/g, "/").replace(/\/{2,}/g, "/");
 
   // Check against protected file patterns using path-segment matching
   for (const pattern of PROTECTED_FILES) {
@@ -210,16 +213,18 @@ export function isProtectedFile(filePath: string): boolean {
 
   // Check against blocked directory patterns using path-segment matching
   for (const pattern of BLOCKED_DIRECTORY_PATTERNS) {
-    // Check if any path segment matches the blocked directory
-    if (resolved.includes(path.sep + pattern + path.sep) ||
-        resolved.endsWith(path.sep + pattern) ||
-        resolved === pattern) {
-      return true;
+    const portablePattern = pattern.replace(/\\/g, "/").replace(/\/{2,}/g, "/");
+    if (portablePattern.startsWith("/")) {
+      if (
+        portableInput === portablePattern ||
+        portableInput.startsWith(`${portablePattern}/`) ||
+        portableResolved.endsWith(portablePattern) ||
+        portableResolved.includes(`${portablePattern}/`)
+      ) return true;
+      continue;
     }
-    // Handle absolute patterns like /etc/systemd
-    if (pattern.startsWith("/") && resolved.startsWith(pattern)) {
-      return true;
-    }
+    const segments = portableResolved.split("/").filter(Boolean);
+    if (segments.includes(portablePattern)) return true;
   }
 
   return false;

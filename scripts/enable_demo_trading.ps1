@@ -13,3 +13,4 @@ $arguments = @('-m', 'trading_lab.operator', '--config', $Config, 'enable-demo',
 if ($Apply) { $arguments += '--apply' }
 if ($ClearKillSwitch) { $arguments += '--clear-kill-switch' }
 & $python @arguments
+if ($LASTEXITCODE -ne 0) { throw "Enable-DEMO operation failed with exit code $LASTEXITCODE." }
