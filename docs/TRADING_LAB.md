@@ -13,6 +13,11 @@ solo inicializa la ruta exacta de un terminal MT5 ya visible en la sesión del
 usuario Gateway. Una cuenta REAL, otro login, otro servidor o cualquier error
 de infraestructura bloquean la operación.
 
+La rama `feature/mt5-demo-trading-lab` conserva el baseline observado al inicio
+de este milestone: 75 tests Python superados antes de la ampliación. El historial
+Git mantiene ese punto y los incrementos posteriores sin reclonar ni sustituir
+el árbol upstream.
+
 ## Fronteras permanentes
 
 - Solo el login DEMO, servidor, nombre opcional, `XAUUSD` y magic configurados.
