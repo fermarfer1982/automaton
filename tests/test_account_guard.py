@@ -50,6 +50,12 @@ class AccountGuardTests(unittest.TestCase):
         self.assertFalse(terminal_disabled.allowed)
         self.assertIn("TERMINAL_AUTOTRADING_DISABLED", terminal_disabled.failed_codes)
 
+    def test_optional_account_name_is_exact_when_configured(self) -> None:
+        guard = AccountGuard(12345678, "Broker-Demo", "Authorized Demo")
+        self.assertTrue(guard.evaluate(self.adapter.account).allowed)
+        rejected = guard.evaluate(replace(self.adapter.account, account_name="Other Demo"))
+        self.assertIn("ACCOUNT_NAME_MISMATCH", rejected.failed_codes)
+
 
 if __name__ == "__main__":
     unittest.main()

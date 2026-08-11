@@ -29,7 +29,7 @@ def security_config(directory: Path) -> SecurityConfig:
         automaton_state_dir=directory / "agent",
         gateway_windows_identity="LAB\\Gateway",
         automaton_windows_identity="LAB\\Agent",
-        risk=RiskLimits(0.0025, 0.1, 30.0, 1, 0.1, 0.01, 20, 300),
+        risk=RiskLimits(0.0025, 0.01, 30.0, 1, 0.01, 0.01, 20, 300),
     )
 
 

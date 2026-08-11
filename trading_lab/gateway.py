@@ -11,6 +11,7 @@ from .domain import (
     GatewayResult,
     GatewayStatus,
     GuardDecision,
+    RiskStage,
     TradingMode,
     TradeProposal,
     proposal_to_payload,
@@ -149,7 +150,12 @@ class MT5Gateway:
             # No subsequent action is permitted unless the proposal itself is durably audited.
             self._audit.append(
                 "proposal_received",
-                {"proposal": proposal_to_payload(proposal), "mode": self._mode.value, "fingerprint": fingerprint},
+                {
+                    "stage": RiskStage.POST_LLM_CHECK.value,
+                    "proposal": proposal_to_payload(proposal),
+                    "mode": self._mode.value,
+                    "fingerprint": fingerprint,
+                },
             )
             if self._research_store is not None:
                 # Research memory must be writable before any possible execution path.
@@ -164,7 +170,11 @@ class MT5Gateway:
             account_decision = self._account_guard.evaluate(account)
             self._audit.append(
                 "account_guard_decision",
-                {"proposal_id": proposal.proposal_id, "checks": account_decision.checks},
+                {
+                    "stage": RiskStage.PRE_FLIGHT_CHECK.value,
+                    "proposal_id": proposal.proposal_id,
+                    "checks": account_decision.checks,
+                },
             )
             if not account_decision.allowed:
                 return self._outcome(proposal, GatewayStatus.REJECTED, account_decision.checks, fingerprint)
@@ -196,6 +206,7 @@ class MT5Gateway:
             self._audit.append(
                 "risk_engine_decision",
                 {
+                    "stage": RiskStage.POST_LLM_CHECK.value,
                     "proposal_id": proposal.proposal_id,
                     "checks": risk.checks,
                     "estimated_risk_amount": risk.estimated_risk_amount,

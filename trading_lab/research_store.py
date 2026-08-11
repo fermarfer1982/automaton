@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 import threading
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .domain import Side, SymbolSnapshot, TradingMode, TradeProposal
 
@@ -135,6 +137,78 @@ CREATE TABLE IF NOT EXISTS paper_positions (
 CREATE INDEX IF NOT EXISTS idx_paper_positions_status
   ON paper_positions(status, updated_at);
 INSERT OR IGNORE INTO research_schema(version) VALUES (2);
+CREATE TABLE IF NOT EXISTS idempotency_requests (
+  idempotency_key TEXT PRIMARY KEY,
+  request_hash TEXT NOT NULL,
+  proposal_id TEXT NOT NULL UNIQUE,
+  response_json TEXT,
+  created_at_utc TEXT NOT NULL,
+  completed_at_utc TEXT
+);
+CREATE TABLE IF NOT EXISTS lifecycle_events (
+  event_id TEXT PRIMARY KEY,
+  proposal_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at_utc TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_proposal
+  ON lifecycle_events(proposal_id, created_at_utc, event_id);
+CREATE TRIGGER IF NOT EXISTS lifecycle_events_no_update
+BEFORE UPDATE ON lifecycle_events
+BEGIN SELECT RAISE(ABORT, 'lifecycle events are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS lifecycle_events_no_delete
+BEFORE DELETE ON lifecycle_events
+BEGIN SELECT RAISE(ABORT, 'lifecycle events are append-only'); END;
+CREATE TABLE IF NOT EXISTS agent_decisions (
+  decision_id TEXT PRIMARY KEY,
+  action TEXT NOT NULL CHECK(action IN ('HOLD', 'PROPOSE')),
+  symbol TEXT NOT NULL CHECK(symbol = 'XAUUSD'),
+  timeframe TEXT NOT NULL,
+  bar_time_utc TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  hypothesis_id TEXT,
+  created_at_utc TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS agent_decisions_no_update
+BEFORE UPDATE ON agent_decisions
+BEGIN SELECT RAISE(ABORT, 'agent decisions are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS agent_decisions_no_delete
+BEFORE DELETE ON agent_decisions
+BEGIN SELECT RAISE(ABORT, 'agent decisions are append-only'); END;
+CREATE TABLE IF NOT EXISTS trade_reviews (
+  review_id TEXT PRIMARY KEY,
+  trade_id TEXT NOT NULL,
+  expected TEXT NOT NULL,
+  observed TEXT NOT NULL,
+  errors TEXT NOT NULL,
+  strengths TEXT NOT NULL,
+  learning TEXT NOT NULL,
+  hypothesis_effect TEXT NOT NULL,
+  created_at_utc TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS trade_reviews_no_update
+BEFORE UPDATE ON trade_reviews
+BEGIN SELECT RAISE(ABORT, 'trade reviews are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS trade_reviews_no_delete
+BEFORE DELETE ON trade_reviews
+BEGIN SELECT RAISE(ABORT, 'trade reviews are append-only'); END;
+CREATE TABLE IF NOT EXISTS memory_items (
+  memory_id TEXT PRIMARY KEY,
+  category TEXT NOT NULL CHECK(category IN ('EPISODIC', 'SEMANTIC', 'PROCEDURAL', 'HYPOTHESIS')),
+  subject_id TEXT NOT NULL,
+  content TEXT NOT NULL,
+  evidence_sample_size INTEGER NOT NULL DEFAULT 0,
+  evidence_eligible INTEGER NOT NULL DEFAULT 0 CHECK(evidence_eligible IN (0, 1)),
+  created_at_utc TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS memory_items_no_update
+BEFORE UPDATE ON memory_items
+BEGIN SELECT RAISE(ABORT, 'memory items are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS memory_items_no_delete
+BEFORE DELETE ON memory_items
+BEGIN SELECT RAISE(ABORT, 'memory items are append-only'); END;
+INSERT OR IGNORE INTO research_schema(version) VALUES (3);
 """
 
 
@@ -174,7 +248,7 @@ class ResearchStore:
             "volume": proposal.volume,
             "estimated_risk_amount": estimated_risk_amount,
         })
-        now = datetime.now().astimezone().isoformat()
+        now = datetime.now(UTC).isoformat()
         with self._lock, closing(self._connect()) as connection:
             connection.execute(
                 """
@@ -214,6 +288,182 @@ class ResearchStore:
                 "SELECT * FROM proposals WHERE proposal_id = ?", (proposal_id,)
             ).fetchone()
         return dict(row) if row else None
+
+    def reserve_idempotency(
+        self,
+        idempotency_key: str,
+        request_hash: str,
+        proposal_id: str,
+    ) -> tuple[str, str, dict[str, Any] | None]:
+        """Return NEW, EXISTING, or CONFLICT without ever re-executing a request."""
+        now = datetime.now(UTC).isoformat()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT request_hash, proposal_id, response_json FROM idempotency_requests WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """
+                    INSERT INTO idempotency_requests(
+                      idempotency_key, request_hash, proposal_id, created_at_utc
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (idempotency_key, request_hash, proposal_id, now),
+                )
+                connection.commit()
+                return "NEW", proposal_id, None
+            connection.commit()
+            if str(row["request_hash"]) != request_hash:
+                return "CONFLICT", str(row["proposal_id"]), None
+            response = json.loads(str(row["response_json"])) if row["response_json"] else None
+            return "EXISTING", str(row["proposal_id"]), response
+
+    def complete_idempotency(self, idempotency_key: str, response: dict[str, Any]) -> None:
+        encoded = json.dumps(response, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        with self._lock, closing(self._connect()) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE idempotency_requests
+                SET response_json = ?, completed_at_utc = ?
+                WHERE idempotency_key = ? AND response_json IS NULL
+                """,
+                (encoded, datetime.now(UTC).isoformat(), idempotency_key),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Idempotency request is absent or already completed")
+            connection.commit()
+
+    def append_lifecycle(
+        self,
+        event_id: str,
+        proposal_id: str,
+        state: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        encoded = json.dumps(payload or {}, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute(
+                """
+                INSERT INTO lifecycle_events(event_id, proposal_id, state, payload_json, created_at_utc)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (event_id, proposal_id, state, encoded, datetime.now(UTC).isoformat()),
+            )
+            connection.commit()
+
+    def record_agent_decision(
+        self,
+        *,
+        decision_id: str,
+        action: str,
+        symbol: str,
+        timeframe: str,
+        bar_time_utc: str,
+        reason: str,
+        hypothesis_id: str | None,
+    ) -> None:
+        if action not in {"HOLD", "PROPOSE"} or symbol != "XAUUSD":
+            raise ValueError("Unsupported structured agent decision")
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute(
+                """
+                INSERT INTO agent_decisions(
+                  decision_id, action, symbol, timeframe, bar_time_utc,
+                  reason, hypothesis_id, created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision_id, action, symbol, timeframe, bar_time_utc,
+                    reason, hypothesis_id, datetime.now(UTC).isoformat(),
+                ),
+            )
+            connection.commit()
+
+    def recent_memory(self, limit: int = 50) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 200:
+            raise ValueError("Memory limit must be between 1 and 200")
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT * FROM memory_items ORDER BY created_at_utc DESC, memory_id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_hypothesis(self, hypothesis_id: str, thesis: str) -> None:
+        thesis = thesis.strip()
+        if not thesis or len(thesis) > 4000:
+            raise ValueError("Hypothesis thesis must contain 1..4000 characters")
+        now = datetime.now(UTC).isoformat()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT thesis FROM hypotheses WHERE hypothesis_id = ?", (hypothesis_id,)
+            ).fetchone()
+            if existing is not None and str(existing["thesis"]) != thesis:
+                raise ValueError("Hypothesis IDs are immutable; create a new version")
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO hypotheses(hypothesis_id, thesis, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (hypothesis_id, thesis, now, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO memory_items(
+                  memory_id, category, subject_id, content, created_at_utc
+                ) VALUES (?, 'HYPOTHESIS', ?, ?, ?)
+                """,
+                (str(uuid4()), hypothesis_id, thesis, now),
+            )
+            connection.commit()
+
+    def save_trade_review(
+        self,
+        *,
+        review_id: str,
+        trade_id: str,
+        expected: str,
+        observed: str,
+        errors: str,
+        strengths: str,
+        learning: str,
+        hypothesis_effect: str,
+    ) -> None:
+        values = (expected, observed, errors, strengths, learning, hypothesis_effect)
+        if any(len(item) > 4000 for item in values):
+            raise ValueError("Trade review field exceeds 4000 characters")
+        now = datetime.now(UTC).isoformat()
+        content = json.dumps({
+            "expected": expected, "observed": observed, "errors": errors,
+            "strengths": strengths, "learning": learning,
+            "hypothesis_effect": hypothesis_effect,
+        }, sort_keys=True, separators=(",", ":"))
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO trade_reviews(
+                  review_id, trade_id, expected, observed, errors, strengths,
+                  learning, hypothesis_effect, created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    review_id, trade_id, expected, observed, errors, strengths,
+                    learning, hypothesis_effect, now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO memory_items(
+                  memory_id, category, subject_id, content, created_at_utc
+                ) VALUES (?, 'EPISODIC', ?, ?, ?)
+                """,
+                (str(uuid4()), trade_id, content, now),
+            )
+            connection.commit()
 
     def record_trade_result(self, record: TradeResultRecord) -> None:
         self._validate_trade_result(record)
@@ -423,7 +673,7 @@ class ResearchStore:
 
     def paper_daily_realized_pnl(self, day: date | None = None) -> float:
         """Return closed PAPER PnL for the local calendar day."""
-        target_day = day or datetime.now().astimezone().date()
+        target_day = day or datetime.now(UTC).date()
         with closing(self._connect()) as connection:
             rows = connection.execute(
                 "SELECT pnl, closed_at FROM trade_results WHERE trade_id LIKE 'paper:%'"
@@ -431,7 +681,7 @@ class ResearchStore:
         total = 0.0
         for row in rows:
             closed_at = datetime.fromisoformat(str(row["closed_at"]))
-            if closed_at.astimezone().date() == target_day:
+            if closed_at.astimezone(UTC).date() == target_day:
                 total += float(row["pnl"])
         return total
 
@@ -439,6 +689,6 @@ class ResearchStore:
         try:
             with closing(self._connect()) as connection:
                 version = connection.execute("SELECT MAX(version) FROM research_schema").fetchone()[0]
-            return version == 2
+            return version == 3
         except sqlite3.Error:
             return False

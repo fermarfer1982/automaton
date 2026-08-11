@@ -23,12 +23,23 @@ class Side(str, Enum):
     SELL = "SELL"
 
 
+class OpenAction(str, Enum):
+    OPEN_LONG = "OPEN_LONG"
+    OPEN_SHORT = "OPEN_SHORT"
+
+
 class GatewayStatus(str, Enum):
     OBSERVED = "OBSERVED"
     PAPER_ACCEPTED = "PAPER_ACCEPTED"
     EXECUTED = "EXECUTED"
     EXECUTION_UNCERTAIN = "EXECUTION_UNCERTAIN"
     REJECTED = "REJECTED"
+
+
+class RiskStage(str, Enum):
+    PRE_FLIGHT_CHECK = "PRE_FLIGHT_CHECK"
+    POST_LLM_CHECK = "POST_LLM_CHECK"
+    PRE_EXECUTION_CHECK = "PRE_EXECUTION_CHECK"
 
 
 @dataclass(frozen=True)
@@ -62,6 +73,8 @@ class AccountSnapshot:
     connected: bool
     trade_allowed: bool
     terminal_trade_allowed: bool
+    currency: str = "UNKNOWN"
+    account_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +91,32 @@ class SymbolSnapshot:
     trade_stops_level: int
     visible: bool
     tick_time_msc: int
+    trade_freeze_level: int = 0
+    market_open: bool = True
+
+
+@dataclass(frozen=True)
+class CandleSnapshot:
+    symbol: str
+    timeframe: str
+    time_msc: int
+    open: float
+    high: float
+    low: float
+    close: float
+    tick_volume: int
+    spread: int
+
+
+@dataclass(frozen=True)
+class PositionSizeResult:
+    ok: bool
+    requested_risk_amount: float
+    allowed_risk_amount: float
+    volume: float | None
+    estimated_risk_amount: float
+    failed_code: str | None = None
+    detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -101,6 +140,28 @@ class ActiveOrderSnapshot:
 
 
 @dataclass(frozen=True)
+class DealSnapshot:
+    ticket: int
+    order_id: int
+    position_id: int
+    symbol: str
+    side: Side | None
+    entry: str
+    volume: float
+    price: float
+    profit: float
+    commission: float
+    swap: float
+    fee: float
+    time_msc: int
+    magic_number: int
+
+    @property
+    def net_pnl(self) -> float:
+        return self.profit + self.commission + self.swap + self.fee
+
+
+@dataclass(frozen=True)
 class TradeProposal:
     proposal_id: str
     hypothesis_id: str
@@ -116,6 +177,25 @@ class TradeProposal:
     position_management: str
     thesis: str
     session: str
+    market_regime: str
+
+
+@dataclass(frozen=True)
+class SemanticTradeRequest:
+    idempotency_key: str
+    action: OpenAction
+    symbol: str
+    entry_type: str
+    stop_loss: float
+    take_profit: float | None
+    requested_risk_amount: float
+    hypothesis_id: str
+    strategy_id: str
+    setup_id: str
+    strategy_version: str
+    confidence: float
+    reason: str
+    timeframe: str
     market_regime: str
 
 

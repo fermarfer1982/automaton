@@ -126,6 +126,34 @@ class RiskEngineTests(unittest.TestCase):
         self.assertIn("MARKET_TICK_STALE", stale.failed_codes)
         self.assertIn("ACTIVE_ORDERS_PRESENT", with_order.failed_codes)
 
+    def test_rejects_closed_market_cooldown_drawdown_and_simultaneous_risk(self) -> None:
+        closed = self.engine.evaluate(
+            proposal=proposal(), account=self.adapter.account,
+            market=replace(self.adapter.symbol, market_open=False), positions=[],
+            daily_realized_pnl=0.0, duplicate=False,
+        )
+        cooldown = self.engine.evaluate(
+            proposal=proposal(), account=self.adapter.account, market=self.adapter.symbol,
+            positions=[], daily_realized_pnl=0.0, duplicate=False, cooldown_active=True,
+        )
+        drawdown = self.engine.evaluate(
+            proposal=proposal(), account=replace(self.adapter.account, equity=9_960.0),
+            market=self.adapter.symbol, positions=[], daily_realized_pnl=0.0,
+            duplicate=False, daily_start_equity=10_000.0, daily_peak_equity=10_000.0,
+        )
+        risky_position = PositionSnapshot(
+            ticket=1, symbol="EURUSD", side=Side.BUY, volume=1.0,
+            price_open=2400.0, stop_loss=2300.0, profit=0.0, magic_number=1,
+        )
+        simultaneous = self.engine.evaluate(
+            proposal=proposal(), account=self.adapter.account, market=self.adapter.symbol,
+            positions=[risky_position], daily_realized_pnl=0.0, duplicate=False,
+        )
+        self.assertIn("MARKET_CLOSED", closed.failed_codes)
+        self.assertIn("COOLDOWN_ACTIVE", cooldown.failed_codes)
+        self.assertIn("DAILY_DRAWDOWN_LIMIT_REACHED", drawdown.failed_codes)
+        self.assertIn("SIMULTANEOUS_RISK_EXCEEDED", simultaneous.failed_codes)
+
 
 if __name__ == "__main__":
     unittest.main()

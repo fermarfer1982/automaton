@@ -96,6 +96,18 @@ class SecurityConfigTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 load_security_config(self.write(directory, payload))
 
+    def test_rejects_placeholders_and_merged_ipc_domain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            payload = self.valid_config()
+            payload["authorized_server"] = "REPLACE_WITH_EXACT_DEMO_SERVER"
+            with self.assertRaises(ConfigError):
+                load_security_config(self.write(directory, payload))
+        with tempfile.TemporaryDirectory() as directory:
+            payload = self.valid_config()
+            payload["api_key_path"] = "C:\\ProgramData\\AutomatonMT5Lab\\control\\automaton.key"
+            with self.assertRaises(ConfigError):
+                load_security_config(self.write(directory, payload))
+
 
 if __name__ == "__main__":
     unittest.main()

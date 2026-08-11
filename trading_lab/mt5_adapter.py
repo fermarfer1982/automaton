@@ -15,6 +15,8 @@ from .domain import (
     AccountKind,
     AccountSnapshot,
     ActiveOrderSnapshot,
+    CandleSnapshot,
+    DealSnapshot,
     OrderCheckResult,
     OrderSendResult,
     PositionSnapshot,
@@ -127,6 +129,8 @@ $matched | ConvertTo-Json -Compress
             connected=bool(terminal.connected),
             trade_allowed=bool(account.trade_allowed),
             terminal_trade_allowed=bool(getattr(terminal, "trade_allowed", False)),
+            currency=str(getattr(account, "currency", "UNKNOWN")),
+            account_name=str(getattr(account, "name", "")) or None,
         )
 
     def symbol_snapshot(self, symbol: str) -> SymbolSnapshot:
@@ -153,7 +157,70 @@ $matched | ConvertTo-Json -Compress
             trade_stops_level=int(info.trade_stops_level),
             visible=bool(info.visible),
             tick_time_msc=int(tick.time_msc),
+            trade_freeze_level=int(getattr(info, "trade_freeze_level", 0)),
+            market_open=int(getattr(info, "trade_mode", 0))
+            != int(getattr(mt5, "SYMBOL_TRADE_MODE_DISABLED", -1)),
         )
+
+    def candles(self, symbol: str, timeframe: str, count: int) -> list[CandleSnapshot]:
+        if count < 1 or count > 500:
+            raise MT5AdapterError("Candle count must be between 1 and 500")
+        mt5 = self._module()
+        timeframes = {
+            "M1": mt5.TIMEFRAME_M1,
+            "M5": mt5.TIMEFRAME_M5,
+            "M15": mt5.TIMEFRAME_M15,
+            "H1": mt5.TIMEFRAME_H1,
+        }
+        if timeframe not in timeframes:
+            raise MT5AdapterError("Unsupported candle timeframe")
+        # Position zero is the still-forming bar; the laboratory consumes only closed bars.
+        rates = mt5.copy_rates_from_pos(symbol, timeframes[timeframe], 1, count)
+        if rates is None:
+            raise self._error("copy_rates_from_pos")
+        candles: list[CandleSnapshot] = []
+        for rate in rates:
+            def field(name: str):
+                try:
+                    return rate[name]
+                except (KeyError, TypeError, IndexError):
+                    return getattr(rate, name)
+
+            values = [float(field(name)) for name in ("open", "high", "low", "close")]
+            if not all(math.isfinite(value) and value > 0 for value in values):
+                raise MT5AdapterError("MT5 returned invalid candle values")
+            if values[1] < max(values[0], values[3]) or values[2] > min(values[0], values[3]):
+                raise MT5AdapterError("MT5 returned inconsistent candle bounds")
+            candles.append(CandleSnapshot(
+                symbol=symbol,
+                timeframe=timeframe,
+                time_msc=int(field("time")) * 1000,
+                open=values[0],
+                high=values[1],
+                low=values[2],
+                close=values[3],
+                tick_volume=int(field("tick_volume")),
+                spread=int(field("spread")),
+            ))
+        return candles
+
+    def order_calc_profit(
+        self,
+        side: Side,
+        symbol: str,
+        volume: float,
+        price_open: float,
+        price_close: float,
+    ) -> float:
+        mt5 = self._module()
+        order_type = mt5.ORDER_TYPE_BUY if side is Side.BUY else mt5.ORDER_TYPE_SELL
+        result = mt5.order_calc_profit(order_type, symbol, volume, price_open, price_close)
+        if result is None:
+            raise self._error("order_calc_profit")
+        profit = float(result)
+        if not math.isfinite(profit):
+            raise MT5AdapterError("order_calc_profit returned a non-finite value")
+        return profit
 
     def positions(self) -> list[PositionSnapshot]:
         mt5 = self._module()
@@ -196,6 +263,59 @@ $matched | ConvertTo-Json -Compress
             )
             for item in raw_orders
         ]
+
+    def history(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        symbol: str | None = None,
+        limit: int = 1000,
+    ) -> list[DealSnapshot]:
+        if start.tzinfo is None or end.tzinfo is None or end <= start:
+            raise MT5AdapterError("History bounds must be ordered timezone-aware datetimes")
+        if limit < 1 or limit > 1000:
+            raise MT5AdapterError("History limit must be between 1 and 1000")
+        mt5 = self._module()
+        deals = mt5.history_deals_get(start, end)
+        if deals is None:
+            raise self._error("history_deals_get")
+        result: list[DealSnapshot] = []
+        entry_names = {
+            int(getattr(mt5, "DEAL_ENTRY_IN", 0)): "IN",
+            int(mt5.DEAL_ENTRY_OUT): "OUT",
+            int(mt5.DEAL_ENTRY_INOUT): "INOUT",
+            int(mt5.DEAL_ENTRY_OUT_BY): "OUT_BY",
+        }
+        for deal in deals:
+            deal_symbol = str(getattr(deal, "symbol", ""))
+            if symbol is not None and deal_symbol != symbol:
+                continue
+            raw_type = int(getattr(deal, "type", -1))
+            side = (
+                Side.BUY if raw_type == int(mt5.ORDER_TYPE_BUY)
+                else Side.SELL if raw_type == int(mt5.ORDER_TYPE_SELL)
+                else None
+            )
+            result.append(DealSnapshot(
+                ticket=int(getattr(deal, "ticket", 0)),
+                order_id=int(getattr(deal, "order", 0)),
+                position_id=int(getattr(deal, "position_id", 0)),
+                symbol=deal_symbol,
+                side=side,
+                entry=entry_names.get(int(getattr(deal, "entry", -1)), "UNKNOWN"),
+                volume=float(getattr(deal, "volume", 0.0)),
+                price=float(getattr(deal, "price", 0.0)),
+                profit=float(getattr(deal, "profit", 0.0)),
+                commission=float(getattr(deal, "commission", 0.0)),
+                swap=float(getattr(deal, "swap", 0.0)),
+                fee=float(getattr(deal, "fee", 0.0)),
+                time_msc=int(getattr(deal, "time_msc", 0)),
+                magic_number=int(getattr(deal, "magic", 0)),
+            ))
+            if len(result) >= limit:
+                break
+        return result
 
     def daily_realized_pnl(self) -> float:
         mt5 = self._module()

@@ -38,6 +38,7 @@ $state = Get-CanonicalPath $AutomatonStateDir
 $workspace = Get-CanonicalPath $WorkspaceRoot
 $control = Join-Path $root 'control'
 $data = Join-Path $root 'data'
+$ipc = Join-Path $root 'ipc'
 $driveRoot = [System.IO.Path]::GetPathRoot($root).TrimEnd('\')
 
 if ($root -eq $driveRoot -or $root -ieq 'C:\ProgramData' -or $state -ieq 'C:\Users') {
@@ -68,9 +69,10 @@ $plan = [pscustomobject]@{
     automaton_sid = $automatonSid.Value
     control_directory = $control
     data_directory = $data
+    ipc_directory = $ipc
     automaton_state_directory = $state
     read_only_workspace = $workspace
-    security_config = (Join-Path $control 'security.json')
+    security_config = (Join-Path $control 'trading.yaml')
 }
 $plan | ConvertTo-Json -Depth 4
 if (-not $Apply) {
@@ -100,10 +102,18 @@ if ($workspaceItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
     throw "Refusing a workspace root that is a reparse point: $workspace"
 }
 
-foreach ($directory in @($root, $control, $data, $state)) {
+foreach ($directory in @($root, $control, $data, $ipc, $state)) {
     if (-not (Test-Path -LiteralPath $directory)) {
         New-Item -ItemType Directory -Path $directory | Out-Null
     }
+}
+
+$apiKeyPath = Join-Path $ipc 'automaton.key'
+if (-not (Test-Path -LiteralPath $apiKeyPath)) {
+    $bytes = [byte[]]::new(32)
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $apiKey = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+    [System.IO.File]::WriteAllText($apiKeyPath, $apiKey, [System.Text.Encoding]::ASCII)
 }
 
 function New-AccessRule(
@@ -167,6 +177,10 @@ Set-ExactAcl $workspace @($gatewaySid, $automatonSid) @(
 ) $true
 Set-ExactTreeAcl $control @($gatewaySid) @([System.Security.AccessControl.FileSystemRights]::ReadAndExecute)
 Set-ExactTreeAcl $data @($gatewaySid) @([System.Security.AccessControl.FileSystemRights]::Modify)
+Set-ExactTreeAcl $ipc @($gatewaySid, $automatonSid) @(
+    [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+    [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+)
 Set-ExactTreeAcl $state @($automatonSid) @([System.Security.AccessControl.FileSystemRights]::Modify)
 
 foreach ($protectedDirectory in @(
@@ -192,7 +206,8 @@ foreach ($relativeFile in @(
     'src\index.ts', 'src\config.ts', 'src\agent\loop.ts', 'src\agent\tools.ts',
     'src\conway\inference.ts', 'src\identity\wallet.ts', 'src\self-mod\code.ts',
     'src\types.ts', 'scripts\Initialize-TradingLabAcl.ps1', 'package.json',
-    'config\trading.security.example.json', 'requirements-mt5.txt'
+    'config\trading.security.example.json', 'config\trading.example.yaml',
+    'requirements-mt5.txt'
 )) {
     $protectedFile = Join-Path $workspace $relativeFile
     if (-not (Test-Path -LiteralPath $protectedFile -PathType Leaf)) {
@@ -204,4 +219,4 @@ foreach ($relativeFile in @(
     ) $false
 }
 
-Write-Host 'ACLs applied. Copy security.json as Administrator, then run readiness before starting either process.'
+Write-Host 'ACLs applied. Copy trading.yaml as Administrator, then run readiness before starting either process.'

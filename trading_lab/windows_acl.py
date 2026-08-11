@@ -105,6 +105,8 @@ def _targets(config_path: Path, config: SecurityConfig, include_automaton_state:
         (config.audit_path.parent, "gateway_data", True, True),
         (workspace, "workspace_code", True, True),
     ]
+    if config.api_key_path is not None:
+        raw.append((config.api_key_path.parent, "gateway_ipc", True, True))
     for relative in (
         "trading_lab", "src/trading", "src/index.ts", "src/config.ts",
         "src/agent/loop.ts", "src/agent/tools.ts", "src/conway/inference.ts",
@@ -122,6 +124,13 @@ def _targets(config_path: Path, config: SecurityConfig, include_automaton_state:
     ):
         if item.exists():
             raw.append((item, role, item.is_dir(), False))
+    for item in (config.audit_db_path, config.gateway_lock_path):
+        if item is not None and item.exists():
+            raw.append((item, "gateway_data", item.is_dir(), False))
+    if config.log_dir is not None and config.log_dir.exists():
+        raw.append((config.log_dir, "gateway_data", True, True))
+    if config.api_key_path is not None and config.api_key_path.exists():
+        raw.append((config.api_key_path, "gateway_ipc", False, False))
     if include_automaton_state:
         raw.append((config.automaton_state_dir, "automaton_state", True, True))
     deduplicated: dict[tuple[str, str], dict[str, Any]] = {}
@@ -169,7 +178,7 @@ def evaluate_acl_snapshot(
                 raise ValueError(f"ACL target cannot be a reparse point: {path}")
             if target.get("require_protected", target.get("is_directory")) and not target.get("protected"):
                 raise ValueError(f"directory inheritance is not disabled: {path}")
-            if role == "workspace_code":
+            if role in {"workspace_code", "gateway_ipc"}:
                 required_sids = {gateway_sid, automaton_sid}
                 forbidden_sid = None
             else:
@@ -217,12 +226,12 @@ def evaluate_acl_snapshot(
                     raise ValueError(f"required identity lacks modify access to {path}")
                 if deny_rights[principal] & MODIFY_RIGHTS:
                     raise ValueError(f"required modify access is denied on {path}")
-            elif role == "workspace_code":
+            elif role in {"workspace_code", "gateway_ipc"}:
                 for principal in required_sids:
                     if allow_rights[principal] & READ_RIGHTS != READ_RIGHTS:
-                        raise ValueError(f"runtime identity lacks read access to code target {path}")
+                        raise ValueError(f"runtime identity lacks read access to protected target {path}")
                     if allow_rights[principal] & WRITE_OR_SECURITY_RIGHTS:
-                        raise ValueError(f"runtime identity can modify protected code target {path}")
+                        raise ValueError(f"runtime identity can modify protected target {path}")
                     if deny_rights[principal] & READ_RIGHTS:
                         raise ValueError(f"runtime identity read access is denied on {path}")
             else:

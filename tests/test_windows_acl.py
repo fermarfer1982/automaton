@@ -36,6 +36,8 @@ def target(path: str, role: str, principal: str, rights: int) -> dict[str, objec
 
 
 def safe_snapshot() -> dict[str, object]:
+    ipc = target("C:/ipc", "gateway_ipc", GATEWAY, READ_RIGHTS)
+    ipc["rules"].append(rule(AGENT, READ_RIGHTS))  # type: ignore[union-attr]
     return {
         "gateway_sid": GATEWAY,
         "automaton_sid": AGENT,
@@ -45,6 +47,7 @@ def safe_snapshot() -> dict[str, object]:
             target("C:/control", "gateway_control", GATEWAY, READ_RIGHTS),
             target("C:/data", "gateway_data", GATEWAY, MODIFY_RIGHTS),
             target("C:/agent", "automaton_state", AGENT, MODIFY_RIGHTS),
+            ipc,
         ],
     }
 
@@ -56,7 +59,7 @@ def workspace_target() -> dict[str, object]:
 
 
 class WindowsAclTests(unittest.TestCase):
-    def test_accepts_strict_three_way_separation(self) -> None:
+    def test_accepts_strict_control_data_ipc_state_separation(self) -> None:
         result = evaluate_acl_snapshot(safe_snapshot(), require_current_gateway=True)
         self.assertTrue(result.passed, result.detail)
 
@@ -93,6 +96,11 @@ class WindowsAclTests(unittest.TestCase):
         snapshot["targets"].append(workspace_target())  # type: ignore[union-attr]
         self.assertTrue(evaluate_acl_snapshot(snapshot).passed)
         snapshot["targets"][-1]["rules"][-1] = rule(AGENT, MODIFY_RIGHTS)  # type: ignore[index]
+        self.assertFalse(evaluate_acl_snapshot(snapshot).passed)
+
+    def test_ipc_requires_both_identities_read_only(self) -> None:
+        snapshot = safe_snapshot()
+        snapshot["targets"][3]["rules"][-1] = rule(AGENT, MODIFY_RIGHTS)  # type: ignore[index]
         self.assertFalse(evaluate_acl_snapshot(snapshot).passed)
 
 

@@ -17,6 +17,8 @@ from .config import load_security_config
 from .domain import Side, TradeProposal
 from .factory import build_application
 from .mt5_adapter import MT5Adapter
+from .api_auth import ApiKeyVerifier
+from .process_lock import GatewayProcessLock
 from .windows_acl import verify_windows_acl
 
 
@@ -199,16 +201,31 @@ def serve(config_path: str | Path, port: int = 8765) -> None:
     )
     if not acl.passed:
         raise PermissionError(f"Gateway ACL verification failed: {acl.detail}")
-    adapter = MT5Adapter(config.mt5_terminal_path)
-    if not adapter.initialize():
-        raise RuntimeError("MT5 initialization failed")
-    app = build_application(config, adapter, runtime_identity_verified=True)
-    server = create_server(app, port)
-    try:
-        server.serve_forever()
-    finally:
-        server.server_close()
-        adapter.shutdown()
+    if config.api_key_path is None or config.gateway_lock_path is None:
+        raise RuntimeError("Gateway IPC key or process lock path is missing")
+    verifier = ApiKeyVerifier(config.api_key_path)
+    process_lock = GatewayProcessLock(config.gateway_lock_path)
+    with process_lock:
+        adapter = MT5Adapter(config.mt5_terminal_path)
+        if not adapter.initialize():
+            raise RuntimeError("MT5 initialization failed")
+        application = build_application(config, adapter, runtime_identity_verified=True)
+        try:
+            try:
+                import uvicorn
+                from .fastapi_service import create_fastapi_app
+            except ImportError as exc:
+                raise RuntimeError("FastAPI/Uvicorn dependencies are unavailable") from exc
+            api = create_fastapi_app(application, verifier)
+            uvicorn.run(
+                api,
+                host="127.0.0.1",
+                port=port,
+                log_config=None,
+                access_log=False,
+            )
+        finally:
+            adapter.shutdown()
 
 
 def main() -> None:
@@ -217,7 +234,7 @@ def main() -> None:
         "--config",
         default=os.environ.get(
             "AUTOMATON_MT5_SECURITY_CONFIG",
-            r"C:\ProgramData\AutomatonMT5Lab\control\security.json",
+            r"C:\ProgramData\AutomatonMT5Lab\control\trading.yaml",
         ),
     )
     parser.add_argument("--port", type=int, default=8765)

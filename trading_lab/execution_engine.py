@@ -4,10 +4,10 @@ from collections.abc import Callable
 from typing import Any, Protocol
 
 from .authorization import AuthorizationDecision
-from .domain import ExecutionResult, GuardDecision, Side, SymbolSnapshot, TradeProposal
+from .domain import ExecutionResult, GuardDecision, RiskStage, Side, SymbolSnapshot, TradeProposal
 
 
-class ExecutionAdapter(Protocol):
+class ExecutionProvider(Protocol):
     def order_check(self, request: dict[str, object]): ...
     def order_send(self, request: dict[str, object]): ...
 
@@ -20,7 +20,7 @@ AuthorizationCheck = Callable[[], AuthorizationDecision]
 class ExecutionEngine:
     """The sole component allowed to sequence MT5 order_check and order_send."""
 
-    def __init__(self, adapter: ExecutionAdapter) -> None:
+    def __init__(self, adapter: ExecutionProvider) -> None:
         self._adapter = adapter
 
     @staticmethod
@@ -66,7 +66,11 @@ class ExecutionEngine:
         pre_send = pre_send_guard()
         audit_hook(
             "pre_send_guard_decision",
-            {"proposal_id": proposal.proposal_id, "checks": pre_send.checks},
+            {
+                "stage": RiskStage.PRE_EXECUTION_CHECK.value,
+                "proposal_id": proposal.proposal_id,
+                "checks": pre_send.checks,
+            },
         )
         if not pre_send.allowed:
             return ExecutionResult(

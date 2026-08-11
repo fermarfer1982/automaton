@@ -67,6 +67,9 @@ class RiskEngine:
         duplicate: bool,
         active_orders: Sequence[ActiveOrderSnapshot] = (),
         now_msc: int | None = None,
+        cooldown_active: bool = False,
+        daily_start_equity: float | None = None,
+        daily_peak_equity: float | None = None,
     ) -> GuardDecision:
         checks: list[CheckResult] = []
 
@@ -76,6 +79,7 @@ class RiskEngine:
         add("SYMBOL_NOT_ALLOWED", proposal.symbol == self._allowed_symbol, "Only XAUUSD is allowed")
         add("MARKET_SYMBOL_MISMATCH", market.symbol == proposal.symbol, "Market data must match proposal symbol")
         add("SYMBOL_NOT_VISIBLE", market.visible, "Symbol must already be visible in MT5")
+        add("MARKET_CLOSED", market.market_open, "XAUUSD must be open for trading")
         add(
             "MAGIC_NUMBER_MISMATCH",
             proposal.magic_number == self._required_magic_number,
@@ -87,6 +91,7 @@ class RiskEngine:
             "Martingale, grid, averaging down, and multi-entry management are forbidden",
         )
         add("DUPLICATE_PROPOSAL", not duplicate, "Equivalent recent proposal must not be repeated")
+        add("COOLDOWN_ACTIVE", not cooldown_active, "Configured entry cooldown is still active")
         add(
             "ACTIVE_ORDERS_PRESENT",
             len(active_orders) == 0,
@@ -140,7 +145,11 @@ class RiskEngine:
         )
         add("STOP_LOSS_WRONG_SIDE", stop_correct_side, "Stop loss must be beyond entry on the loss side")
         stop_distance_points = abs(entry - stop) / market.point if valid_market and valid_stop else 0.0
-        minimum_stop_points = max(self._limits.min_stop_distance_points, market.trade_stops_level)
+        minimum_stop_points = max(
+            self._limits.min_stop_distance_points,
+            market.trade_stops_level,
+            market.trade_freeze_level,
+        )
         add(
             "STOP_DISTANCE_TOO_SMALL",
             stop_correct_side and stop_distance_points >= minimum_stop_points,
@@ -159,7 +168,10 @@ class RiskEngine:
         estimated_risk = 0.0
         if valid_market and valid_stop and finite_volume:
             estimated_risk = abs(entry - stop) / market.tick_size * market.tick_value * proposal.volume
-        risk_cap = account.equity * self._limits.max_risk_per_trade_fraction
+        risk_cap = min(
+            account.equity * self._limits.max_risk_per_trade_fraction,
+            self._limits.max_risk_per_trade_amount,
+        )
         add(
             "RISK_PER_TRADE_EXCEEDED",
             math.isfinite(estimated_risk) and 0 < estimated_risk <= risk_cap,
@@ -183,10 +195,52 @@ class RiskEngine:
             exposure <= self._limits.max_symbol_exposure_lots,
             "Symbol lot exposure exceeds configured cap",
         )
-        daily_loss_cap = account.balance * self._limits.max_daily_loss_fraction
+        existing_stop_risk = 0.0
+        existing_risk_valid = valid_market
+        for position in positions:
+            if position.stop_loss is None or not math.isfinite(position.stop_loss):
+                existing_risk_valid = False
+                break
+            existing_risk_valid = existing_risk_valid and position.volume > 0
+            if valid_market:
+                existing_stop_risk += (
+                    abs(position.price_open - position.stop_loss)
+                    / market.tick_size
+                    * market.tick_value
+                    * position.volume
+                )
+        simultaneous_cap = min(
+            account.equity * self._limits.max_simultaneous_risk_fraction,
+            self._limits.max_simultaneous_risk_amount,
+        )
+        add(
+            "SIMULTANEOUS_RISK_EXCEEDED",
+            existing_risk_valid
+            and math.isfinite(existing_stop_risk + estimated_risk)
+            and existing_stop_risk + estimated_risk <= simultaneous_cap,
+            "Total stop-loss risk exceeds the simultaneous cap",
+        )
+        daily_loss_cap = min(
+            account.balance * self._limits.max_daily_loss_fraction,
+            self._limits.max_daily_loss_amount,
+        )
         add(
             "DAILY_LOSS_LIMIT_REACHED",
             math.isfinite(daily_realized_pnl) and daily_realized_pnl > -daily_loss_cap,
             "Realized daily loss is at or beyond the configured cap",
+        )
+        start_equity = account.balance if daily_start_equity is None else daily_start_equity
+        peak_equity = max(start_equity, account.equity) if daily_peak_equity is None else daily_peak_equity
+        drawdown = peak_equity - account.equity
+        drawdown_cap = min(
+            start_equity * self._limits.max_daily_drawdown_fraction,
+            self._limits.max_daily_drawdown_amount,
+        )
+        add(
+            "DAILY_DRAWDOWN_LIMIT_REACHED",
+            all(math.isfinite(value) and value > 0 for value in (start_equity, peak_equity))
+            and math.isfinite(drawdown)
+            and drawdown < drawdown_cap,
+            "UTC-day equity drawdown is at or beyond the configured cap",
         )
         return GuardDecision(checks=tuple(checks), estimated_risk_amount=estimated_risk)
