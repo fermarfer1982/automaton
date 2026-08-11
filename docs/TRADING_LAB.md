@@ -91,6 +91,9 @@ Tras revisar SIDs/rutas, un administrador puede repetir con `-Apply`. La opción
 adicional `-InstallDependencies` es una autorización humana separada. Usa
 `requirements-gateway-win-py314.lock` (wheels CPython 3.14/Windows x64, hashes
 SHA-256 completos) y `pnpm --frozen-lockfile`; no se ejecuta automáticamente.
+Los scripts resuelven exclusivamente el runtime portable local
+`.runtime\node-v22.22.0-win-x64`, verifican Node v22.22.0 x64 y el SHA-256 del
+ejecutable antes de usar Corepack con pnpm 10.28.1. `.runtime/` no se versiona.
 
 ACLs separadas:
 

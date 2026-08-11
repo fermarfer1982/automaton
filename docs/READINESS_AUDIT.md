@@ -26,31 +26,27 @@ identidades dedicadas y con `TRADING_MODE=OBSERVE_ONLY`.
 | Scripts, ACL, kill switch independiente y enable DEMO humano | `scripts/*.ps1`, `operator.py`, tests ACL/operator | AST/tests locales; aplicación real pendiente |
 
 La `.venv` local se instaló con `--require-hashes` y el lock CPython 3.14 x64.
-La suite `pytest` ejecuta 123 tests y 6 subtests: todos pasan. Con pnpm 10.28.1,
-TypeScript typecheck, build y los 5 ficheros/12 tests específicos de trading
-también pasan.
+La suite `pytest` ejecuta 124 tests y 6 subtests: todos pasan. TypeScript
+typecheck y build pasan; Vitest ejecuta 69 ficheros y 1.656 tests: todos pasan,
+incluidos los 5 ficheros/12 tests específicos de trading.
 
-El host solo ofrece Node 24.16.0. `better-sqlite3` 11.10.0 no publica un binding
-precompilado para su ABI y el host no contiene el toolchain C++ necesario para
-compilarlo. El install congelado se completó con scripts nativos deshabilitados
-para poder verificar typecheck/build, pero la suite Vitest upstream completa no
-puede considerarse verde: los tests que abren su SQLite fallan por ausencia del
-binding. El proyecto y CI usan Node 20/22; los scripts ahora rechazan otras
-versiones antes de instalar o probar.
+El runtime local fijado es Node v22.22.0 x64 en `.runtime/`, descargado de la
+distribución oficial y verificado contra el SHA-256 publicado. Los scripts de
+setup, arranque y pruebas resuelven ese binario exacto, vuelven a comprobar su
+hash y rechazan una versión, arquitectura o binario reparse-point distintos.
+Corepack ejecuta pnpm 10.28.1 de forma explícita; el install congelado y los
+scripts nativos de `better-sqlite3` y `esbuild` se completaron correctamente.
 
 ## Evidencia todavía ausente por gates humanos
 
-1. Provisión humana de Node 20.18+ o Node 22 y repetición de
-   `pnpm install --frozen-lockfile` con pnpm 10.28.1, incluidos scripts nativos;
-   después, ejecución verde de Vitest completo.
-2. Creación manual de dos usuarios Windows distintos y no administradores, sin
+1. Creación manual de dos usuarios Windows distintos y no administradores, sin
    compartir contraseñas con el proyecto o el agente.
-3. Aplicación humana de ACL después de revisar el dry-run de SIDs y rutas.
-4. Configuración protegida del login DEMO, servidor/nombre exactos, ruta del
+2. Aplicación humana de ACL después de revisar el dry-run de SIDs y rutas.
+3. Configuración protegida del login DEMO, servidor/nombre exactos, ruta del
    terminal y límites revisados; no contiene contraseña.
-5. Selección explícita del proveedor/modelo y claves solo en el entorno Agent.
-6. Terminal MT5 visible bajo Gateway y smoke test live exclusivamente read-only.
-7. Gateway y Automaton activos bajo sus identidades, con evidencia fresca de
+4. Selección explícita del proveedor/modelo y claves solo en el entorno Agent.
+5. Terminal MT5 visible bajo Gateway y smoke test live exclusivamente read-only.
+6. Gateway y Automaton activos bajo sus identidades, con evidencia fresca de
    tools/inferencia y cero exposición.
 
 Hasta completar esos puntos, el único informe honesto es:
@@ -70,8 +66,8 @@ SECURITY_TESTS=false
 TRADING_MODE=UNVERIFIED
 ```
 
-Solo se instalaron la `.venv` hash-locked, el paquete pnpm 10.28.1 de Corepack y
-las dependencias Node del lock; no se instalaron Node/toolchains adicionales.
-No se ha aplicado ACL, leído una cuenta live, enviado una orden ni habilitado
-`DEMO_EXECUTION`. Cuando el informe pase a `true`, el proceso debe detenerse y
-solicitar una autorización humana nueva antes de cualquier ejecución DEMO.
+Solo se instalaron la `.venv` hash-locked, Node v22.22.0 x64 portable, pnpm
+10.28.1 mediante Corepack y las dependencias Node del lock. No se ha aplicado
+ACL, leído una cuenta live, enviado una orden ni habilitado `DEMO_EXECUTION`.
+Cuando el informe pase a `true`, el proceso debe detenerse y solicitar una
+autorización humana nueva antes de cualquier ejecución DEMO.
