@@ -7,11 +7,11 @@ $usersGroupSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-5
 $accountDefinitions = @(
     [pscustomobject]@{
         Name = 'AutomatonAgent'
-        Description = 'Automaton MT5 Lab agent identity'
+        Description = 'Automaton trading agent'
     },
     [pscustomobject]@{
         Name = 'AutomatonGateway'
-        Description = 'Automaton MT5 Lab gateway and interactive MT5 identity'
+        Description = 'Automaton MT5 gateway'
     }
 )
 

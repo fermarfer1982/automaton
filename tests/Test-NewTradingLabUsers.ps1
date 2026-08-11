@@ -47,6 +47,23 @@ Assert-True `
     (-not ($source -match 'Set-LocalUser|Remove-LocalUser|Set-Acl')) `
     'The provisioning script must not reset users, passwords, or ACLs.'
 
+$descriptionMatches = @([regex]::Matches($source, "Description\s*=\s*'([^']*)'"))
+Assert-True ($descriptionMatches.Count -eq 2) 'Expected exactly two stable account descriptions.'
+foreach ($descriptionMatch in $descriptionMatches) {
+    Assert-True `
+        ($descriptionMatch.Groups[1].Value.Length -le 48) `
+        "Account description exceeds the Windows 48-character limit: $($descriptionMatch.Groups[1].Value.Length)"
+}
+Assert-True `
+    (([regex]::Matches($source, '\$definition\.Description')).Count -eq 1) `
+    'Description must only be passed to New-LocalUser.'
+Assert-True `
+    ($source.Contains('-Description $definition.Description')) `
+    'Description must not participate in security validation.'
+Assert-True `
+    (-not ($source -match 'Description\s*(-eq|-ne|-match|-notmatch)|Where-Object[^\r\n]*Description')) `
+    'Security behavior must not depend on Description content.'
+
 # Reproduce the original binder mismatch without changing any group. The
 # currently executing local account is used only as a read-only typed fixture.
 $fixture = Get-LocalUser -Name $env:USERNAME -ErrorAction Stop
@@ -69,6 +86,8 @@ Assert-True $sidBindingFailed 'SecurityIdentifier unexpectedly bound as LocalPri
     powershell_ast = 'PASS'
     local_principal_binding = 'PASS'
     security_identifier_regression = 'PASS'
+    description_length = 'PASS'
+    description_security_independent = 'PASS'
     users_group_sid = 'S-1-5-32-545'
     idempotent_resume_guards = 'PASS'
     privileged_group_fail_closed = 'PASS'
