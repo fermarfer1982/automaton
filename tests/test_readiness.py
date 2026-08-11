@@ -75,7 +75,7 @@ class ReadinessAclGateTests(unittest.TestCase):
                     "trading_lab.service.verify_windows_acl",
                     return_value=AclVerification(False, "unsafe ACL"),
                 ),
-                patch("trading_lab.service.MT5Adapter") as adapter,
+                patch("trading_lab.service.MT5ExecutionProvider") as adapter,
             ):
                 with self.assertRaises(PermissionError):
                     serve(Path(directory) / "security.json")

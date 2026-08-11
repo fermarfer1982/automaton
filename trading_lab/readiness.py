@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -15,7 +16,7 @@ from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .api_auth import ApiKeyVerifier
-from .config import SecurityConfig, load_security_config
+from .config import SecurityConfig, load_security_config, security_config_hash
 from .domain import TradingMode
 from .windows_acl import verify_windows_acl
 
@@ -309,14 +310,50 @@ def run_readiness(config_path: str | Path, *, run_tests: bool = True) -> dict[st
                 "all tests passed" if completed.returncode == 0 else "test suite failed",
             )
         )
+        risk_completed = subprocess.run(
+            [
+                sys.executable, "-m", "pytest", "-q",
+                "tests/test_risk_engine.py",
+                "tests/test_position_sizer.py",
+                "tests/test_position_management.py",
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        checks.append(
+            ReadinessCheck(
+                "risk_tests",
+                risk_completed.returncode == 0,
+                "deterministic risk tests passed"
+                if risk_completed.returncode == 0 else "risk test suite failed",
+            )
+        )
         workspace = Path(__file__).resolve().parents[1]
         pnpm = shutil.which("pnpm")
-        node_dependencies = (workspace / "node_modules").is_dir() and pnpm is not None
+        pnpm_reviewed = False
+        if pnpm is not None:
+            try:
+                version = subprocess.run(
+                    [pnpm, "--version"], capture_output=True, text=True,
+                    timeout=15, check=False,
+                )
+                pnpm_reviewed = version.returncode == 0 and version.stdout.strip() == "10.28.1"
+            except (OSError, subprocess.TimeoutExpired):
+                pnpm_reviewed = False
+        node_dependencies = (
+            (workspace / "node_modules").is_dir()
+            and pnpm is not None
+            and pnpm_reviewed
+        )
         checks.append(
             ReadinessCheck(
                 "automaton_dependencies",
                 node_dependencies,
-                "pnpm dependencies present" if node_dependencies else "node_modules not installed",
+                "pnpm 10.28.1 dependencies present"
+                if node_dependencies else "reviewed pnpm/node_modules unavailable",
             )
         )
         if node_dependencies and pnpm is not None:
@@ -485,9 +522,17 @@ def run_readiness(config_path: str | Path, *, run_tests: bool = True) -> dict[st
                 "security tests were not run; readiness cannot be asserted",
             )
         )
+        checks.append(
+            ReadinessCheck(
+                "risk_tests",
+                False,
+                "risk tests were not run; readiness cannot be asserted",
+            )
+        )
     ready = bool(checks) and all(check.passed for check in checks)
     by_name = {check.name: check.passed for check in checks}
     security_tests = by_name.get("security_tests", False)
+    risk_tests = by_name.get("risk_tests", False)
     tools_ready = all(
         by_name.get(name, False)
         for name in (
@@ -510,8 +555,9 @@ def run_readiness(config_path: str | Path, *, run_tests: bool = True) -> dict[st
         "GATEWAY_HEALTH": gateway_healthy,
         "AUTOMATON_TOOLS_READY": tools_ready,
         "AUDIT_READY": audit_ready,
-        "RISK_TESTS": security_tests,
+        "RISK_TESTS": risk_tests,
         "SECURITY_TESTS": security_tests,
+        "SECURITY_CONFIG_SHA256": security_config_hash(config) if config is not None else None,
         "TRADING_MODE": (
             TradingMode.OBSERVE_ONLY.value
             if by_name.get("observe_only_mode", False)
@@ -532,9 +578,34 @@ def main() -> None:
             r"C:\ProgramData\AutomatonMT5Lab\control\trading.yaml",
         ),
     )
+    parser.add_argument(
+        "--output",
+        help="Optional absolute external path for the sanitized readiness artifact",
+    )
     args = parser.parse_args()
     report = run_readiness(args.config)
-    print(json.dumps(report, indent=2))
+    encoded = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    if args.output:
+        output = Path(args.output)
+        workspace = Path(__file__).resolve().parents[1]
+        try:
+            safe = (
+                output.is_absolute()
+                and not output.resolve().is_relative_to(workspace)
+                and not output.is_symlink()
+            )
+        except OSError:
+            safe = False
+        if not safe:
+            raise SystemExit("Readiness output must be an absolute non-symlink path outside the workspace")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output.with_name(f"{output.name}.{os.getpid()}.tmp")
+        temporary.write_text(encoded, encoding="utf-8", newline="\n")
+        temporary.replace(output)
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        digest_path = output.with_name(f"{output.name}.sha256")
+        digest_path.write_text(f"{digest}  {output.name}\n", encoding="ascii", newline="\n")
+    print(encoded, end="")
     print(f"AUTOMATON_MT5_LAB_READY={str(report['AUTOMATON_MT5_LAB_READY']).lower()}")
     raise SystemExit(0 if report["AUTOMATON_MT5_LAB_READY"] else 1)
 

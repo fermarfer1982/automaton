@@ -42,6 +42,7 @@ import { loadTradingLabIdentity } from "./trading/identity.js";
 import { getCurrentWindowsIdentityProof } from "./trading/windows-identity.js";
 import { recordTradingLabTurn } from "./trading/status.js";
 import { recordProcessedTradingBar, TradingHeartbeat } from "./trading/heartbeat.js";
+import { configureTradingLabLogging } from "./trading/logging.js";
 
 const logger = createLogger("main");
 const VERSION = "0.2.1";
@@ -246,6 +247,7 @@ async function run(): Promise<void> {
       throw new Error("Automaton is not running as its configured least-privilege Windows identity");
     }
     tradingLabWindowsSid = windowsIdentity.sid;
+    configureTradingLabLogging(getAutomatonDir());
   }
 
   // Load wallet (chain-aware)

@@ -1,5 +1,7 @@
 # Automaton: Self-Improving, Self-Replicating, Sovereign AI
 
+> **Perfil MT5 seguro:** este repositorio incluye un perfil de laboratorio separado para una cuenta MetaTrader 5 DEMO autorizada. Permanece por defecto en `OBSERVE_ONLY`; desactiva wallet, pagos, replicación, shell e instalaciones del agente, y no habilita operaciones automáticamente. Consulte [la guía del laboratorio](docs/TRADING_LAB.md) y [sus invariantes](docs/SECURITY_INVARIANTS.md).
+
 *The first AI that can earn its own existence, replicate, and evolve — without needing a human.*
 
 ---

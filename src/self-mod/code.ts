@@ -98,6 +98,19 @@ const PROTECTED_FILES: readonly string[] = Object.freeze([
   "trading-lab-identity.json",
   "trading-lab-runtime-status.json",
   "scripts/Initialize-TradingLabAcl.ps1",
+  "scripts/setup.ps1",
+  "scripts/start_gateway.ps1",
+  "scripts/start_automaton.ps1",
+  "scripts/status.ps1",
+  "scripts/stop.ps1",
+  "scripts/test_gateway.ps1",
+  "scripts/enable_demo_trading.ps1",
+  "scripts/disable_trading.ps1",
+  "scripts/emergency_stop.ps1",
+  "requirements-gateway-win-py314.lock",
+  "requirements-gateway.in",
+  "docs/TRADING_LAB.md",
+  "docs/SECURITY_INVARIANTS.md",
 ]);
 
 /**

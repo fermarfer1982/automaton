@@ -28,6 +28,8 @@ describe("trading runtime profile", () => {
       tool("propose_trade"),
       tool("remember_fact"),
       tool("save_procedure"),
+      tool("set_goal"),
+      tool("complete_goal"),
       tool("exec"),
       tool("git_push"),
       tool("transfer_credits"),

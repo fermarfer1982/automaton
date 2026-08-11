@@ -206,8 +206,12 @@ foreach ($relativeFile in @(
     'src\index.ts', 'src\config.ts', 'src\agent\loop.ts', 'src\agent\tools.ts',
     'src\conway\inference.ts', 'src\identity\wallet.ts', 'src\self-mod\code.ts',
     'src\types.ts', 'scripts\Initialize-TradingLabAcl.ps1', 'package.json',
+    'scripts\setup.ps1', 'scripts\start_gateway.ps1', 'scripts\start_automaton.ps1',
+    'scripts\status.ps1', 'scripts\stop.ps1', 'scripts\test_gateway.ps1',
+    'scripts\enable_demo_trading.ps1', 'scripts\disable_trading.ps1',
+    'scripts\emergency_stop.ps1',
     'config\trading.security.example.json', 'config\trading.example.yaml',
-    'requirements-mt5.txt'
+    'requirements-mt5.txt', 'requirements-gateway-win-py314.lock'
 )) {
     $protectedFile = Join-Path $workspace $relativeFile
     if (-not (Test-Path -LiteralPath $protectedFile -PathType Leaf)) {

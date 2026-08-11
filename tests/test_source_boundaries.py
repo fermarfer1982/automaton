@@ -16,6 +16,7 @@ class SourceBoundaryTests(unittest.TestCase):
             "git_push", "transfer_credits", "topup_credits", "spawn_child",
             "fund_child", "install_npm_package", "install_mcp_server",
             "register_domain", "x402_fetch", "exec", "edit_own_file",
+            "set_goal", "complete_goal", "remember_fact", "learn_procedure",
         ):
             self.assertNotRegex(source, re.compile(rf'^\s*"{forbidden}",?\s*$', re.MULTILINE))
 
@@ -29,6 +30,8 @@ class SourceBoundaryTests(unittest.TestCase):
             self.assertIn(protected, source)
         self.assertIn('"conway/inference.ts"', source)
         self.assertIn('"scripts/Initialize-TradingLabAcl.ps1"', source)
+        self.assertIn('"docs/SECURITY_INVARIANTS.md"', source)
+        self.assertIn('"requirements-gateway-win-py314.lock"', source)
 
     def test_windows_local_identity_uses_native_home_not_root_fallback(self) -> None:
         wallet = (ROOT / "src" / "identity" / "wallet.ts").read_text(encoding="utf-8")
@@ -109,6 +112,22 @@ class SourceBoundaryTests(unittest.TestCase):
             if re.search(r"\.order_check\s*\(", path.read_text(encoding="utf-8")):
                 offenders.append(path.name)
         self.assertEqual([], offenders)
+
+    def test_production_http_transport_is_fastapi_only(self) -> None:
+        service = (ROOT / "trading_lab" / "service.py").read_text(encoding="utf-8")
+        fastapi_service = (ROOT / "trading_lab" / "fastapi_service.py").read_text(encoding="utf-8")
+        self.assertNotIn("HTTPServer", service)
+        self.assertNotIn("BaseHTTPRequestHandler", service)
+        self.assertIn('host="127.0.0.1"', service)
+        self.assertIn('request.url.path.startswith("/v1")', fastapi_service)
+
+    def test_market_provider_facade_has_no_execution_capability(self) -> None:
+        source = (ROOT / "trading_lab" / "providers.py").read_text(encoding="utf-8")
+        facade = source.split("class LiveMT5MarketDataProvider", 1)[1].split(
+            "class MT5ExecutionProvider", 1
+        )[0]
+        self.assertNotIn("order_check", facade)
+        self.assertNotIn("order_send", facade)
 
     def test_no_credential_fields_exist_in_trade_proposal(self) -> None:
         source = (ROOT / "trading_lab" / "domain.py").read_text(encoding="utf-8").lower()

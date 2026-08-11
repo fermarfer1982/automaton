@@ -112,7 +112,12 @@ def _targets(config_path: Path, config: SecurityConfig, include_automaton_state:
         "src/agent/loop.ts", "src/agent/tools.ts", "src/conway/inference.ts",
         "src/identity/wallet.ts", "src/self-mod/code.ts", "src/types.ts",
         "scripts/Initialize-TradingLabAcl.ps1", "package.json",
-        "config/trading.security.example.json", "requirements-mt5.txt",
+        "scripts/setup.ps1", "scripts/start_gateway.ps1", "scripts/start_automaton.ps1",
+        "scripts/status.ps1", "scripts/stop.ps1", "scripts/test_gateway.ps1",
+        "scripts/enable_demo_trading.ps1", "scripts/disable_trading.ps1",
+        "scripts/emergency_stop.ps1", "config/trading.security.example.json",
+        "config/trading.example.yaml", "requirements-mt5.txt",
+        "requirements-gateway-win-py314.lock",
     ):
         item = workspace / relative
         raw.append((item, "workspace_code", item.is_dir(), False))

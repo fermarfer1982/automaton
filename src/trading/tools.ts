@@ -95,7 +95,7 @@ export function createTradingTools(): AutomatonTool[] {
           decision_id: { type: "string", minLength: 1, maxLength: 128 },
           action: { type: "string", enum: ["HOLD", "PROPOSE"] },
           symbol: { type: "string", enum: ["XAUUSD"] },
-          timeframe: { type: "string", enum: ["M1", "M5", "M15", "H1"] },
+          timeframe: { type: "string", enum: ["M1"] },
           bar_time_utc: { type: "string", format: "date-time" },
           reason: { type: "string", minLength: 1, maxLength: 4000 },
           hypothesis_id: { type: ["string", "null"], maxLength: 128 },

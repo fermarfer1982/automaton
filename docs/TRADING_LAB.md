@@ -1,176 +1,160 @@
-# Automaton MT5 Laboratory
+# Laboratorio Automaton → MT5 DEMO
 
-This repository runs Conway Automaton with a restricted trading profile and a
-separate deterministic Windows gateway. The initial and milestone mode is
-always `OBSERVE_ONLY`; no code path changes it in response to an agent request.
-
-## Trust boundary
+El laboratorio separa estrictamente observación/decisión y ejecución:
 
 ```text
-Automaton
-  -> restricted Trading Tools (loopback HTTP only)
-  -> MT5 Gateway (serialized, fail-closed)
-  -> Account Guard (exact login + exact server + DEMO)
-  -> Risk Engine (pure deterministic policy)
-  -> Execution Engine (order_check before order_send)
-  -> MetaTrader 5 terminal
+Automaton → Trading Tools → FastAPI Gateway → Account Guard
+          → Risk Engine → Execution Engine → MetaTrader 5
 ```
 
-The service receives no MT5 password. `MT5Adapter.initialize()` is called with
-only the exact terminal executable path and never calls `login()` or
-`symbol_select()`. The already logged-in terminal account must match the
-external protected configuration exactly or every request fails closed.
-The gateway also refuses to initialize unless that exact executable already has
-a visible window in the gateway process's current Windows session; it never
-auto-launches a hidden terminal or relies on another user's MT5 session.
+El estado por defecto es siempre `OBSERVE_ONLY`. El gateway no recibe
+contraseñas, no llama a `login()` ni `symbol_select()`, no busca otra cuenta y
+solo inicializa la ruta exacta de un terminal MT5 ya visible en la sesión del
+usuario Gateway. Una cuenta REAL, otro login, otro servidor o cualquier error
+de infraestructura bloquean la operación.
 
-The agent-facing API has only:
+## Fronteras permanentes
 
-- `GET /v1/health`
-- `GET /v1/market/XAUUSD`
-- `GET /v1/research/metrics`
-- `POST /v1/proposals`
+- Solo el login DEMO, servidor, nombre opcional, `XAUUSD` y magic configurados.
+- Automaton propone riesgo monetario; nunca volumen, magic, cuenta, servidor o modo.
+- `order_check()` y todas las variantes de `order_send()` viven únicamente en
+  el adaptador protegido y se serializan en Execution Engine.
+- Tres gates auditados: `PRE_FLIGHT_CHECK`, `POST_LLM_CHECK` y
+  `PRE_EXECUTION_CHECK`.
+- Cualquier posición u orden pendiente de toda la cuenta bloquea una apertura.
+- Una sola entrada con SL obligatorio; grid, martingala, averaging down,
+  ampliación del SL y aumento de pérdidas están prohibidos.
+- Un resultado perdido tras `order_send()` queda `EXECUTION_UNCERTAIN` y su
+  huella se bloquea de forma durable hasta reconciliación humana.
+- Los stores JSON hash-chain y SQLite deben coincidir; UPDATE/DELETE de eventos
+  históricos están bloqueados por triggers.
+- El perfil del agente excluye shell, instalaciones, pagos, wallets, réplica,
+  social, compras y `git push`. Las claves de inferencia solo viven en el entorno
+  del usuario Agent.
 
-There is no execution endpoint, account selector, login endpoint, mode setter,
-or credentials field. In `OBSERVE_ONLY` and `PAPER`, neither `order_check()` nor
-`order_send()` can be called. In `DEMO_EXECUTION`, both an external human allow
-file containing exactly `ALLOW_DEMO_EXECUTION` and an absent kill-switch file
-are required. The kill switch always wins.
+## API local autenticada
 
-Once `order_send()` has been attempted, a timeout, lost response, or failure to
-persist its result is returned as `EXECUTION_UNCERTAIN`, never as a safe
-rejection. The pre-send fingerprint remains durable, blocks automatic retry,
-and requires human reconciliation with MT5 history.
-
-## Protected external configuration
-
-Copy `config/trading.security.example.json` manually to:
+El bind es exclusivamente `127.0.0.1:8765`. Todas las rutas siguientes,
+incluidas health/status, exigen `X-AUTOMATON-KEY`; la key aleatoria está en el
+dominio IPC externo y nunca aparece en configuración, respuestas, logs o memoria.
 
 ```text
-C:\ProgramData\AutomatonMT5Lab\control\security.json
+GET  /v1/health                 GET  /v1/status
+GET  /v1/account                GET  /v1/market/XAUUSD
+GET  /v1/candles/XAUUSD         GET  /v1/positions[/{ticket}]
+GET  /v1/history                GET  /v1/daily-stats
+POST /v1/trade/propose          POST /v1/trade/close
+POST /v1/trade/modify           POST /v1/trade/cancel-pending
+POST /v1/research/decisions     POST /v1/research/hypotheses
+POST /v1/research/reviews       GET  /v1/research/metrics
+GET  /v1/research/memory
 ```
 
-Replace only the exact authorized DEMO account number and DEMO server after
-verifying them in the visible MT5 terminal. Keep `trading_mode` equal to
-`OBSERVE_ONLY`. Never put a password, API key, token, or private key in this
-file. The loader rejects credential-shaped fields recursively.
+`401` identifica key inválida, `422` esquema inválido, `409` conflicto de
+idempotencia y `503` infraestructura fail-closed. Las decisiones de dominio
+devuelven `200` con códigos estables. `OBSERVE_ONLY` registra y deniega cualquier
+gestión sin llamar a MT5. PAPER usa posiciones virtuales persistentes. El futuro
+DEMO permite cierre total, cancelación y modificaciones reductoras incluso con
+kill switch, pero bloquea aperturas y cualquier aumento de riesgo.
 
-Create two distinct standard (non-administrator) Windows identities first:
-one for the interactive MT5 terminal plus gateway, and another for Automaton.
-Passwords remain human-managed and must never be placed in this repository or
-passed to the agent. As Administrator, inspect the ACL plan and apply it only
-after checking the resolved SIDs and paths:
+## Configuración, identidades y ACL
+
+Copiar y revisar manualmente [trading.example.yaml](../config/trading.example.yaml)
+en:
+
+```text
+C:\ProgramData\AutomatonMT5Lab\control\trading.yaml
+```
+
+Escribir explícitamente el login/servidor DEMO observados por el humano, sin
+contraseña. No se acepta detección automática como autorización. Crear fuera de
+Codex dos usuarios Windows estándar distintos:
+
+- Gateway: terminal visible y gateway.
+- Agent: Automaton y su estado externo, sin wallet de firma.
+
+El script ACL no crea usuarios, no pide contraseñas y es dry-run sin `-Apply`:
 
 ```powershell
-.\scripts\Initialize-TradingLabAcl.ps1 `
+.\scripts\setup.ps1 `
   -GatewayIdentity 'MACHINE\AutomatonMT5Gateway' `
   -AutomatonIdentity 'MACHINE\AutomatonLabAgent' `
   -AutomatonStateDir 'C:\Users\AutomatonLabAgent\.automaton'
-
-.\scripts\Initialize-TradingLabAcl.ps1 `
-  -GatewayIdentity 'MACHINE\AutomatonMT5Gateway' `
-  -AutomatonIdentity 'MACHINE\AutomatonLabAgent' `
-  -AutomatonStateDir 'C:\Users\AutomatonLabAgent\.automaton' `
-  -Apply
 ```
 
-The script does not create users, set passwords, install software, configure
-MT5, or copy `security.json`. Without `-Apply` it is read-only. With `-Apply` it
-refuses broad/workspace/overlapping targets, administrator identities, signing
-wallets, and reparse-point trees before changing ACLs. Run MT5 and the gateway
-as the configured gateway identity; log into the authorized DEMO manually in
-the visible terminal. Run Automaton only as the configured agent identity.
+Tras revisar SIDs/rutas, un administrador puede repetir con `-Apply`. La opción
+adicional `-InstallDependencies` es una autorización humana separada. Usa
+`requirements-gateway-win-py314.lock` (wheels CPython 3.14/Windows x64, hashes
+SHA-256 completos) y `pnpm --frozen-lockfile`; no se ejecuta automáticamente.
 
-The operational paths must remain outside `C:\automaton` and use three distinct
-ACL domains: read-only gateway control (`security.json`, authorization, kill
-switch), gateway-writable data (`audit.jsonl`, `research.db`), and
-Automaton-writable state. Automaton must have no access to gateway control/data;
-the gateway must have no access to Automaton state and cannot write its own
-authorization or kill switch. Directory inheritance must be disabled. Startup
-and readiness inspect Windows SIDs and ACL rights and fail closed if this exact
-separation is absent; they never create accounts or change ACLs automatically.
-The same verifier requires both runtime identities to have read/execute but no
-write, delete, ownership, or ACL-changing rights over the workspace and every
-protected security source. Install and build as Administrator; runtime state
-belongs only in the external Automaton state directory.
+ACLs separadas:
 
-The gateway-owned `research.db` records hypothesis, strategy/setup/version,
-session, market regime, proposal status, and closed-trade evidence. Aggregates
-include sample size, PnL, R expectancy, profit factor, win rate, MFE, MAE, and
-maximum drawdown. A result is not labelled evidence-sufficient below 30 closed
-trades; this threshold is a guard against learning from isolated outcomes, not a
-claim that 30 observations guarantee statistical significance.
+- `control`: administradores escriben; Gateway solo lee; Agent sin acceso.
+- `ipc`: Gateway y Agent solo leen la key.
+- `data`: solo Gateway modifica auditoría, research, lock y logs.
+- estado Agent: solo Agent modifica.
+- código: Gateway y Agent solo lectura/ejecución.
 
-`PAPER` uses persistent virtual positions in that database. It fills buys at
-ask and sells at bid, marks exits at the opposite executable quote, survives
-gateway restarts, records SL/TP closure plus PnL/R/MFE/MAE, and feeds open PAPER
-exposure and the more conservative of live/PAPER daily PnL back into the same
-Risk Engine. It still has no path to `order_check()` or `order_send()`.
+## Operación
 
-## Commands
-
-The pure safety suite uses only the Python standard library:
+Ejecutar cada start bajo su identidad dedicada, nunca como administrador:
 
 ```powershell
-python -m unittest discover -s tests -p 'test_*.py' -v
+.\scripts\start_gateway.ps1
+
+$env:AUTOMATON_LAB_PROVIDER = 'openai' # o anthropic/ollama
+$env:AUTOMATON_LAB_MODEL = 'MODELO_EXPLICITO'
+.\scripts\start_automaton.ps1 `
+  -AutomatonStateDir 'C:\Users\AutomatonLabAgent\.automaton'
 ```
 
-The MT5 dependency is pinned for this Windows CPython 3.14 environment in
-`requirements-mt5.txt`. Installation is intentionally a human-authorized step.
-After it is installed and the protected configuration exists, start the visible
-MT5 terminal and gateway as the configured gateway identity. The service proves
-its current SID before initializing MT5:
+Comandos disponibles: `status.ps1`, `stop.ps1` (dry-run/`-Apply`),
+`test_gateway.ps1`, `disable_trading.ps1` y `emergency_stop.ps1`. El emergency
+stop activa inmediatamente el archivo kill switch externo. Los logs operativos
+`gateway`, `security` y `trading` rotan a medianoche UTC; Agent escribe un JSONL
+por día UTC. Los journals de auditoría no se rotan automáticamente.
+
+Política de firewall a aplicar manualmente:
+
+- bloquear toda entrada para ambos usuarios; el gateway solo escucha loopback;
+- Agent: salida únicamente al proveedor de inferencia elegido (o loopback Ollama);
+- Gateway: salida únicamente al terminal/broker MT5 necesario;
+- GitHub, PyPI y NPM: solo durante mantenimiento humano, nunca en runtime.
+
+## Evidencia y ciclo de investigación
+
+El heartbeat consulta health cada 30 s sin LLM, velas cerradas M1 sin iniciar
+más de un ciclo por barra y posiciones cada 5 s solo con exposición. Persistir
+una decisión `HOLD|PROPOSE` exige que su timestamp coincida con la última M1
+cerrada; existe una restricción única por barra.
+
+`research.db` conserva strategy/setup/version, sesiones, régimen, timeframe,
+PnL bruto/neto, comisión, swap, R, MFE, MAE, spreads, ATR, distancias, R:R,
+duración, hora/día y calidad. Agrega por estrategia/version, setup, sesión,
+hora, día, dirección, régimen y timeframe; reporta sample, wins/losses, winrate,
+expectancy R, profit factor, drawdown, MFE/MAE, duración mediana e intervalo
+bootstrap 95 % reproducible. `minimum_evidence_sample=30` solo marca elegibilidad;
+no promociona hipótesis automáticamente.
+
+## Readiness y gate DEMO
+
+Con ambos procesos vivos, un administrador ejecuta:
 
 ```powershell
-python -m trading_lab.service --config C:\ProgramData\AutomatonMT5Lab\control\security.json
+.\scripts\test_gateway.ps1
 ```
 
-The standard Conway setup/provision/configure flows are disabled by default in
-the trading profile because upstream can provision services, register identity,
-start social/financial heartbeats, and buy credits. After the Node dependencies
-are explicitly authorized and installed, one explicit human command creates a
-non-signing public laboratory identifier and the restricted configuration:
+Genera un artefacto read-only con digest SHA-256 y exige simultáneamente MT5,
+DEMO, login/servidor, XAUUSD, ticks, M1/M5/M15/H1, posiciones, historia,
+auditoría dual, memoria, tools, inferencia fresca, identidades/ACL, suites y
+`TRADING_MODE=OBSERVE_ONLY`. Solo entonces puede aparecer:
 
-```powershell
-$env:AUTOMATON_STATE_DIR = 'C:\Users\AutomatonLabAgent\.automaton'
-$env:AUTOMATON_LAB_PROVIDER = 'openai'  # or anthropic / ollama
-$env:AUTOMATON_LAB_MODEL = 'YOUR_EXPLICIT_MODEL'
-node dist/index.js --setup-trading-lab
-node dist/index.js --run
+```text
+AUTOMATON_MT5_LAB_READY=true
 ```
 
-The public identifier has no private key and all signing methods fail closed;
-the normal `--init` signing-wallet path is disabled in the default trading
-profile. Lab setup writes zero treasury limits, disables social/replication, and
-persists no provider key. Supply `OPENAI_API_KEY` or
-`ANTHROPIC_API_KEY` only in the runtime service environment. For Ollama, use a
-credential-free loopback `OLLAMA_BASE_URL`. Never paste these credentials into
-the genesis prompt, trading security JSON, research database, or agent memory.
-Readiness also requires `wallet.json` to be absent from the Automaton identity's
-state directory; use a dedicated Windows identity rather than reusing an
-upstream Automaton profile that contains signing material.
-
-Finally, run readiness from a separate Administrator terminal while both
-processes are alive:
-
-```powershell
-python -m trading_lab.readiness --config C:\ProgramData\AutomatonMT5Lab\control\security.json
-```
-
-Readiness contacts MT5 only through the loopback gateway. It requires fresh
-non-secret runtime evidence showing that Automaton completed inference and used
-both the guarded health and XAUUSD observation tools; it never requires the
-provider key in the Administrator environment.
-
-The readiness command returns nonzero and prints
-`AUTOMATON_MT5_LAB_READY=false` unless every live check and security test passes
-while the configured mode remains `OBSERVE_ONLY`.
-
-## Explicitly disabled in the trading profile
-
-The default `AUTOMATON_RUNTIME_PROFILE=trading_lab` allowlist excludes shell
-execution, source edits, package/skill/MCP installation, Git push, payments,
-credit transfers, x402, domains, sandbox creation, replication, child funding,
-and social messaging. `AUTOMATON_RUNTIME_PROFILE=upstream` exists solely for
-upstream compatibility and must never be used by the trading laboratory without
-an explicit human security review.
+No hace falta ni se permite enviar una orden para alcanzar readiness. El script
+`enable_demo_trading.ps1` es dry-run salvo `-Apply`, exige ese artefacto completo,
+gateway detenido, y crea autorización externa ligada a login, servidor, hash de
+configuración DEMO y hash del readiness. No debe ejecutarse en este milestone;
+requiere una autorización humana posterior y separada.

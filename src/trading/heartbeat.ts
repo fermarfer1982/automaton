@@ -62,7 +62,18 @@ export class TradingHeartbeat {
       const now = Date.now();
       let positionCount = this.previousPositionCount;
       if (now - this.lastHealthAt >= 30_000) {
-        const health = await callGatewayJson<HealthResponse>("/v1/health");
+        const historyQuery = new URLSearchParams({
+          from: new Date(now - 24 * 60 * 60 * 1_000).toISOString(),
+          to: new Date(now).toISOString(),
+          symbol: "XAUUSD",
+          limit: "1000",
+        });
+        const [health] = await Promise.all([
+          callGatewayJson<HealthResponse>("/v1/health"),
+          callGatewayJson<Record<string, unknown>>("/v1/daily-stats"),
+          callGatewayJson<Record<string, unknown>>(`/v1/history?${historyQuery.toString()}`),
+          callGatewayJson<Record<string, unknown>>("/v1/research/metrics"),
+        ]);
         positionCount = Number(health.exposure?.position_count || 0);
         this.lastHealthAt = now;
       }

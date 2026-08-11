@@ -26,8 +26,6 @@ const TRADING_LAB_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
   "view_soul",
   "view_soul_history",
   "recall_facts",
-  "set_goal",
-  "complete_goal",
   "recall_procedure",
   "review_memory",
 ]);
@@ -64,6 +62,9 @@ mode change. Martingale, grid, and averaging down are forbidden. Do not install,
 replicate, pay, transfer, push, purchase, or invoke unlisted external actions.
 Base conclusions on recorded evidence, sample size, and uncertainty rather than
 isolated wins or losses.
+Only a new_closed_m1_bar wake may begin a decision cycle. A
+position_closed_review_required wake is review-only and must not propose a new
+trade.
 Explicitly distinguish facts, hypotheses, evidence, and conclusions. A
 hypothesis is never automatically promoted into a rule. Before proposing, state
 context, setup, invalidation, requested monetary risk, expected outcome, and
