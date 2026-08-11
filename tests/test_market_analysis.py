@@ -4,7 +4,7 @@ import unittest
 from datetime import UTC, datetime, timedelta, timezone
 
 from trading_lab.domain import CandleSnapshot
-from trading_lab.market_analysis import atr, session_context
+from trading_lab.market_analysis import asian_session_range, atr, session_context
 
 
 class MarketAnalysisTests(unittest.TestCase):
@@ -33,6 +33,24 @@ class MarketAnalysisTests(unittest.TestCase):
             for index in range(15)
         ]
         self.assertEqual(3.0, atr(items))
+
+    def test_asian_range_uses_latest_iana_session(self) -> None:
+        zone = timezone(timedelta(hours=8))
+        now = datetime(2026, 8, 11, 9, 0, tzinfo=UTC)  # 17:00 Singapore.
+        items = [
+            CandleSnapshot(
+                symbol="XAUUSD", timeframe="M5",
+                time_msc=int(datetime(2026, 8, 11, hour, 0, tzinfo=UTC).timestamp() * 1000),
+                open=100.0, high=100.0 + hour, low=99.0 - hour, close=100.0,
+                tick_volume=1, spread=1,
+            )
+            for hour in range(0, 8)
+        ]
+        result = asian_session_range(items, now, zone_loader=lambda _name: zone)
+        self.assertTrue(result["available"])
+        self.assertTrue(result["complete"])
+        self.assertEqual(107.0, result["high"])
+        self.assertEqual(92.0, result["low"])
 
 
 if __name__ == "__main__":

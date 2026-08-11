@@ -74,10 +74,12 @@ class FakeMT5Adapter:
 
     def candles(self, symbol: str, timeframe: str, count: int):
         self.calls.append("candles")
-        now = int(time() // 60 * 60 * 1000) - 60_000
+        minutes = {"M1": 1, "M5": 5, "M15": 15, "H1": 60}[timeframe]
+        step_msc = minutes * 60_000
+        now = int(time() * 1000 // step_msc * step_msc) - step_msc
         return [
             CandleSnapshot(
-                symbol=symbol, timeframe=timeframe, time_msc=now - (count - index) * 60_000,
+                symbol=symbol, timeframe=timeframe, time_msc=now - (count - index - 1) * step_msc,
                 open=2400.0, high=2401.0, low=2399.0, close=2400.5,
                 tick_volume=100, spread=20,
             )

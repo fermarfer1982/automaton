@@ -19,6 +19,8 @@ class FakeMT5Module:
     DEAL_ENTRY_OUT_BY = 3
     DEAL_ENTRY_IN = 0
     TRADE_ACTION_DEAL = 1
+    TRADE_ACTION_SLTP = 6
+    TRADE_ACTION_REMOVE = 8
     ORDER_TIME_GTC = 0
     ORDER_FILLING_IOC = 1
     TRADE_RETCODE_PLACED = 10008
@@ -189,6 +191,30 @@ class MT5AdapterTests(unittest.TestCase):
         raw = next(payload for name, payload in self.module.calls if name == "order_send")
         self.assertEqual(self.module.TRADE_ACTION_DEAL, raw["action"])
         self.assertEqual(self.module.ORDER_TYPE_BUY, raw["type"])
+
+    def test_maps_only_protected_close_modify_and_cancel_schemas(self) -> None:
+        close = {
+            "action": "DEAL", "symbol": "XAUUSD", "volume": 0.01,
+            "type": "SELL", "position": 5, "price": 2400.0, "sl": 0.0, "tp": 0.0,
+            "deviation": 10, "magic": 26081101, "comment": "automaton:close:x",
+            "type_time": "GTC", "type_filling": "IOC",
+        }
+        modify = {
+            "action": "SLTP", "symbol": "XAUUSD", "position": 5,
+            "sl": 2399.0, "tp": 2404.0, "magic": 26081101,
+            "comment": "automaton:modify:x",
+        }
+        cancel = {
+            "action": "REMOVE", "symbol": "XAUUSD", "order": 8,
+            "magic": 26081101, "comment": "automaton:cancel:x",
+        }
+        self.adapter.order_check(close)
+        self.adapter.order_check(modify)
+        self.adapter.order_check(cancel)
+        raw = [payload for name, payload in self.module.calls if name == "order_check"]
+        self.assertEqual(self.module.TRADE_ACTION_DEAL, raw[0]["action"])
+        self.assertEqual(self.module.TRADE_ACTION_SLTP, raw[1]["action"])
+        self.assertEqual(self.module.TRADE_ACTION_REMOVE, raw[2]["action"])
 
     def test_reads_only_closed_candles_for_allowed_timeframes(self) -> None:
         candles = self.adapter.candles("XAUUSD", "M1", 1)

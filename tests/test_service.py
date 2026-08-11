@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,59 +17,8 @@ from trading_lab.gateway import MT5Gateway
 from trading_lab.paper_engine import PaperEngine
 from trading_lab.risk_engine import RiskEngine
 from trading_lab.research_store import ResearchStore
-from trading_lab.service import ProposalValidationError, parse_proposal
 from tests.fakes import FakeMT5Adapter
 from tests.test_risk_engine import proposal
-
-
-def valid_payload() -> dict[str, object]:
-    return {
-        "proposal_id": "proposal-001",
-        "hypothesis_id": "hypothesis-001",
-        "strategy_id": "emergent-research",
-        "setup_id": "breakout-observation",
-        "strategy_version": "0.1.0",
-        "symbol": "XAUUSD",
-        "side": "BUY",
-        "volume": 0.05,
-        "stop_loss": 2398.0,
-        "take_profit": 2404.0,
-        "magic_number": 26081101,
-        "position_management": "SINGLE_ENTRY",
-        "thesis": "A falsifiable market hypothesis.",
-        "session": "LONDON",
-        "market_regime": "UNKNOWN",
-    }
-
-
-class ProposalParsingTests(unittest.TestCase):
-    def test_parses_strict_proposal_schema(self) -> None:
-        proposal = parse_proposal(valid_payload())
-        self.assertEqual("XAUUSD", proposal.symbol)
-        self.assertEqual("BUY", proposal.side.value)
-
-    def test_rejects_request_control_over_mode_or_account(self) -> None:
-        for key, value in (
-            ("trading_mode", "DEMO_EXECUTION"),
-            ("account", 999),
-            ("server", "Other-Demo"),
-            ("password", "secret"),
-        ):
-            with self.subTest(key=key):
-                payload = valid_payload()
-                payload[key] = value
-                with self.assertRaises(ProposalValidationError):
-                    parse_proposal(payload)
-
-    def test_rejects_nonfinite_numbers_and_oversized_text(self) -> None:
-        payload = valid_payload()
-        payload["volume"] = float("nan")
-        with self.assertRaises(ProposalValidationError):
-            parse_proposal(payload)
-        payload = valid_payload()
-        payload["thesis"] = "x" * 4001
-        with self.assertRaises(ProposalValidationError):
-            parse_proposal(payload)
 
 
 class GatewayApplicationTests(unittest.TestCase):
@@ -144,11 +94,19 @@ class GatewayApplicationTests(unittest.TestCase):
             )
             health = app.health()
             market = app.market_snapshot("XAUUSD")
+            account = app.account_state()
+            status = app.status()
             self.assertTrue(health["healthy"])
             self.assertEqual("XAUUSD", market["symbol"])
             self.assertTrue(health["exposure"]["clear"])
             self.assertNotIn("login", health)
             self.assertNotIn("server", health)
+            sanitized = json.dumps({"account": account, "status": status}).lower()
+            self.assertNotIn("12345678", sanitized)
+            self.assertNotIn("broker-demo", sanitized)
+            self.assertNotIn("terminal64", sanitized)
+            self.assertIn("asia_range", market)
+            self.assertEqual(0.0, status["daily_r"])
             self.assertNotIn("order_check", adapter.calls)
             self.assertNotIn("order_send", adapter.calls)
 

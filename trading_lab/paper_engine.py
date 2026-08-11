@@ -22,7 +22,7 @@ class PaperEngine:
         value = int.from_bytes(
             hashlib.sha256(proposal_id.encode("utf-8")).digest()[:7], "big"
         )
-        return -(value or 1)
+        return value or 1
 
     def open(
         self,
@@ -88,7 +88,7 @@ class PaperEngine:
                     side=Side(str(row["side"])),
                     volume=float(row["volume"]),
                     price_open=float(row["entry_price"]),
-                    stop_loss=float(row["initial_stop_loss"]),
+                    stop_loss=float(row["current_stop_loss"]),
                     profit=0.0,
                     # Virtual positions cannot carry an MT5 magic number. Presence on
                     # the symbol is sufficient for the independent risk engine to block
@@ -123,6 +123,7 @@ class PaperEngine:
             exit_price = market.bid if side is Side.BUY else market.ask
             entry_price = float(row["entry_price"])
             initial_stop = float(row["initial_stop_loss"])
+            current_stop = float(row["current_stop_loss"])
             risk_distance = abs(entry_price - initial_stop)
             if risk_distance <= 0:
                 raise ValueError("Persisted paper risk distance is invalid")
@@ -135,7 +136,7 @@ class PaperEngine:
 
             take_profit = row["take_profit"]
             hit_stop = (
-                exit_price <= initial_stop if side is Side.BUY else exit_price >= initial_stop
+                exit_price <= current_stop if side is Side.BUY else exit_price >= current_stop
             )
             hit_target = take_profit is not None and (
                 exit_price >= float(take_profit)
@@ -193,3 +194,110 @@ class PaperEngine:
             )
             closed.append(record)
         return closed
+
+    def modify(
+        self,
+        ticket: int,
+        *,
+        stop_loss: float,
+        take_profit: float | None,
+        at: datetime | None = None,
+    ) -> None:
+        with self._lock:
+            row = next(
+                (
+                    item for item in self._store.list_open_paper_positions()
+                    if self._ticket(str(item["proposal_id"])) == ticket
+                ),
+                None,
+            )
+            if row is None:
+                raise LookupError("Paper position was not found")
+            at = at or datetime.now().astimezone()
+            payload = {
+                "proposal_id": str(row["proposal_id"]),
+                "ticket": ticket,
+                "old_stop_loss": float(row["current_stop_loss"]),
+                "new_stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "updated_at": at.isoformat(),
+            }
+            self._audit.append("paper_position_modify_authorized", payload)
+            self._store.update_paper_protection(
+                str(row["proposal_id"]),
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                updated_at=at,
+            )
+            self._audit.append("paper_position_modified", payload)
+
+    def close(
+        self,
+        ticket: int,
+        market: SymbolSnapshot,
+        *,
+        at: datetime | None = None,
+    ) -> TradeResultRecord:
+        with self._lock:
+            row = next(
+                (
+                    item for item in self._store.list_open_paper_positions()
+                    if self._ticket(str(item["proposal_id"])) == ticket
+                ),
+                None,
+            )
+            if row is None:
+                raise LookupError("Paper position was not found")
+            at = at or datetime.now().astimezone()
+            side = Side(str(row["side"]))
+            direction = 1.0 if side is Side.BUY else -1.0
+            exit_price = market.bid if side is Side.BUY else market.ask
+            entry_price = float(row["entry_price"])
+            initial_stop = float(row["initial_stop_loss"])
+            risk_distance = abs(entry_price - initial_stop)
+            tick_size = float(row["tick_size"])
+            tick_value = float(row["tick_value"])
+            volume = float(row["volume"])
+            if min(risk_distance, tick_size, tick_value, volume) <= 0:
+                raise ValueError("Persisted paper economics are invalid")
+            current_r = direction * (exit_price - entry_price) / risk_distance
+            mfe_r = max(float(row["mfe_r"]), current_r, 0.0)
+            mae_r = min(float(row["mae_r"]), current_r, 0.0)
+            pnl = direction * (exit_price - entry_price) / tick_size * tick_value * volume
+            record = TradeResultRecord(
+                trade_id=str(row["paper_trade_id"]),
+                proposal_id=str(row["proposal_id"]),
+                hypothesis_id=str(row["hypothesis_id"]),
+                strategy_id=str(row["strategy_id"]),
+                setup_id=str(row["setup_id"]),
+                strategy_version=str(row["strategy_version"]),
+                session=str(row["session"]),
+                market_regime=str(row["market_regime"]),
+                symbol=str(row["symbol"]),
+                side=side,
+                volume=volume,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                initial_stop_loss=initial_stop,
+                opened_at=datetime.fromisoformat(str(row["opened_at"])),
+                closed_at=at,
+                pnl=pnl,
+                r_multiple=current_r,
+                mfe_r=mfe_r,
+                mae_r=mae_r,
+            )
+            payload = {
+                "proposal_id": record.proposal_id,
+                "trade_id": record.trade_id,
+                "reason": "MANUAL",
+                "exit_price": record.exit_price,
+                "pnl": record.pnl,
+                "r_multiple": record.r_multiple,
+                "mfe_r": record.mfe_r,
+                "mae_r": record.mae_r,
+                "closed_at": at.isoformat(),
+            }
+            self._audit.append("paper_position_close_authorized", payload)
+            self._store.close_paper_position(record, reason="MANUAL")
+            self._audit.append("paper_position_closed", payload)
+            return record

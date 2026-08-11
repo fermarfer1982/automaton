@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 from .account_guard import AccountGuard
 from .audit import HashChainAuditLog
 from .domain import OpenAction, SemanticTradeRequest, Side, TradingMode, TradeProposal
-from .market_analysis import session_context, summarize_candles, utc_day_range
+from .market_analysis import asian_session_range, session_context, summarize_candles, utc_day_range
 
 
 class GatewayApplication:
@@ -32,6 +32,7 @@ class GatewayApplication:
         runtime_identity_verified: bool = False,
         magic_number: int = 0,
         position_sizer=None,
+        risk_limits=None,
     ) -> None:
         self._mode = mode
         self._allowed_symbol = allowed_symbol
@@ -44,12 +45,15 @@ class GatewayApplication:
         self._runtime_identity_verified = runtime_identity_verified
         self._magic_number = magic_number
         self._position_sizer = position_sizer
+        self._risk_limits = risk_limits
 
     def health(self) -> dict[str, Any]:
         account = self._adapter.account_snapshot()
         account_decision = self._account_guard.evaluate(account)
         market = self._adapter.symbol_snapshot(self._allowed_symbol)
         positions = self._adapter.positions()
+        if self._mode is TradingMode.PAPER and self._paper_engine is not None:
+            positions = positions + self._paper_engine.position_snapshots()
         active_orders = self._adapter.active_orders()
         audit_verification = self._audit.verify()
         tick_fresh = -2_000 <= int(time.time() * 1000) - market.tick_time_msc <= 5_000
@@ -119,13 +123,15 @@ class GatewayApplication:
             self._paper_engine.reconcile(market)
         now = datetime.now(UTC)
         timeframe_data: dict[str, dict[str, object]] = {}
-        m1_candles = []
+        range_candles = []
         if hasattr(self._adapter, "candles"):
             for timeframe in ("M1", "M5", "M15", "H1"):
-                candles = self._adapter.candles(symbol, timeframe, 100)
+                candles = self._adapter.candles(
+                    symbol, timeframe, 500 if timeframe == "M5" else 100
+                )
                 timeframe_data[timeframe.lower()] = summarize_candles(candles)
-                if timeframe == "M1":
-                    m1_candles = candles
+                if timeframe == "M5":
+                    range_candles = candles
         response = {
             "symbol": market.symbol,
             "timestamp_utc": now.isoformat(),
@@ -134,6 +140,8 @@ class GatewayApplication:
             "spread_points": (market.ask - market.bid) / market.point,
             "point": market.point,
             "trade_stops_level": market.trade_stops_level,
+            "trade_freeze_level": market.trade_freeze_level,
+            "trade_mode": market.trade_mode,
             "volume_min": market.volume_min,
             "volume_max": market.volume_max,
             "volume_step": market.volume_step,
@@ -141,7 +149,8 @@ class GatewayApplication:
             "market_open": market.market_open,
             "session": session_context(now),
             "timeframes": timeframe_data,
-            "day_range": utc_day_range(m1_candles, now),
+            "day_range": utc_day_range(range_candles, now),
+            "asia_range": asian_session_range(range_candles, now),
             "positions": self.positions_state(audit_event=False)["positions"],
             "daily": self.daily_stats(audit_event=False),
         }
@@ -161,6 +170,31 @@ class GatewayApplication:
 
     def account_state(self) -> dict[str, Any]:
         account, decision = self._guarded_account()
+        daily = self.daily_stats(audit_event=False)
+        risk_headroom = None
+        if self._risk_limits is not None:
+            per_trade = min(
+                account.equity * self._risk_limits.max_risk_per_trade_fraction,
+                self._risk_limits.max_risk_per_trade_amount,
+            )
+            simultaneous = min(
+                account.equity * self._risk_limits.max_simultaneous_risk_fraction,
+                self._risk_limits.max_simultaneous_risk_amount,
+            )
+            daily_loss = min(
+                account.balance * self._risk_limits.max_daily_loss_fraction,
+                self._risk_limits.max_daily_loss_amount,
+            )
+            daily_drawdown = min(
+                float(daily["start_equity"]) * self._risk_limits.max_daily_drawdown_fraction,
+                self._risk_limits.max_daily_drawdown_amount,
+            )
+            risk_headroom = {
+                "per_trade": per_trade,
+                "simultaneous": simultaneous,
+                "daily_loss_remaining": max(0.0, daily_loss + min(0.0, float(daily["realized_pnl"]))),
+                "daily_drawdown_remaining": max(0.0, daily_drawdown - float(daily["drawdown"])),
+            }
         response = {
             "connected": account.connected,
             "demo_verified": account.kind.value == "DEMO",
@@ -170,6 +204,7 @@ class GatewayApplication:
             "currency": account.currency,
             "balance": account.balance,
             "equity": account.equity,
+            "risk_headroom": risk_headroom,
         }
         self._audit.append("account_state_served", response)
         return response
@@ -194,6 +229,11 @@ class GatewayApplication:
     def positions_state(self, *, audit_event: bool = True) -> dict[str, Any]:
         self._guarded_account()
         positions = self._adapter.positions()
+        paper_tickets: set[int] = set()
+        if self._mode is TradingMode.PAPER and self._paper_engine is not None:
+            paper_positions = self._paper_engine.position_snapshots()
+            paper_tickets = {item.ticket for item in paper_positions}
+            positions = positions + paper_positions
         response = {
             "count": len(positions),
             "positions": [
@@ -205,7 +245,10 @@ class GatewayApplication:
                     "price_open": item.price_open,
                     "stop_loss": item.stop_loss,
                     "profit": item.profit,
-                    "owned_by_lab": item.symbol == self._allowed_symbol,
+                    "owned_by_lab": item.symbol == self._allowed_symbol and (
+                        item.ticket in paper_tickets
+                        or item.magic_number == self._magic_number
+                    ),
                 }
                 for item in positions
             ],
@@ -244,9 +287,24 @@ class GatewayApplication:
             "count": len(deals),
             "deals": [
                 {
-                    **asdict(item),
+                    "ticket": item.ticket,
+                    "order_id": item.order_id,
+                    "position_id": item.position_id,
+                    "symbol": item.symbol,
                     "side": item.side.value if item.side else None,
+                    "entry": item.entry,
+                    "volume": item.volume,
+                    "price": item.price,
+                    "profit": item.profit,
+                    "commission": item.commission,
+                    "swap": item.swap,
+                    "fee": item.fee,
+                    "time_msc": item.time_msc,
                     "net_pnl": item.net_pnl,
+                    "owned_by_lab": (
+                        item.symbol == self._allowed_symbol
+                        and item.magic_number == self._magic_number
+                    ),
                 }
                 for item in deals
             ],
@@ -257,13 +315,34 @@ class GatewayApplication:
     def daily_stats(self, *, audit_event: bool = True) -> dict[str, Any]:
         account, _ = self._guarded_account()
         realized = self._adapter.daily_realized_pnl()
+        research_daily = (
+            self._research_store.daily_research_summary()
+            if self._research_store is not None else None
+        )
+        paper_positions = []
+        if self._mode is TradingMode.PAPER and self._paper_engine is not None:
+            paper_positions = self._paper_engine.position_snapshots()
+            realized += self._research_store.paper_daily_realized_pnl()
+        risk_state = (
+            self._research_store.update_daily_risk_state(
+                currency=account.currency,
+                equity=account.equity,
+                balance=account.balance,
+            )
+            if self._research_store is not None else None
+        )
         response = {
             "date_utc": datetime.now(UTC).date().isoformat(),
             "currency": account.currency,
             "realized_pnl": realized,
             "equity": account.equity,
             "balance": account.balance,
-            "open_positions": len(self._adapter.positions()),
+            "open_positions": len(self._adapter.positions()) + len(paper_positions),
+            "closed_trades": research_daily["sample_size"] if research_daily else 0,
+            "daily_r": research_daily["total_r"] if research_daily else 0.0,
+            "start_equity": risk_state["start_equity"] if risk_state else None,
+            "peak_equity": risk_state["peak_equity"] if risk_state else None,
+            "drawdown": risk_state["drawdown"] if risk_state else None,
         }
         if audit_event:
             self._audit.append("daily_stats_served", response)
@@ -272,6 +351,14 @@ class GatewayApplication:
     def status(self) -> dict[str, Any]:
         health = self.health()
         daily = self.daily_stats(audit_event=False)
+        last_decision = (
+            self._research_store.latest_agent_decision()
+            if self._research_store is not None else None
+        )
+        last_execution = (
+            self._research_store.latest_lifecycle_event()
+            if self._research_store is not None else None
+        )
         response = {
             "mode": self._mode.value,
             "connected": health["account_guard"]["allowed"],
@@ -281,7 +368,9 @@ class GatewayApplication:
             "kill_switch": "UNKNOWN" if self._mode is TradingMode.DEMO_EXECUTION else "NOT_APPLICABLE",
             "open_positions": health["exposure"]["position_count"],
             "daily_pnl": daily["realized_pnl"],
-            "daily_r": None,
+            "daily_r": daily["daily_r"],
+            "last_agent_decision": last_decision,
+            "last_execution": last_execution,
             "last_market_data": health["market_data"],
             "audit_valid": health["audit"]["valid"],
         }
@@ -415,15 +504,41 @@ class GatewayApplication:
             "calculated_volume": sizing.volume,
             "idempotent_replay": False,
         }
-        state = (
-            "APPROVED" if result.status.value in {"OBSERVED", "PAPER_ACCEPTED", "EXECUTED"}
-            else "EXECUTION_UNCERTAIN" if result.status.value == "EXECUTION_UNCERTAIN"
-            else "REJECTED_RISK"
-        )
-        self._research_store.append_lifecycle(str(uuid4()), proposal_id, state, {
+        lifecycle_payload = {
             "gateway_status": result.status.value,
             "failed_codes": list(result.failed_codes),
-        })
+        }
+        if result.status.value == "OBSERVED":
+            self._research_store.append_lifecycle(
+                str(uuid4()), proposal_id, "OBSERVED", lifecycle_payload
+            )
+        elif result.status.value in {"PAPER_ACCEPTED", "EXECUTED"}:
+            for state in ("APPROVED", "EXECUTING", "EXECUTED", "OPEN"):
+                self._research_store.append_lifecycle(
+                    str(uuid4()), proposal_id, state, lifecycle_payload
+                )
+        elif result.status.value == "EXECUTION_UNCERTAIN":
+            self._research_store.append_lifecycle(
+                str(uuid4()), proposal_id, "EXECUTION_UNCERTAIN", lifecycle_payload
+            )
+        else:
+            failed = set(result.failed_codes)
+            market_codes = {
+                "MARKET_CLOSED", "MARKET_TICK_STALE", "SPREAD_TOO_WIDE",
+                "MARKET_DATA_INVALID", "SYMBOL_TRADE_MODE_FORBIDDEN",
+            }
+            security_codes = {
+                "ACCOUNT_NOT_DEMO", "ACCOUNT_LOGIN_MISMATCH", "ACCOUNT_SERVER_MISMATCH",
+                "AUDIT_CHAIN_INVALID", "DEMO_EXECUTION_NOT_AUTHORIZED", "KILL_SWITCH_ENGAGED",
+            }
+            state = (
+                "REJECTED_SECURITY" if failed & security_codes
+                else "REJECTED_MARKET" if failed & market_codes
+                else "REJECTED_RISK"
+            )
+            self._research_store.append_lifecycle(
+                str(uuid4()), proposal_id, state, lifecycle_payload
+            )
         self._research_store.complete_idempotency(request.idempotency_key, response)
         return response
 
@@ -448,10 +563,16 @@ class GatewayApplication:
                     "average_mfe_r": item.average_mfe_r,
                     "average_mae_r": item.average_mae_r,
                     "max_drawdown": item.max_drawdown,
+                    "wins": item.wins,
+                    "losses": item.losses,
+                    "median_duration_seconds": item.median_duration_seconds,
+                    "expectancy_r_ci95_low": item.expectancy_r_ci95_low,
+                    "expectancy_r_ci95_high": item.expectancy_r_ci95_high,
                     "evidence_sufficient": item.evidence_sufficient,
                 }
                 for item in metrics
             ],
+            "groups": self._research_store.grouped_metrics(),
         }
         self._audit.append("research_metrics_served", response)
         return response
@@ -459,6 +580,16 @@ class GatewayApplication:
     def record_decision(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self._research_store is None:
             raise RuntimeError("Research store is unavailable")
+        self._guarded_account()
+        if not self._audit.verify().valid:
+            raise RuntimeError("Audit chain is invalid")
+        if payload.get("symbol") != self._allowed_symbol or payload.get("timeframe") != "M1":
+            raise ValueError("Decisions must reference the configured XAUUSD M1 stream")
+        bar_time = datetime.fromisoformat(str(payload["bar_time_utc"])).astimezone(UTC)
+        candles = self._adapter.candles(self._allowed_symbol, "M1", 1)
+        if len(candles) != 1 or candles[0].time_msc != int(bar_time.timestamp() * 1000):
+            raise ValueError("Decision must reference the latest closed XAUUSD M1 bar")
+        payload = {**payload, "bar_time_utc": bar_time.isoformat()}
         self._research_store.record_agent_decision(**payload)
         self._audit.append("agent_decision_recorded", payload)
         return {"recorded": True, "decision_id": payload["decision_id"]}
@@ -476,6 +607,11 @@ class GatewayApplication:
         if self._research_store is None:
             raise RuntimeError("Research store is unavailable")
         self._research_store.save_trade_review(**payload)
+        proposal_id = self._research_store.proposal_id_for_trade(payload["trade_id"])
+        if proposal_id is not None:
+            self._research_store.append_lifecycle(
+                str(uuid4()), proposal_id, "REVIEWED", {"review_id": payload["review_id"]}
+            )
         self._audit.append("trade_review_saved", {
             "review_id": payload["review_id"], "trade_id": payload["trade_id"],
         })
@@ -489,23 +625,8 @@ class GatewayApplication:
         return {"count": len(items), "items": items}
 
     def manage_position(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Fail-closed placeholder until the dedicated risk-reduction engine is wired."""
         if action not in {"CLOSE", "MODIFY", "CANCEL_PENDING"}:
             raise ValueError("Unsupported management action")
-        self._guarded_account()
-        response = {
-            "status": "REJECTED_SECURITY",
-            "mode": self._mode.value,
-            "action": action,
-            "failed_codes": [
-                "TRADING_MODE_OBSERVE_ONLY"
-                if self._mode is TradingMode.OBSERVE_ONLY
-                else "POSITION_MANAGEMENT_NOT_READY"
-            ],
-        }
-        self._audit.append("position_management_rejected", {
-            "action": action,
-            "ticket": payload.get("ticket"),
-            "failed_codes": response["failed_codes"],
-        })
-        return response
+        if self._gateway is None:
+            raise RuntimeError("Position management gateway is unavailable")
+        return self._gateway.manage_position(action, payload)

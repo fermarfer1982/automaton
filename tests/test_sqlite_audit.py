@@ -43,6 +43,25 @@ class DualAuditTests(unittest.TestCase):
                 payload = connection.execute("SELECT payload_json FROM audit_events").fetchone()[0]
             self.assertEqual("[REDACTED]", json.loads(payload)["api_key"])
 
+    def test_materialized_security_projections_are_append_only_and_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audit = DualAuditLog(root / "audit.jsonl", root / "audit.db")
+            audit.append(
+                "risk_engine_decision",
+                {"stage": "POST_LLM_CHECK", "failed_codes": ["SPREAD_TOO_WIDE"]},
+            )
+            audit.append(
+                "proposal_outcome",
+                {"status": "REJECTED", "proposal_id": "p1"},
+            )
+            with closing(sqlite3.connect(root / "audit.db")) as connection:
+                self.assertEqual(1, connection.execute("SELECT COUNT(*) FROM audit_gates").fetchone()[0])
+                self.assertEqual(1, connection.execute("SELECT COUNT(*) FROM audit_denials").fetchone()[0])
+                with self.assertRaises(sqlite3.DatabaseError):
+                    connection.execute("DELETE FROM audit_gates")
+            self.assertTrue(audit.verify().valid)
+
 
 if __name__ == "__main__":
     unittest.main()

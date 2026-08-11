@@ -93,6 +93,7 @@ class SymbolSnapshot:
     tick_time_msc: int
     trade_freeze_level: int = 0
     market_open: bool = True
+    trade_mode: str = "FULL"
 
 
 @dataclass(frozen=True)

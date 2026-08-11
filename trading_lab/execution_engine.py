@@ -4,7 +4,16 @@ from collections.abc import Callable
 from typing import Any, Protocol
 
 from .authorization import AuthorizationDecision
-from .domain import ExecutionResult, GuardDecision, RiskStage, Side, SymbolSnapshot, TradeProposal
+from .domain import (
+    ActiveOrderSnapshot,
+    ExecutionResult,
+    GuardDecision,
+    PositionSnapshot,
+    RiskStage,
+    Side,
+    SymbolSnapshot,
+    TradeProposal,
+)
 
 
 class ExecutionProvider(Protocol):
@@ -20,11 +29,11 @@ AuthorizationCheck = Callable[[], AuthorizationDecision]
 class ExecutionEngine:
     """The sole component allowed to sequence MT5 order_check and order_send."""
 
-    def __init__(self, adapter: ExecutionProvider) -> None:
+    def __init__(self, adapter: ExecutionProvider, max_deviation_points: int = 10) -> None:
         self._adapter = adapter
+        self._max_deviation_points = max_deviation_points
 
-    @staticmethod
-    def build_request(proposal: TradeProposal, market: SymbolSnapshot) -> dict[str, object]:
+    def build_request(self, proposal: TradeProposal, market: SymbolSnapshot) -> dict[str, object]:
         return {
             "action": "DEAL",
             "symbol": proposal.symbol,
@@ -33,11 +42,67 @@ class ExecutionEngine:
             "price": market.ask if proposal.side is Side.BUY else market.bid,
             "sl": proposal.stop_loss,
             "tp": proposal.take_profit or 0.0,
-            "deviation": 10,
+            "deviation": self._max_deviation_points,
             "magic": proposal.magic_number,
             "comment": f"automaton:{proposal.proposal_id[:18]}",
             "type_time": "GTC",
             "type_filling": "IOC",
+        }
+
+    def build_close_request(
+        self,
+        position: PositionSnapshot,
+        market: SymbolSnapshot,
+        magic_number: int,
+        operation_id: str,
+    ) -> dict[str, object]:
+        closing_side = Side.SELL if position.side is Side.BUY else Side.BUY
+        return {
+            "action": "DEAL",
+            "symbol": position.symbol,
+            "volume": position.volume,
+            "type": closing_side.value,
+            "position": position.ticket,
+            "price": market.bid if closing_side is Side.SELL else market.ask,
+            "sl": 0.0,
+            "tp": 0.0,
+            "deviation": self._max_deviation_points,
+            "magic": magic_number,
+            "comment": f"automaton:close:{operation_id[:10]}",
+            "type_time": "GTC",
+            "type_filling": "IOC",
+        }
+
+    @staticmethod
+    def build_modify_request(
+        position: PositionSnapshot,
+        stop_loss: float,
+        take_profit: float | None,
+        magic_number: int,
+        operation_id: str,
+    ) -> dict[str, object]:
+        return {
+            "action": "SLTP",
+            "symbol": position.symbol,
+            "position": position.ticket,
+            "sl": stop_loss,
+            "tp": take_profit or 0.0,
+            "magic": magic_number,
+            "comment": f"automaton:modify:{operation_id[:9]}",
+        }
+
+    @staticmethod
+    def build_cancel_request(
+        order: ActiveOrderSnapshot,
+        magic_number: int,
+        operation_id: str,
+    ) -> dict[str, object]:
+        return {
+            "action": "REMOVE",
+            "symbol": order.symbol,
+            "order": order.ticket,
+            "magic": magic_number,
+            "comment": f"automaton:cancel:{operation_id[:9]}",
         }
 
     def execute(
@@ -132,6 +197,7 @@ class ExecutionEngine:
                 "order_send_result",
                 {
                     "proposal_id": proposal.proposal_id,
+                    "fingerprint": fingerprint,
                     "ok": sent.ok,
                     "retcode": sent.retcode,
                     "comment": sent.comment,
@@ -151,3 +217,84 @@ class ExecutionEngine:
         if not sent.ok:
             return ExecutionResult(False, "ORDER_SEND_FAILED", sent.comment, order_check=checked, order_send=sent)
         return ExecutionResult(True, None, "Order executed", order_check=checked, order_send=sent)
+
+    def execute_management(
+        self,
+        request: dict[str, object],
+        audit_hook: AuditHook,
+        *,
+        operation_id: str,
+        fingerprint: str,
+        pre_send_guard: PreSendGuard,
+    ) -> ExecutionResult:
+        audit_hook("management_order_check_requested", {
+            "operation_id": operation_id, "request": request,
+        })
+        checked = self._adapter.order_check(request)
+        audit_hook("management_order_check_result", {
+            "operation_id": operation_id,
+            "ok": checked.ok,
+            "retcode": checked.retcode,
+            "comment": checked.comment,
+        })
+        if not checked.ok:
+            return ExecutionResult(False, "ORDER_CHECK_FAILED", checked.comment, order_check=checked)
+        pre_send = pre_send_guard()
+        audit_hook("management_pre_send_guard_decision", {
+            "stage": RiskStage.PRE_EXECUTION_CHECK.value,
+            "operation_id": operation_id,
+            "checks": pre_send.checks,
+        })
+        if not pre_send.allowed:
+            return ExecutionResult(
+                False, "PRE_SEND_GUARD_REJECTED",
+                f"Pre-send revalidation failed: {', '.join(pre_send.failed_codes)}",
+                order_check=checked,
+            )
+        audit_hook("management_order_send_authorized", {
+            "operation_id": operation_id, "fingerprint": fingerprint, "request": request,
+        })
+        try:
+            sent = self._adapter.order_send(request)
+        except Exception as exc:
+            try:
+                audit_hook("management_order_send_uncertain", {
+                    "operation_id": operation_id,
+                    "fingerprint": fingerprint,
+                    "error_type": type(exc).__name__,
+                })
+            except Exception:
+                pass
+            return ExecutionResult(
+                False, "ORDER_SEND_UNCERTAIN",
+                "MT5 management outcome is unknown; human reconciliation is required",
+                order_check=checked,
+                execution_uncertain=True,
+            )
+        try:
+            audit_hook("management_order_send_result", {
+                "operation_id": operation_id,
+                "fingerprint": fingerprint,
+                "ok": sent.ok,
+                "retcode": sent.retcode,
+                "comment": sent.comment,
+                "order_id": sent.order_id,
+                "deal_id": sent.deal_id,
+            })
+        except Exception:
+            return ExecutionResult(
+                False, "POST_SEND_AUDIT_FAILED",
+                "MT5 responded but the result could not be durably audited",
+                order_check=checked,
+                order_send=sent,
+                execution_uncertain=True,
+            )
+        if not sent.ok:
+            return ExecutionResult(
+                False, "ORDER_SEND_FAILED", sent.comment,
+                order_check=checked, order_send=sent,
+            )
+        return ExecutionResult(
+            True, None, "Position management executed",
+            order_check=checked, order_send=sent,
+        )

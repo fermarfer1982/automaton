@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable
-from datetime import UTC, datetime, time, tzinfo
+from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .domain import CandleSnapshot
@@ -82,4 +82,37 @@ def utc_day_range(candles: list[CandleSnapshot], now: datetime) -> dict[str, flo
     return {
         "high": max((item.high for item in selected), default=None),
         "low": min((item.low for item in selected), default=None),
+    }
+
+
+def asian_session_range(
+    candles: list[CandleSnapshot],
+    now: datetime,
+    zone_loader: Callable[[str], tzinfo] = ZoneInfo,
+) -> dict[str, object]:
+    """Range of the current/latest Singapore 08:00-16:00 session."""
+    if now.tzinfo is None:
+        raise ValueError("Range timestamp must be timezone-aware")
+    try:
+        zone = zone_loader("Asia/Singapore")
+    except ZoneInfoNotFoundError:
+        return {"available": False, "high": None, "low": None, "complete": False}
+    local_now = now.astimezone(zone)
+    session_day: date = local_now.date()
+    if local_now.time().replace(tzinfo=None) < time(8, 0):
+        session_day -= timedelta(days=1)
+    start = datetime.combine(session_day, time(8, 0), zone)
+    end = datetime.combine(session_day, time(16, 0), zone)
+    selected = []
+    for item in candles:
+        timestamp = datetime.fromtimestamp(item.time_msc / 1000, UTC).astimezone(zone)
+        if start <= timestamp < end and timestamp <= local_now:
+            selected.append(item)
+    return {
+        "available": bool(selected),
+        "high": max((item.high for item in selected), default=None),
+        "low": min((item.low for item in selected), default=None),
+        "start_utc": start.astimezone(UTC).isoformat(),
+        "end_utc": end.astimezone(UTC).isoformat(),
+        "complete": local_now >= end,
     }

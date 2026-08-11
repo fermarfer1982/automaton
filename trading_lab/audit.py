@@ -139,3 +139,52 @@ class HashChainAuditLog:
             except (OSError, ValueError, TypeError):
                 return True
             return False
+
+    def has_unreconciled_execution(self, fingerprint: str) -> bool:
+        """Treat an authorized send without a durable result as uncertain forever."""
+        with self._lock:
+            uncertain = False
+            if not self.path.exists():
+                return False
+            try:
+                with self.path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        record = json.loads(line)
+                        payload = record.get("payload", {})
+                        if payload.get("fingerprint") != fingerprint:
+                            continue
+                        event = record.get("event")
+                        if event in {"order_send_authorized", "management_order_send_authorized"}:
+                            uncertain = True
+                        elif event in {"order_send_result", "management_order_send_result", "execution_reconciled"}:
+                            uncertain = False
+                        elif event in {"order_send_uncertain", "management_order_send_uncertain"}:
+                            uncertain = True
+            except (OSError, ValueError, TypeError):
+                return True
+            return uncertain
+
+    def has_recent_entry(self, window_seconds: int) -> bool:
+        """Return true after a PAPER/DEMO entry, regardless of proposal fingerprint."""
+        with self._lock:
+            cutoff = datetime.now(UTC) - timedelta(seconds=window_seconds)
+            if not self.path.exists():
+                return False
+            try:
+                with self.path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        record = json.loads(line)
+                        if record.get("event") != "proposal_outcome":
+                            continue
+                        payload = record.get("payload", {})
+                        if payload.get("status") not in {"PAPER_ACCEPTED", "EXECUTED"}:
+                            continue
+                        if datetime.fromisoformat(record["timestamp"]) >= cutoff:
+                            return True
+            except (OSError, ValueError, TypeError):
+                return True
+            return False

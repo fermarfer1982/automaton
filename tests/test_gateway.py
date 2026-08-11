@@ -69,6 +69,12 @@ class GatewayTests(unittest.TestCase):
             def verify(self):
                 return self.delegate.verify()
 
+            def has_unreconciled_execution(self, fingerprint):
+                return self.delegate.has_unreconciled_execution(fingerprint)
+
+            def has_recent_entry(self, window_seconds):
+                return self.delegate.has_recent_entry(window_seconds)
+
         with tempfile.TemporaryDirectory() as directory:
             audit = FailingAudit(Path(directory) / "audit.jsonl")
             gateway, adapter, authorization_path, _ = self.build_gateway(
@@ -100,6 +106,17 @@ class GatewayTests(unittest.TestCase):
             second = gateway.submit(replace(proposal(), proposal_id="proposal-002"))
             self.assertEqual(GatewayStatus.REJECTED, second.status)
             self.assertIn("EXISTING_SYMBOL_POSITION", second.failed_codes)
+
+    def test_paper_entry_cooldown_survives_position_close(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            gateway, adapter, _, _ = self.build_gateway(directory, TradingMode.PAPER)
+            first = gateway.submit(proposal())
+            self.assertEqual(GatewayStatus.PAPER_ACCEPTED, first.status)
+            ticket = gateway._paper_engine.position_snapshots()[0].ticket
+            gateway._paper_engine.close(ticket, adapter.symbol)
+            second = gateway.submit(replace(proposal(), proposal_id="proposal-002"))
+            self.assertEqual(GatewayStatus.REJECTED, second.status)
+            self.assertIn("COOLDOWN_ACTIVE", second.failed_codes)
 
     def test_demo_execution_requires_external_authorization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -210,8 +227,8 @@ class GatewayTests(unittest.TestCase):
             self.assertIn("ORDER_SEND_UNCERTAIN", first.failed_codes)
 
             second = gateway.submit(replace(proposal(), proposal_id="proposal-002"))
-            self.assertEqual(GatewayStatus.REJECTED, second.status)
-            self.assertIn("DUPLICATE_PROPOSAL", second.failed_codes)
+            self.assertEqual(GatewayStatus.EXECUTION_UNCERTAIN, second.status)
+            self.assertIn("EXECUTION_RECONCILIATION_REQUIRED", second.failed_codes)
             self.assertEqual(1, adapter.calls.count("order_send"))
 
     def test_post_send_audit_failure_is_reported_as_uncertain(self) -> None:
@@ -229,6 +246,12 @@ class GatewayTests(unittest.TestCase):
 
             def verify(self):
                 return self.delegate.verify()
+
+            def has_unreconciled_execution(self, fingerprint):
+                return self.delegate.has_unreconciled_execution(fingerprint)
+
+            def has_recent_entry(self, window_seconds):
+                return self.delegate.has_recent_entry(window_seconds)
 
         with tempfile.TemporaryDirectory() as directory:
             audit = ResultFailingAudit(Path(directory) / "audit.jsonl")

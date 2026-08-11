@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 from dataclasses import dataclass
@@ -57,6 +58,37 @@ class SecurityConfig:
     api_key_path: Path | None = None
     gateway_lock_path: Path | None = None
     log_dir: Path | None = None
+
+
+def security_config_hash(config: SecurityConfig) -> str:
+    """Canonical non-secret binding used by external DEMO authorization."""
+    payload = {
+        "schema_version": config.schema_version,
+        "trading_mode": config.trading_mode.value,
+        "authorized_account": config.authorized_account,
+        "authorized_server": config.authorized_server,
+        "authorized_account_name": config.authorized_account_name,
+        "allowed_symbol": config.allowed_symbol,
+        "magic_number": config.magic_number,
+        "mt5_terminal_path": str(config.mt5_terminal_path),
+        "audit_path": str(config.audit_path),
+        "audit_db_path": str(config.audit_db_path),
+        "research_db_path": str(config.research_db_path),
+        "api_key_path": str(config.api_key_path),
+        "gateway_lock_path": str(config.gateway_lock_path),
+        "log_dir": str(config.log_dir),
+        "demo_authorization_path": str(config.demo_authorization_path),
+        "kill_switch_path": str(config.kill_switch_path),
+        "automaton_state_dir": str(config.automaton_state_dir),
+        "gateway_windows_identity": config.gateway_windows_identity,
+        "automaton_windows_identity": config.automaton_windows_identity,
+        "risk": {
+            name: getattr(config.risk, name)
+            for name in config.risk.__dataclass_fields__
+        },
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 _CREDENTIAL_KEYS = {

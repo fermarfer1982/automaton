@@ -5,7 +5,7 @@ import json
 import math
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
 from collections.abc import Callable
@@ -144,6 +144,14 @@ $matched | ConvertTo-Json -Compress
             for field in ("trade_tick_value", "trade_tick_value_profit", "trade_tick_value_loss")
         ]
         tick_value = max(tick_values)
+        raw_trade_mode = int(getattr(info, "trade_mode", -1))
+        trade_modes = {
+            int(getattr(mt5, "SYMBOL_TRADE_MODE_DISABLED", 0)): "DISABLED",
+            int(getattr(mt5, "SYMBOL_TRADE_MODE_LONGONLY", 1)): "LONG_ONLY",
+            int(getattr(mt5, "SYMBOL_TRADE_MODE_SHORTONLY", 2)): "SHORT_ONLY",
+            int(getattr(mt5, "SYMBOL_TRADE_MODE_CLOSEONLY", 3)): "CLOSE_ONLY",
+            int(getattr(mt5, "SYMBOL_TRADE_MODE_FULL", 4)): "FULL",
+        }
         return SymbolSnapshot(
             symbol=str(getattr(info, "name", symbol)),
             bid=float(tick.bid),
@@ -158,8 +166,9 @@ $matched | ConvertTo-Json -Compress
             visible=bool(info.visible),
             tick_time_msc=int(tick.time_msc),
             trade_freeze_level=int(getattr(info, "trade_freeze_level", 0)),
-            market_open=int(getattr(info, "trade_mode", 0))
+            market_open=raw_trade_mode
             != int(getattr(mt5, "SYMBOL_TRADE_MODE_DISABLED", -1)),
+            trade_mode=trade_modes.get(raw_trade_mode, "UNKNOWN"),
         )
 
     def candles(self, symbol: str, timeframe: str, count: int) -> list[CandleSnapshot]:
@@ -319,7 +328,7 @@ $matched | ConvertTo-Json -Compress
 
     def daily_realized_pnl(self) -> float:
         mt5 = self._module()
-        now = datetime.now().astimezone()
+        now = datetime.now(UTC)
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         deals = mt5.history_deals_get(start, now)
         if deals is None:
@@ -340,28 +349,38 @@ $matched | ConvertTo-Json -Compress
 
     def _raw_request(self, request: dict[str, object]) -> dict[str, object]:
         mt5 = self._module()
-        required = {
+        open_required = {
             "action", "symbol", "volume", "type", "price", "sl", "tp",
             "deviation", "magic", "comment", "type_time", "type_filling",
         }
-        if set(request) != required:
-            raise MT5AdapterError("Execution request fields do not match the protected schema")
-        if request["action"] != "DEAL" or request["type_time"] != "GTC" or request["type_filling"] != "IOC":
-            raise MT5AdapterError("Unsupported protected execution request mode")
-        side = request["type"]
-        if side == Side.BUY.value:
-            order_type = mt5.ORDER_TYPE_BUY
-        elif side == Side.SELL.value:
-            order_type = mt5.ORDER_TYPE_SELL
-        else:
-            raise MT5AdapterError("Unsupported order side")
-        return {
-            **request,
-            "action": mt5.TRADE_ACTION_DEAL,
-            "type": order_type,
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
-        }
+        close_required = open_required | {"position"}
+        request_fields = frozenset(request)
+        if request_fields in {frozenset(open_required), frozenset(close_required)}:
+            if request["action"] != "DEAL" or request["type_time"] != "GTC" or request["type_filling"] != "IOC":
+                raise MT5AdapterError("Unsupported protected execution request mode")
+            side = request["type"]
+            if side == Side.BUY.value:
+                order_type = mt5.ORDER_TYPE_BUY
+            elif side == Side.SELL.value:
+                order_type = mt5.ORDER_TYPE_SELL
+            else:
+                raise MT5AdapterError("Unsupported order side")
+            return {
+                **request,
+                "action": mt5.TRADE_ACTION_DEAL,
+                "type": order_type,
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+        if request_fields == {"action", "symbol", "position", "sl", "tp", "magic", "comment"}:
+            if request["action"] != "SLTP":
+                raise MT5AdapterError("Unsupported protected SL/TP request mode")
+            return {**request, "action": mt5.TRADE_ACTION_SLTP}
+        if request_fields == {"action", "symbol", "order", "magic", "comment"}:
+            if request["action"] != "REMOVE":
+                raise MT5AdapterError("Unsupported protected cancellation request mode")
+            return {**request, "action": mt5.TRADE_ACTION_REMOVE}
+        raise MT5AdapterError("Execution request fields do not match the protected schema")
 
     def order_check(self, request: dict[str, object]) -> OrderCheckResult:
         result = self._module().order_check(self._raw_request(request))

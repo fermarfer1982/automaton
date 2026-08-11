@@ -32,6 +32,18 @@ class RiskEngine:
     def duplicate_window_seconds(self) -> int:
         return self._limits.duplicate_window_seconds
 
+    @property
+    def allowed_symbol(self) -> str:
+        return self._allowed_symbol
+
+    @property
+    def required_magic_number(self) -> int:
+        return self._required_magic_number
+
+    @property
+    def cooldown_seconds(self) -> int:
+        return self._limits.cooldown_seconds
+
     @staticmethod
     def fingerprint(proposal: TradeProposal) -> str:
         material = {
@@ -80,6 +92,16 @@ class RiskEngine:
         add("MARKET_SYMBOL_MISMATCH", market.symbol == proposal.symbol, "Market data must match proposal symbol")
         add("SYMBOL_NOT_VISIBLE", market.visible, "Symbol must already be visible in MT5")
         add("MARKET_CLOSED", market.market_open, "XAUUSD must be open for trading")
+        trade_mode_allows_entry = (
+            market.trade_mode == "FULL"
+            or (market.trade_mode == "LONG_ONLY" and proposal.side is Side.BUY)
+            or (market.trade_mode == "SHORT_ONLY" and proposal.side is Side.SELL)
+        )
+        add(
+            "SYMBOL_TRADE_MODE_FORBIDDEN",
+            trade_mode_allows_entry,
+            "Broker symbol trade mode does not allow the proposed opening side",
+        )
         add(
             "MAGIC_NUMBER_MISMATCH",
             proposal.magic_number == self._required_magic_number,
@@ -180,8 +202,8 @@ class RiskEngine:
 
         add(
             "OPEN_POSITION_LIMIT_REACHED",
-            len(positions) < self._limits.max_open_positions,
-            "Maximum open position count reached",
+            len(positions) == 0,
+            "Any account position blocks a new entry",
         )
         same_symbol = [position for position in positions if position.symbol == proposal.symbol]
         add(

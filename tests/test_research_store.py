@@ -73,6 +73,24 @@ class ResearchStoreTests(unittest.TestCase):
             self.assertAlmostEqual(50.0, metrics.max_drawdown)
             self.assertAlmostEqual(1.125, metrics.average_mfe_r)
             self.assertAlmostEqual(-0.625, metrics.average_mae_r)
+            self.assertEqual(2, metrics.wins)
+            self.assertEqual(2, metrics.losses)
+            self.assertIsNotNone(metrics.expectancy_r_ci95_low)
+            self.assertIsNotNone(metrics.expectancy_r_ci95_high)
+            repeated = ResearchStore(Path(directory) / "research.db").strategy_metrics(
+                "adaptive", "1.0.0"
+            )
+            self.assertEqual(
+                (metrics.expectancy_r_ci95_low, metrics.expectancy_r_ci95_high),
+                (repeated.expectancy_r_ci95_low, repeated.expectancy_r_ci95_high),
+            )
+            groups = store.grouped_metrics()
+            london = next(
+                item for item in groups
+                if item["dimension"] == "session" and item["value"] == "LONDON"
+            )
+            self.assertEqual(4, london["sample_size"])
+            self.assertIn("max_drawdown", london)
 
     def test_empty_sample_reports_no_statistical_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -81,6 +99,28 @@ class ResearchStoreTests(unittest.TestCase):
             self.assertIsNone(metrics.expectancy_r)
             self.assertIsNone(metrics.profit_factor)
             self.assertFalse(metrics.evidence_sufficient)
+
+    def test_daily_equity_start_and_peak_are_durable_in_utc(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "research.db"
+            store = ResearchStore(path)
+            at = datetime(2026, 8, 11, 0, 5, tzinfo=UTC)
+            first = store.update_daily_risk_state(
+                currency="EUR", equity=10_000.0, balance=10_000.0, at=at,
+            )
+            store.update_daily_risk_state(
+                currency="EUR", equity=10_050.0, balance=10_000.0,
+                at=at + timedelta(hours=1),
+            )
+            restarted = ResearchStore(path)
+            drawdown = restarted.update_daily_risk_state(
+                currency="EUR", equity=9_990.0, balance=10_000.0,
+                at=at + timedelta(hours=2),
+            )
+            self.assertEqual(10_000.0, first["start_equity"])
+            self.assertEqual(10_000.0, drawdown["start_equity"])
+            self.assertEqual(10_050.0, drawdown["peak_equity"])
+            self.assertEqual(60.0, drawdown["drawdown"])
 
 
 if __name__ == "__main__":

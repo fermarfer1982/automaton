@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
+import random
 import sqlite3
+import statistics
 import threading
 from contextlib import closing
 from dataclasses import dataclass
@@ -39,6 +42,19 @@ class TradeResultRecord:
     r_multiple: float
     mfe_r: float
     mae_r: float
+    gross_pnl: float | None = None
+    commission: float = 0.0
+    swap: float = 0.0
+    fee: float = 0.0
+    entry_spread_points: float | None = None
+    exit_spread_points: float | None = None
+    timeframe: str = "UNKNOWN"
+    atr_at_entry: float | None = None
+    stop_distance_points: float | None = None
+    initial_reward_risk: float | None = None
+    primary_session: str | None = None
+    active_sessions: str = "[]"
+    data_quality: str = "UNKNOWN"
 
 
 @dataclass(frozen=True)
@@ -54,6 +70,11 @@ class StrategyMetrics:
     average_mfe_r: float | None
     average_mae_r: float | None
     max_drawdown: float
+    wins: int
+    losses: int
+    median_duration_seconds: float | None
+    expectancy_r_ci95_low: float | None
+    expectancy_r_ci95_high: float | None
     evidence_sufficient: bool
     minimum_evidence_sample: int = MIN_EVIDENCE_SAMPLE
 
@@ -221,7 +242,107 @@ class ResearchStore:
         self._lock = threading.Lock()
         with closing(self._connect()) as connection:
             connection.executescript(_SCHEMA)
+            self._migrate_schema(connection)
             connection.commit()
+
+    @staticmethod
+    def _migrate_schema(connection: sqlite3.Connection) -> None:
+        version = int(connection.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM research_schema"
+        ).fetchone()[0])
+        if version < 4:
+            connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            DROP INDEX IF EXISTS idx_paper_positions_status;
+            CREATE TABLE paper_positions_v4 (
+              proposal_id TEXT PRIMARY KEY,
+              paper_trade_id TEXT NOT NULL UNIQUE,
+              status TEXT NOT NULL CHECK(status IN (
+                'OPEN', 'CLOSED_TP', 'CLOSED_SL', 'CLOSED_MANUAL'
+              )),
+              entry_price REAL NOT NULL,
+              initial_stop_loss REAL NOT NULL,
+              current_stop_loss REAL NOT NULL,
+              take_profit REAL,
+              tick_size REAL NOT NULL,
+              tick_value REAL NOT NULL,
+              volume REAL NOT NULL,
+              mfe_r REAL NOT NULL DEFAULT 0,
+              mae_r REAL NOT NULL DEFAULT 0,
+              opened_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              closed_at TEXT
+            );
+            INSERT INTO paper_positions_v4(
+              proposal_id, paper_trade_id, status, entry_price,
+              initial_stop_loss, current_stop_loss, take_profit, tick_size,
+              tick_value, volume, mfe_r, mae_r, opened_at, updated_at, closed_at
+            )
+            SELECT proposal_id, paper_trade_id, status, entry_price,
+                   initial_stop_loss, initial_stop_loss, take_profit, tick_size,
+                   tick_value, volume, mfe_r, mae_r, opened_at, updated_at, closed_at
+            FROM paper_positions;
+            DROP TABLE paper_positions;
+            ALTER TABLE paper_positions_v4 RENAME TO paper_positions;
+            CREATE INDEX idx_paper_positions_status
+              ON paper_positions(status, updated_at);
+            INSERT OR IGNORE INTO research_schema(version) VALUES (4);
+            COMMIT;
+            """
+            )
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS daily_risk_state (
+              date_utc TEXT PRIMARY KEY,
+              currency TEXT NOT NULL,
+              start_equity REAL NOT NULL,
+              peak_equity REAL NOT NULL,
+              last_equity REAL NOT NULL,
+              balance REAL NOT NULL,
+              updated_at_utc TEXT NOT NULL
+            );
+            INSERT OR IGNORE INTO research_schema(version) VALUES (5);
+            """
+        )
+        trade_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(trade_results)")
+        }
+        additions = {
+            "gross_pnl": "REAL",
+            "commission": "REAL NOT NULL DEFAULT 0",
+            "swap": "REAL NOT NULL DEFAULT 0",
+            "fee": "REAL NOT NULL DEFAULT 0",
+            "entry_spread_points": "REAL",
+            "exit_spread_points": "REAL",
+            "timeframe": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+            "atr_at_entry": "REAL",
+            "stop_distance_points": "REAL",
+            "initial_reward_risk": "REAL",
+            "primary_session": "TEXT",
+            "active_sessions": "TEXT NOT NULL DEFAULT '[]'",
+            "data_quality": "TEXT NOT NULL DEFAULT 'UNKNOWN'",
+            "duration_seconds": "REAL NOT NULL DEFAULT 0",
+            "weekday_utc": "INTEGER NOT NULL DEFAULT 0",
+            "hour_utc": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, declaration in additions.items():
+            if name not in trade_columns:
+                connection.execute(
+                    f"ALTER TABLE trade_results ADD COLUMN {name} {declaration}"
+                )
+        connection.execute(
+            "INSERT OR IGNORE INTO research_schema(version) VALUES (6)"
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_decision_closed_bar
+            ON agent_decisions(symbol, timeframe, bar_time_utc)
+            """
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO research_schema(version) VALUES (7)"
+        )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5.0)
@@ -364,21 +485,26 @@ class ResearchStore:
         reason: str,
         hypothesis_id: str | None,
     ) -> None:
-        if action not in {"HOLD", "PROPOSE"} or symbol != "XAUUSD":
+        if action not in {"HOLD", "PROPOSE"} or symbol != "XAUUSD" or timeframe != "M1":
             raise ValueError("Unsupported structured agent decision")
         with self._lock, closing(self._connect()) as connection:
-            connection.execute(
-                """
-                INSERT INTO agent_decisions(
-                  decision_id, action, symbol, timeframe, bar_time_utc,
-                  reason, hypothesis_id, created_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    decision_id, action, symbol, timeframe, bar_time_utc,
-                    reason, hypothesis_id, datetime.now(UTC).isoformat(),
-                ),
-            )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO agent_decisions(
+                      decision_id, action, symbol, timeframe, bar_time_utc,
+                      reason, hypothesis_id, created_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        decision_id, action, symbol, timeframe, bar_time_utc,
+                        reason, hypothesis_id, datetime.now(UTC).isoformat(),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise FileExistsError(
+                    "A decision is already recorded for this closed M1 bar"
+                ) from exc
             connection.commit()
 
     def recent_memory(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -390,6 +516,47 @@ class ResearchStore:
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def latest_agent_decision(self) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT decision_id, action, symbol, timeframe, bar_time_utc,
+                       reason, hypothesis_id, created_at_utc
+                FROM agent_decisions
+                ORDER BY created_at_utc DESC, decision_id DESC LIMIT 1
+                """
+            ).fetchone()
+        return dict(row) if row else None
+
+    def latest_lifecycle_event(self) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT event_id, proposal_id, state, created_at_utc
+                FROM lifecycle_events
+                ORDER BY created_at_utc DESC, event_id DESC LIMIT 1
+                """
+            ).fetchone()
+        return dict(row) if row else None
+
+    def daily_research_summary(self, day: date | None = None) -> dict[str, float | int]:
+        target = (day or datetime.now(UTC).date()).isoformat()
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS sample_size,
+                       COALESCE(SUM(pnl), 0) AS net_pnl,
+                       COALESCE(SUM(r_multiple), 0) AS total_r
+                FROM trade_results WHERE substr(closed_at, 1, 10) = ?
+                """,
+                (target,),
+            ).fetchone()
+        return {
+            "sample_size": int(row["sample_size"]),
+            "net_pnl": float(row["net_pnl"]),
+            "total_r": float(row["total_r"]),
+        }
 
     def save_hypothesis(self, hypothesis_id: str, thesis: str) -> None:
         thesis = thesis.strip()
@@ -485,7 +652,19 @@ class ResearchStore:
             "r_multiple": record.r_multiple,
             "mfe_r": record.mfe_r,
             "mae_r": record.mae_r,
+            "gross_pnl": record.pnl if record.gross_pnl is None else record.gross_pnl,
+            "commission": record.commission,
+            "swap": record.swap,
+            "fee": record.fee,
         })
+        optional = {
+            "entry_spread_points": record.entry_spread_points,
+            "exit_spread_points": record.exit_spread_points,
+            "atr_at_entry": record.atr_at_entry,
+            "stop_distance_points": record.stop_distance_points,
+            "initial_reward_risk": record.initial_reward_risk,
+        }
+        self._validate_finite({key: value for key, value in optional.items() if value is not None})
 
     @staticmethod
     def _insert_trade_result(connection: sqlite3.Connection, record: TradeResultRecord) -> None:
@@ -496,7 +675,14 @@ class ResearchStore:
               strategy_version, session, market_regime, symbol, side, volume,
               entry_price, exit_price, initial_stop_loss, opened_at, closed_at,
               pnl, r_multiple, mfe_r, mae_r
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              , gross_pnl, commission, swap, fee, entry_spread_points,
+              exit_spread_points, timeframe, atr_at_entry, stop_distance_points,
+              initial_reward_risk, primary_session, active_sessions, data_quality,
+              duration_seconds, weekday_utc, hour_utc
+            ) VALUES (
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
             """,
             (
                 record.trade_id, record.proposal_id, record.hypothesis_id,
@@ -506,6 +692,15 @@ class ResearchStore:
                 record.exit_price, record.initial_stop_loss,
                 record.opened_at.isoformat(), record.closed_at.isoformat(),
                 record.pnl, record.r_multiple, record.mfe_r, record.mae_r,
+                record.pnl if record.gross_pnl is None else record.gross_pnl,
+                record.commission, record.swap, record.fee,
+                record.entry_spread_points, record.exit_spread_points,
+                record.timeframe, record.atr_at_entry, record.stop_distance_points,
+                record.initial_reward_risk, record.primary_session or record.session,
+                record.active_sessions, record.data_quality,
+                max(0.0, (record.closed_at - record.opened_at).total_seconds()),
+                record.closed_at.astimezone(UTC).weekday(),
+                record.closed_at.astimezone(UTC).hour,
             ),
         )
 
@@ -531,17 +726,41 @@ class ResearchStore:
                 """
                 INSERT INTO paper_positions(
                   proposal_id, paper_trade_id, status, entry_price,
-                  initial_stop_loss, take_profit, tick_size, tick_value, volume,
+                  initial_stop_loss, current_stop_loss, take_profit, tick_size, tick_value, volume,
                   mfe_r, mae_r, opened_at, updated_at
-                ) VALUES (?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
+                ) VALUES (?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
                 """,
                 (
                     proposal.proposal_id, f"paper:{proposal.proposal_id}", entry_price,
-                    proposal.stop_loss, proposal.take_profit, market.tick_size,
+                    proposal.stop_loss, proposal.stop_loss, proposal.take_profit, market.tick_size,
                     market.tick_value, proposal.volume, opened_at.isoformat(),
                     opened_at.isoformat(),
                 ),
             )
+            connection.commit()
+
+    def update_paper_protection(
+        self,
+        proposal_id: str,
+        *,
+        stop_loss: float,
+        take_profit: float | None,
+        updated_at: datetime,
+    ) -> None:
+        self._validate_finite({"stop_loss": stop_loss})
+        if take_profit is not None:
+            self._validate_finite({"take_profit": take_profit})
+        with self._lock, closing(self._connect()) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE paper_positions
+                SET current_stop_loss = ?, take_profit = ?, updated_at = ?
+                WHERE proposal_id = ? AND status = 'OPEN'
+                """,
+                (stop_loss, take_profit, updated_at.isoformat(), proposal_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Open paper position not found")
             connection.commit()
 
     def list_open_paper_positions(self) -> list[dict[str, Any]]:
@@ -587,8 +806,8 @@ class ResearchStore:
         *,
         reason: str,
     ) -> None:
-        if reason not in {"TP", "SL"}:
-            raise ValueError("Paper close reason must be TP or SL")
+        if reason not in {"TP", "SL", "MANUAL"}:
+            raise ValueError("Paper close reason must be TP, SL, or MANUAL")
         self._validate_trade_result(record)
         with self._lock, closing(self._connect()) as connection:
             self._insert_trade_result(connection, record)
@@ -606,13 +825,28 @@ class ResearchStore:
             )
             if cursor.rowcount != 1:
                 raise ValueError("Open paper position not found")
+            connection.execute(
+                """
+                INSERT INTO lifecycle_events(
+                  event_id, proposal_id, state, payload_json, created_at_utc
+                ) VALUES (?, ?, 'CLOSED', ?, ?)
+                """,
+                (
+                    str(uuid4()), record.proposal_id,
+                    json.dumps(
+                        {"reason": reason, "trade_id": record.trade_id},
+                        sort_keys=True, separators=(",", ":"),
+                    ),
+                    record.closed_at.astimezone(UTC).isoformat(),
+                ),
+            )
             connection.commit()
 
     def strategy_metrics(self, strategy_id: str, strategy_version: str) -> StrategyMetrics:
         with closing(self._connect()) as connection:
             rows = connection.execute(
                 """
-                SELECT pnl, r_multiple, mfe_r, mae_r
+                SELECT pnl, r_multiple, mfe_r, mae_r, duration_seconds
                 FROM trade_results
                 WHERE strategy_id = ? AND strategy_version = ?
                 ORDER BY closed_at, trade_id
@@ -632,6 +866,11 @@ class ResearchStore:
                 average_mfe_r=None,
                 average_mae_r=None,
                 max_drawdown=0.0,
+                wins=0,
+                losses=0,
+                median_duration_seconds=None,
+                expectancy_r_ci95_low=None,
+                expectancy_r_ci95_high=None,
                 evidence_sufficient=False,
             )
         pnl = [float(row["pnl"]) for row in rows]
@@ -646,6 +885,10 @@ class ResearchStore:
             peak = max(peak, cumulative)
             max_drawdown = max(max_drawdown, peak - cumulative)
         sample = len(rows)
+        ci_low, ci_high = self._bootstrap_mean_ci(
+            r_values,
+            seed_material=f"{strategy_id}|{strategy_version}|{sample}",
+        )
         return StrategyMetrics(
             strategy_id=strategy_id,
             strategy_version=strategy_version,
@@ -658,8 +901,34 @@ class ResearchStore:
             average_mfe_r=sum(float(row["mfe_r"]) for row in rows) / sample,
             average_mae_r=sum(float(row["mae_r"]) for row in rows) / sample,
             max_drawdown=max_drawdown,
+            wins=sum(1 for value in pnl if value > 0),
+            losses=sum(1 for value in pnl if value < 0),
+            median_duration_seconds=statistics.median(
+                float(row["duration_seconds"]) for row in rows
+            ),
+            expectancy_r_ci95_low=ci_low,
+            expectancy_r_ci95_high=ci_high,
             evidence_sufficient=sample >= MIN_EVIDENCE_SAMPLE,
         )
+
+    @staticmethod
+    def _bootstrap_mean_ci(
+        values: list[float], *, seed_material: str, samples: int = 2000
+    ) -> tuple[float | None, float | None]:
+        if not values:
+            return None, None
+        if len(values) == 1:
+            return values[0], values[0]
+        seed = int.from_bytes(
+            hashlib.sha256(seed_material.encode("utf-8")).digest()[:8], "big"
+        )
+        rng = random.Random(seed)
+        size = len(values)
+        means = sorted(
+            sum(values[rng.randrange(size)] for _ in range(size)) / size
+            for _ in range(samples)
+        )
+        return means[int(samples * 0.025)], means[int(samples * 0.975) - 1]
 
     def all_strategy_metrics(self) -> list[StrategyMetrics]:
         with closing(self._connect()) as connection:
@@ -670,6 +939,80 @@ class ResearchStore:
             self.strategy_metrics(str(row["strategy_id"]), str(row["strategy_version"]))
             for row in groups
         ]
+
+    def grouped_metrics(self) -> list[dict[str, Any]]:
+        dimensions = {
+            "setup": "setup_id",
+            "session": "session",
+            "hour_utc": "hour_utc",
+            "weekday_utc": "weekday_utc",
+            "direction": "side",
+            "regime": "market_regime",
+            "timeframe": "timeframe",
+        }
+        output: list[dict[str, Any]] = []
+        with closing(self._connect()) as connection:
+            for dimension, column in dimensions.items():
+                groups = connection.execute(
+                    f"SELECT DISTINCT {column} AS value FROM trade_results ORDER BY {column}"
+                ).fetchall()
+                for group in groups:
+                    value = group["value"]
+                    rows = connection.execute(
+                        f"""
+                        SELECT pnl, r_multiple, mfe_r, mae_r, duration_seconds
+                        FROM trade_results WHERE {column} = ?
+                        ORDER BY closed_at, trade_id
+                        """,
+                        (value,),
+                    ).fetchall()
+                    pnl = [float(row["pnl"]) for row in rows]
+                    r_values = [float(row["r_multiple"]) for row in rows]
+                    if not rows:
+                        continue
+                    gross_profit = sum(item for item in pnl if item > 0)
+                    gross_loss = abs(sum(item for item in pnl if item < 0))
+                    cumulative = 0.0
+                    peak = 0.0
+                    max_drawdown = 0.0
+                    for item in pnl:
+                        cumulative += item
+                        peak = max(peak, cumulative)
+                        max_drawdown = max(max_drawdown, peak - cumulative)
+                    ci_low, ci_high = self._bootstrap_mean_ci(
+                        r_values,
+                        seed_material=f"{dimension}|{value}|{len(rows)}",
+                    )
+                    output.append({
+                        "dimension": dimension,
+                        "value": value,
+                        "sample_size": len(rows),
+                        "wins": sum(1 for item in pnl if item > 0),
+                        "losses": sum(1 for item in pnl if item < 0),
+                        "win_rate": sum(1 for item in pnl if item > 0) / len(rows),
+                        "net_profit": sum(pnl),
+                        "expectancy_r": sum(r_values) / len(rows),
+                        "expectancy_r_ci95_low": ci_low,
+                        "expectancy_r_ci95_high": ci_high,
+                        "profit_factor": (
+                            gross_profit / gross_loss if gross_loss > 0 else None
+                        ),
+                        "max_drawdown": max_drawdown,
+                        "average_mfe_r": sum(float(row["mfe_r"]) for row in rows) / len(rows),
+                        "average_mae_r": sum(float(row["mae_r"]) for row in rows) / len(rows),
+                        "median_duration_seconds": statistics.median(
+                            float(row["duration_seconds"]) for row in rows
+                        ),
+                        "evidence_sufficient": len(rows) >= MIN_EVIDENCE_SAMPLE,
+                    })
+        return output
+
+    def proposal_id_for_trade(self, trade_id: str) -> str | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT proposal_id FROM trade_results WHERE trade_id = ?", (trade_id,)
+            ).fetchone()
+        return str(row["proposal_id"]) if row else None
 
     def paper_daily_realized_pnl(self, day: date | None = None) -> float:
         """Return closed PAPER PnL for the local calendar day."""
@@ -685,10 +1028,63 @@ class ResearchStore:
                 total += float(row["pnl"])
         return total
 
+    def update_daily_risk_state(
+        self,
+        *,
+        currency: str,
+        equity: float,
+        balance: float,
+        at: datetime | None = None,
+    ) -> dict[str, Any]:
+        self._validate_finite({"equity": equity, "balance": balance})
+        if not currency or equity <= 0 or balance <= 0:
+            raise ValueError("Daily risk state requires positive account economics")
+        now = (at or datetime.now(UTC)).astimezone(UTC)
+        day = now.date().isoformat()
+        with self._lock, closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM daily_risk_state WHERE date_utc = ?", (day,)
+            ).fetchone()
+            if row is None:
+                start_equity = equity
+                peak_equity = equity
+                connection.execute(
+                    """
+                    INSERT INTO daily_risk_state(
+                      date_utc, currency, start_equity, peak_equity,
+                      last_equity, balance, updated_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (day, currency, equity, equity, equity, balance, now.isoformat()),
+                )
+            else:
+                if str(row["currency"]) != currency:
+                    raise RuntimeError("Account currency changed during the UTC risk day")
+                start_equity = float(row["start_equity"])
+                peak_equity = max(float(row["peak_equity"]), equity)
+                connection.execute(
+                    """
+                    UPDATE daily_risk_state
+                    SET peak_equity = ?, last_equity = ?, balance = ?, updated_at_utc = ?
+                    WHERE date_utc = ?
+                    """,
+                    (peak_equity, equity, balance, now.isoformat(), day),
+                )
+            connection.commit()
+        return {
+            "date_utc": day,
+            "currency": currency,
+            "start_equity": start_equity,
+            "peak_equity": peak_equity,
+            "last_equity": equity,
+            "drawdown": peak_equity - equity,
+        }
+
     def health(self) -> bool:
         try:
             with closing(self._connect()) as connection:
                 version = connection.execute("SELECT MAX(version) FROM research_schema").fetchone()[0]
-            return version == 3
+            return version == 7
         except sqlite3.Error:
             return False
