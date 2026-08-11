@@ -1,0 +1,10 @@
+# Human-reviewed direct dependencies. Do not install from this file in production;
+# use the Windows/CPython 3.14 hash lock below.
+fastapi==0.141.1
+uvicorn==0.52.1
+pydantic==2.13.4
+httpx==0.28.1
+pytest==9.1.1
+PyYAML==6.0.3
+tzdata==2026.3
+MetaTrader5==5.0.6090

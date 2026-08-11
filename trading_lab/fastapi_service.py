@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -19,6 +20,9 @@ from .api_models import (
 from .domain import SemanticTradeRequest
 
 
+MAX_REQUEST_BYTES = 64 * 1024
+
+
 def create_fastapi_app(application, verifier: ApiKeyVerifier) -> FastAPI:
     app = FastAPI(
         title="Automaton MT5 Gateway",
@@ -34,6 +38,25 @@ def create_fastapi_app(application, verifier: ApiKeyVerifier) -> FastAPI:
             raise HTTPException(status_code=401, detail="invalid_gateway_key")
 
     protected = [Depends(authenticate)]
+
+    @app.middleware("http")
+    async def security_boundary(request: Request, call_next):
+        if request.url.path.startswith("/v1"):
+            keys = request.headers.getlist("x-automaton-key")
+            if len(keys) != 1 or not verifier.verify(keys[0]):
+                return JSONResponse(status_code=401, content={"error": "invalid_gateway_key"})
+            if request.method in {"POST", "PUT", "PATCH"}:
+                raw_length = request.headers.get("content-length")
+                try:
+                    length = int(raw_length or "")
+                except ValueError:
+                    length = -1
+                if length < 1 or length > MAX_REQUEST_BYTES:
+                    return JSONResponse(status_code=413, content={"error": "invalid_request_size"})
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, _exc: RequestValidationError):
@@ -94,7 +117,7 @@ def create_fastapi_app(application, verifier: ApiKeyVerifier) -> FastAPI:
     def history(
         from_utc: datetime = Query(alias="from"),
         to_utc: datetime = Query(alias="to"),
-        symbol: str | None = None,
+        symbol: Literal["XAUUSD"] = "XAUUSD",
         limit: int = Query(default=1000, ge=1, le=1000),
     ):
         return application.history(from_utc, to_utc, symbol=symbol, limit=limit)

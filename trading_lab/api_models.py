@@ -50,7 +50,7 @@ class DecisionBody(StrictModel):
     decision_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
     action: Literal["HOLD", "PROPOSE"]
     symbol: Literal["XAUUSD"]
-    timeframe: Literal["M1", "M5", "M15", "H1"]
+    timeframe: Literal["M1"]
     bar_time_utc: datetime
     reason: str = Field(min_length=1, max_length=4000)
     hypothesis_id: str | None = Field(default=None, max_length=128)
