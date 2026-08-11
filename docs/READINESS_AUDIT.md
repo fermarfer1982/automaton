@@ -25,7 +25,7 @@ identidades dedicadas y con `TRADING_MODE=OBSERVE_ONLY`.
 | Perfil sin shell/pagos/replicación/install/push/self-mod de seguridad | `runtime-profile.ts`, `self-mod/code.ts`, tests source-boundary | Probado estáticamente |
 | Scripts, ACL, kill switch independiente y enable DEMO humano | `scripts/*.ps1`, `operator.py`, tests ACL/operator | AST/tests locales; aplicación real pendiente |
 
-La suite estándar actual ejecuta 121 tests: 118 pasan y 3 se omiten porque las
+La suite estándar actual ejecuta 122 tests: 119 pasan y 3 se omiten porque las
 dependencias FastAPI/httpx/Pydantic hash-locked todavía no están instaladas.
 `pytest`, typecheck, build y Vitest no pueden considerarse verdes hasta instalar
 las dependencias revisadas.
