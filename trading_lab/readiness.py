@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -8,10 +9,12 @@ import shutil
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from .api_auth import ApiKeyVerifier
 from .config import SecurityConfig, load_security_config
 from .domain import TradingMode
 from .windows_acl import verify_windows_acl
@@ -34,10 +37,13 @@ class ReadinessCheck:
     detail: str
 
 
-def _gateway_get(path: str) -> dict[str, object]:
+def _gateway_get(path: str, api_key: str) -> dict[str, object]:
     request = Request(
         GATEWAY_ORIGIN + path,
-        headers={"Accept": "application/json"},
+        headers={
+            "Accept": "application/json",
+            "X-AUTOMATON-KEY": api_key,
+        },
         method="GET",
     )
     with build_opener(_NoRedirect()).open(request, timeout=5) as response:
@@ -82,6 +88,13 @@ def run_readiness(config_path: str | Path, *, run_tests: bool = True) -> dict[st
     checks: list[ReadinessCheck] = []
     config: SecurityConfig | None = None
     verified_automaton_sid: str | None = None
+    mt5_connected = False
+    demo_verified = False
+    account_allowed = False
+    server_allowed = False
+    xauusd_available = False
+    gateway_healthy = False
+    audit_ready = False
     try:
         config = load_security_config(config_path)
         checks.append(ReadinessCheck("security_config", True, "valid schema without credentials"))
@@ -102,13 +115,17 @@ def run_readiness(config_path: str | Path, *, run_tests: bool = True) -> dict[st
         workspace = Path(__file__).resolve().parents[1]
         for name, path in (
             ("audit_outside_workspace", config.audit_path),
+            ("audit_db_outside_workspace", config.audit_db_path),
             ("research_db_outside_workspace", config.research_db_path),
+            ("api_key_outside_workspace", config.api_key_path),
+            ("gateway_lock_outside_workspace", config.gateway_lock_path),
+            ("logs_outside_workspace", config.log_dir),
             ("authorization_outside_workspace", config.demo_authorization_path),
             ("kill_switch_outside_workspace", config.kill_switch_path),
         ):
             try:
-                outside = not path.resolve().is_relative_to(workspace)
-            except OSError:
+                outside = path is not None and not path.resolve().is_relative_to(workspace)
+            except (AttributeError, OSError):
                 outside = False
             checks.append(ReadinessCheck(name, outside, str(path)))
 
@@ -118,13 +135,55 @@ def run_readiness(config_path: str | Path, *, run_tests: bool = True) -> dict[st
         if not acl.passed:
             raise PermissionError("Windows ACL separation is not ready")
 
+        if config.api_key_path is None:
+            raise RuntimeError("Protected gateway API key path is missing")
+        verifier = ApiKeyVerifier(config.api_key_path)
+        api_key = config.api_key_path.read_text(encoding="ascii")
+        if not verifier.verify(api_key):
+            raise RuntimeError("Protected gateway API key is invalid")
+        checks.append(
+            ReadinessCheck(
+                "gateway_api_key",
+                True,
+                "external protected IPC key validated without disclosure",
+            )
+        )
+
         try:
-            health = _gateway_get("/v1/health")
-            market = _gateway_get("/v1/market/XAUUSD")
-            metrics = _gateway_get("/v1/research/metrics")
-            checks.append(ReadinessCheck("gateway_http", True, "loopback gateway is responding"))
+            health = _gateway_get("/v1/health", api_key)
+            status = _gateway_get("/v1/status", api_key)
+            account = _gateway_get("/v1/account", api_key)
+            market = _gateway_get("/v1/market/XAUUSD", api_key)
+            positions = _gateway_get("/v1/positions", api_key)
+            daily = _gateway_get("/v1/daily-stats", api_key)
+            metrics = _gateway_get("/v1/research/metrics", api_key)
+            memory = _gateway_get("/v1/research/memory?limit=1", api_key)
+            candle_payloads = {
+                timeframe: _gateway_get(
+                    f"/v1/candles/XAUUSD?{urlencode({'timeframe': timeframe, 'count': 20})}",
+                    api_key,
+                )
+                for timeframe in ("M1", "M5", "M15", "H1")
+            }
+            end = datetime.now(UTC)
+            history_query = urlencode({
+                "from": (end - timedelta(days=1)).isoformat(),
+                "to": end.isoformat(),
+                "symbol": "XAUUSD",
+                "limit": 1000,
+            })
+            history = _gateway_get(f"/v1/history?{history_query}", api_key)
+            checks.append(
+                ReadinessCheck(
+                    "gateway_authenticated_http",
+                    True,
+                    "all required loopback /v1 routes responded with authentication",
+                )
+            )
         except Exception as exc:
-            checks.append(ReadinessCheck("gateway_http", False, f"{type(exc).__name__}"))
+            checks.append(
+                ReadinessCheck("gateway_authenticated_http", False, f"{type(exc).__name__}")
+            )
             raise RuntimeError("Loopback gateway is unavailable or invalid") from exc
         checks.append(ReadinessCheck(
             "gateway_runtime_identity",
@@ -133,18 +192,35 @@ def run_readiness(config_path: str | Path, *, run_tests: bool = True) -> dict[st
         ))
         checks.append(ReadinessCheck(
             "observe_only_gateway",
-            health.get("mode") == TradingMode.OBSERVE_ONLY.value,
-            f"gateway mode={health.get('mode')}",
+            health.get("mode") == TradingMode.OBSERVE_ONLY.value
+            and status.get("mode") == TradingMode.OBSERVE_ONLY.value
+            and status.get("trading_enabled") is False,
+            f"gateway mode={health.get('mode')}; trading_enabled={status.get('trading_enabled')}",
         ))
         account_guard = health.get("account_guard", {})
         market_health = health.get("market_data", {})
         exposure = health.get("exposure", {})
         audit = health.get("audit", {})
         research = health.get("research_store", {})
+        mt5_connected = account.get("connected") is True
+        demo_verified = account.get("demo_verified") is True
+        account_allowed = account.get("account_allowed") is True
+        server_allowed = account.get("server_allowed") is True
+        xauusd_available = (
+            isinstance(market_health, dict)
+            and market_health.get("available") is True
+            and market.get("symbol") == "XAUUSD"
+        )
+        gateway_healthy = health.get("healthy") is True
+        audit_ready = isinstance(audit, dict) and audit.get("valid") is True
         checks.append(ReadinessCheck(
             "mt5_connection_and_authorized_demo_account",
             bool(health.get("healthy")) and isinstance(account_guard, dict)
-            and account_guard.get("allowed") is True,
+            and account_guard.get("allowed") is True
+            and account.get("connected") is True
+            and account.get("demo_verified") is True
+            and account.get("account_allowed") is True
+            and account.get("server_allowed") is True,
             "gateway health and exact DEMO account guard",
         ))
         checks.append(ReadinessCheck(
@@ -154,9 +230,34 @@ def run_readiness(config_path: str | Path, *, run_tests: bool = True) -> dict[st
             "live XAUUSD snapshot through the gateway",
         ))
         checks.append(ReadinessCheck(
+            "closed_candles_all_timeframes",
+            all(
+                payload.get("symbol") == "XAUUSD"
+                and payload.get("timeframe") == timeframe
+                and payload.get("closed_only") is True
+                and isinstance(payload.get("count"), int)
+                and int(payload["count"]) >= 15
+                for timeframe, payload in candle_payloads.items()
+            ),
+            "closed M1/M5/M15/H1 candles are available",
+        ))
+        session = market.get("session", {})
+        checks.append(ReadinessCheck(
+            "market_session_timezone_data",
+            isinstance(session, dict) and session.get("available") is True,
+            "IANA market session calculation is available",
+        ))
+        checks.append(ReadinessCheck(
             "zero_existing_exposure",
             isinstance(exposure, dict) and exposure.get("clear") is True,
             "no positions or active orders",
+        ))
+        checks.append(ReadinessCheck(
+            "account_queries",
+            positions.get("count") == 0
+            and isinstance(history.get("deals"), list)
+            and daily.get("currency") == account.get("currency"),
+            "positions, bounded history and daily account data are available",
         ))
         checks.append(ReadinessCheck(
             "audit_chain",
@@ -166,15 +267,35 @@ def run_readiness(config_path: str | Path, *, run_tests: bool = True) -> dict[st
         checks.append(ReadinessCheck(
             "structured_research_memory",
             isinstance(research, dict) and research.get("available") is True
-            and metrics.get("minimum_evidence_sample") == 30,
+            and metrics.get("minimum_evidence_sample") == 30
+            and isinstance(memory.get("items"), list),
             "research database and evidence threshold",
         ))
     except Exception as exc:
         checks.append(ReadinessCheck("live_integration", False, f"{type(exc).__name__}: {exc}"))
 
     if run_tests:
+        dependency_modules = {
+            "fastapi": "FastAPI",
+            "pydantic": "Pydantic",
+            "uvicorn": "Uvicorn",
+            "pytest": "pytest",
+            "MetaTrader5": "MetaTrader5",
+            "yaml": "PyYAML",
+            "tzdata": "tzdata",
+        }
+        missing_modules = [
+            label for module, label in dependency_modules.items()
+            if importlib.util.find_spec(module) is None
+        ]
+        checks.append(ReadinessCheck(
+            "gateway_dependencies",
+            not missing_modules,
+            "all fixed gateway/runtime dependencies present"
+            if not missing_modules else f"missing: {', '.join(missing_modules)}",
+        ))
         completed = subprocess.run(
-            [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"],
+            [sys.executable, "-m", "pytest", "-q"],
             cwd=Path(__file__).resolve().parents[1],
             capture_output=True,
             text=True,
@@ -365,8 +486,38 @@ def run_readiness(config_path: str | Path, *, run_tests: bool = True) -> dict[st
             )
         )
     ready = bool(checks) and all(check.passed for check in checks)
+    by_name = {check.name: check.passed for check in checks}
+    security_tests = by_name.get("security_tests", False)
+    tools_ready = all(
+        by_name.get(name, False)
+        for name in (
+            "gateway_authenticated_http",
+            "automaton_dependencies",
+            "automaton_typecheck",
+            "automaton_build",
+            "automaton_tests",
+            "automaton_lab_policy",
+            "automaton_inference_provider",
+        )
+    )
     return {
         "AUTOMATON_MT5_LAB_READY": ready,
+        "MT5_CONNECTED": mt5_connected,
+        "DEMO_VERIFIED": demo_verified,
+        "ACCOUNT_ALLOWED": account_allowed,
+        "SERVER_ALLOWED": server_allowed,
+        "XAUUSD_AVAILABLE": xauusd_available,
+        "GATEWAY_HEALTH": gateway_healthy,
+        "AUTOMATON_TOOLS_READY": tools_ready,
+        "AUDIT_READY": audit_ready,
+        "RISK_TESTS": security_tests,
+        "SECURITY_TESTS": security_tests,
+        "TRADING_MODE": (
+            TradingMode.OBSERVE_ONLY.value
+            if by_name.get("observe_only_mode", False)
+            and by_name.get("observe_only_gateway", False)
+            else "UNVERIFIED"
+        ),
         "required_mode": TradingMode.OBSERVE_ONLY.value,
         "checks": [asdict(check) for check in checks],
     }
@@ -378,7 +529,7 @@ def main() -> None:
         "--config",
         default=os.environ.get(
             "AUTOMATON_MT5_SECURITY_CONFIG",
-            r"C:\ProgramData\AutomatonMT5Lab\control\security.json",
+            r"C:\ProgramData\AutomatonMT5Lab\control\trading.yaml",
         ),
     )
     args = parser.parse_args()

@@ -57,6 +57,14 @@ class ReadinessAclGateTests(unittest.TestCase):
             checks = {item["name"]: item for item in report["checks"]}
             self.assertFalse(checks["least_privilege_windows_acl"]["passed"])
             self.assertFalse(report["AUTOMATON_MT5_LAB_READY"])
+            self.assertEqual(report["TRADING_MODE"], "UNVERIFIED")
+            for field in (
+                "MT5_CONNECTED", "DEMO_VERIFIED", "ACCOUNT_ALLOWED",
+                "SERVER_ALLOWED", "XAUUSD_AVAILABLE", "GATEWAY_HEALTH",
+                "AUTOMATON_TOOLS_READY", "AUDIT_READY", "RISK_TESTS",
+                "SECURITY_TESTS",
+            ):
+                self.assertIs(report[field], False)
 
     def test_gateway_service_refuses_unsafe_acl_before_mt5_initialize(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
