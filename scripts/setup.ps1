@@ -33,7 +33,16 @@ if ($InstallDependencies) {
     if ($pythonRuntime -ne '3.14|64bit') {
         throw "Reviewed CPython 3.14 x64 is required; found $pythonRuntime."
     }
-    $pnpmVersion = (& pnpm --version).Trim()
+    $nodeVersionText = (& node -p "process.versions.node").Trim()
+    $nodeVersion = [version]$nodeVersionText
+    $nodeSupported = (
+        ($nodeVersion.Major -eq 20 -and $nodeVersion -ge [version]'20.18.0') -or
+        $nodeVersion.Major -eq 22
+    )
+    if (-not $nodeSupported) {
+        throw "Reviewed Node 20.18+ or Node 22 is required; found $nodeVersionText."
+    }
+    $pnpmVersion = (& corepack pnpm@10.28.1 --version).Trim()
     if ($pnpmVersion -ne '10.28.1') {
         throw "Reviewed pnpm 10.28.1 is required; found $pnpmVersion."
     }
@@ -42,6 +51,6 @@ if ($InstallDependencies) {
     & (Join-Path $venv 'Scripts\python.exe') -m pip install `
         --require-hashes -r (Join-Path $workspace 'requirements-gateway-win-py314.lock')
     Push-Location $workspace
-    try { pnpm install --frozen-lockfile } finally { Pop-Location }
+    try { corepack pnpm@10.28.1 install --frozen-lockfile } finally { Pop-Location }
 }
 Write-Host 'Setup applied. DEMO_EXECUTION remains disabled.'

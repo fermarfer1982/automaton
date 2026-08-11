@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import unittest
 from pathlib import Path
@@ -138,6 +139,21 @@ class SourceBoundaryTests(unittest.TestCase):
         proposal_source = source.split("class tradeproposal", 1)[1].split("class ordercheckresult", 1)[0]
         for forbidden in ("password", "credential", "api_key", "private_key"):
             self.assertNotIn(forbidden, proposal_source)
+
+    def test_windows_scripts_pin_supported_node_and_pnpm_runtimes(self) -> None:
+        package = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
+        self.assertEqual("^20.18.0 || ^22.0.0", package["engines"]["node"])
+        self.assertIn("corepack pnpm@10.28.1 -r build", package["scripts"]["build"])
+        workspace = (ROOT / "pnpm-workspace.yaml").read_text(encoding="utf-8")
+        self.assertIn("onlyBuiltDependencies:", workspace)
+        self.assertIn("  - better-sqlite3", workspace)
+        self.assertIn("  - esbuild", workspace)
+        for script_name in ("setup.ps1", "test_gateway.ps1"):
+            source = (ROOT / "scripts" / script_name).read_text(encoding="utf-8")
+            self.assertIn("process.versions.node", source)
+            self.assertIn("[version]'20.18.0'", source)
+            self.assertIn("$nodeVersion.Major -eq 22", source)
+            self.assertIn("corepack pnpm@10.28.1", source)
 
 
 if __name__ == "__main__":
