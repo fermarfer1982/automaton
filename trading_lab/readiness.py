@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
+from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .api_auth import ApiKeyVerifier
@@ -58,6 +59,37 @@ def _gateway_get(path: str, api_key: str) -> dict[str, object]:
         if response.status != 200 or not isinstance(payload, dict):
             raise RuntimeError("Gateway response is invalid")
         return payload
+
+
+def _gateway_rejects_unauthenticated(path: str = "/v1/health") -> bool:
+    request = Request(
+        GATEWAY_ORIGIN + path,
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with build_opener(_NoRedirect()).open(request, timeout=5):
+            return False
+    except HTTPError as exc:
+        try:
+            return exc.code == 401
+        finally:
+            exc.close()
+
+
+def _contains_protected_response_key(value: object) -> bool:
+    forbidden = {
+        "login", "server", "password", "credential", "credentials",
+        "api_key", "apikey", "secret", "terminal_path", "mt5_terminal_path",
+    }
+    if isinstance(value, dict):
+        return any(
+            str(key).lower() in forbidden or _contains_protected_response_key(child)
+            for key, child in value.items()
+        )
+    if isinstance(value, list):
+        return any(_contains_protected_response_key(item) for item in value)
+    return False
 
 
 def _fresh_timestamp(value: object) -> bool:
@@ -151,6 +183,8 @@ def run_readiness(config_path: str | Path, *, run_tests: bool = True) -> dict[st
         )
 
         try:
+            if not _gateway_rejects_unauthenticated():
+                raise RuntimeError("Gateway accepted an unauthenticated /v1 request")
             health = _gateway_get("/v1/health", api_key)
             status = _gateway_get("/v1/status", api_key)
             account = _gateway_get("/v1/account", api_key)
@@ -178,7 +212,7 @@ def run_readiness(config_path: str | Path, *, run_tests: bool = True) -> dict[st
                 ReadinessCheck(
                     "gateway_authenticated_http",
                     True,
-                    "all required loopback /v1 routes responded with authentication",
+                    "missing key was rejected and all required authenticated /v1 routes responded",
                 )
             )
         except Exception as exc:
@@ -190,6 +224,12 @@ def run_readiness(config_path: str | Path, *, run_tests: bool = True) -> dict[st
             "gateway_runtime_identity",
             health.get("runtime_identity_verified") is True,
             "gateway process SID was verified before MT5 initialization",
+        ))
+        checks.append(ReadinessCheck(
+            "sanitized_gateway_responses",
+            not _contains_protected_response_key(account)
+            and not _contains_protected_response_key(status),
+            "account/status contain no protected identifiers or secret fields",
         ))
         checks.append(ReadinessCheck(
             "observe_only_gateway",

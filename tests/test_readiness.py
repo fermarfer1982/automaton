@@ -8,7 +8,12 @@ from unittest.mock import patch
 
 from trading_lab.config import RiskLimits, SecurityConfig
 from trading_lab.domain import TradingMode
-from trading_lab.readiness import _fresh_timestamp, _past_timestamp, run_readiness
+from trading_lab.readiness import (
+    _contains_protected_response_key,
+    _fresh_timestamp,
+    _past_timestamp,
+    run_readiness,
+)
 from trading_lab.service import serve
 from trading_lab.windows_acl import AclVerification
 
@@ -40,6 +45,14 @@ class ReadinessAclGateTests(unittest.TestCase):
         self.assertFalse(_fresh_timestamp((datetime.now(UTC) - timedelta(hours=1)).isoformat()))
         self.assertFalse(_fresh_timestamp((datetime.now(UTC) + timedelta(minutes=2)).isoformat()))
         self.assertTrue(_past_timestamp((datetime.now(UTC) - timedelta(days=2)).isoformat()))
+
+    def test_readiness_rejects_sensitive_response_keys_recursively(self) -> None:
+        self.assertFalse(_contains_protected_response_key({
+            "account": {"currency": "EUR"}, "checks": ["SERVER_ALLOWED"],
+        }))
+        self.assertTrue(_contains_protected_response_key({
+            "account": {"login": 12345678},
+        }))
 
     def test_readiness_does_not_touch_mt5_when_acl_is_unsafe(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
