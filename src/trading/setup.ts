@@ -4,6 +4,7 @@ import type { AutomatonConfig, TreasuryPolicy } from "../types.js";
 import { requireCredentialFreeLoopbackOrigin } from "./network.js";
 import { getOrCreateTradingLabIdentity } from "./identity.js";
 import { getCurrentWindowsIdentityProof } from "./windows-identity.js";
+import { readGatewayApiKey } from "./gateway-auth.js";
 
 const ZERO_TREASURY_POLICY: TreasuryPolicy = Object.freeze({
   maxSingleTransferCents: 0,
@@ -28,6 +29,9 @@ purchase, push, register, or change protected security infrastructure.
 `.trim();
 
 export function createTradingLabConfigFromEnvironment(): AutomatonConfig {
+  // Validate only the path and file shape. The key value is never persisted in
+  // Automaton configuration or exposed to the model.
+  readGatewayApiKey();
   const providerValue = (process.env.AUTOMATON_LAB_PROVIDER || "").toLowerCase();
   if (!new Set(["openai", "anthropic", "ollama"]).has(providerValue)) {
     throw new Error("AUTOMATON_LAB_PROVIDER must be openai, anthropic, or ollama");

@@ -24,6 +24,7 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn('"trading_lab"', source)
         self.assertIn('"trading"', source)
         self.assertIn('"trading.security.json"', source)
+        self.assertIn('"trading.example.yaml"', source)
         for protected in ('"index.ts"', '"agent/loop.ts"', '"config.ts"', '"identity/wallet.ts"'):
             self.assertIn(protected, source)
         self.assertIn('"conway/inference.ts"', source)
@@ -70,11 +71,20 @@ class SourceBoundaryTests(unittest.TestCase):
         ):
             self.assertNotRegex(source, re.compile(rf'^\s*"{forbidden}",?\s*$', re.MULTILINE))
         network = (ROOT / "src" / "trading" / "network.ts").read_text(encoding="utf-8")
-        tools = (ROOT / "src" / "trading" / "tools.ts").read_text(encoding="utf-8")
+        client = (ROOT / "src" / "trading" / "gateway-client.ts").read_text(encoding="utf-8")
         self.assertIn('parsed.hostname === "127.0.0.1"', network)
         self.assertNotIn('parsed.hostname === "localhost"', network)
-        self.assertNotIn("process.env.AUTOMATON_MT5_GATEWAY_URL", tools)
-        self.assertIn('redirect: "error"', tools)
+        self.assertNotIn("process.env.AUTOMATON_MT5_GATEWAY_URL", client)
+        self.assertIn('redirect: "error"', client)
+
+    def test_semantic_tool_cannot_supply_volume_magic_account_or_mode(self) -> None:
+        source = (ROOT / "src" / "trading" / "tools.ts").read_text(encoding="utf-8")
+        proposal = source.split('name: "propose_trade"', 1)[1].split('name: "close_position"', 1)[0]
+        for forbidden in ("volume", "magic_number", "authorized_account", "server", "trading_mode"):
+            self.assertNotIn(forbidden, proposal)
+        auth = (ROOT / "src" / "trading" / "gateway-auth.ts").read_text(encoding="utf-8")
+        self.assertIn("AUTOMATON_MT5_API_KEY_FILE", auth)
+        self.assertIn("isSymbolicLink", auth)
 
     def test_mt5_adapter_never_logs_in_or_selects_an_account_or_symbol(self) -> None:
         source = (ROOT / "trading_lab" / "mt5_adapter.py").read_text(encoding="utf-8")

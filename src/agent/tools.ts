@@ -56,9 +56,18 @@ const EXTERNAL_SOURCE_TOOLS = new Set([
   "web_fetch",
   "check_social_inbox",
   "trading_lab_status",
-  "observe_xauusd",
-  "review_trading_evidence",
-  "propose_xauusd_trade",
+  "get_account_state",
+  "get_market_snapshot",
+  "get_candles",
+  "get_positions",
+  "get_trade_history",
+  "get_daily_performance",
+  "propose_trade",
+  "close_position",
+  "modify_position",
+  "cancel_pending",
+  "get_strategy_statistics",
+  "get_recent_trading_memory",
 ]);
 
 // ─── Self-Preservation Guard ───────────────────────────────────

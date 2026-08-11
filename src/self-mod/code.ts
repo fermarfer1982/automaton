@@ -91,6 +91,10 @@ const PROTECTED_FILES: readonly string[] = Object.freeze([
   "agent/policy-rules/index.js",
   // Trading laboratory security configuration examples
   "trading.security.json",
+  "trading.example.yaml",
+  "gateway-auth.ts",
+  "gateway-client.ts",
+  "heartbeat.ts",
   "trading-lab-identity.json",
   "trading-lab-runtime-status.json",
   "scripts/Initialize-TradingLabAcl.ps1",

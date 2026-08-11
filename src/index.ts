@@ -41,6 +41,7 @@ import { requireCredentialFreeLoopbackOrigin } from "./trading/network.js";
 import { loadTradingLabIdentity } from "./trading/identity.js";
 import { getCurrentWindowsIdentityProof } from "./trading/windows-identity.js";
 import { recordTradingLabTurn } from "./trading/status.js";
+import { recordProcessedTradingBar, TradingHeartbeat } from "./trading/heartbeat.js";
 
 const logger = createLogger("main");
 const VERSION = "0.2.1";
@@ -473,13 +474,26 @@ async function run(): Promise<void> {
       })
     : undefined;
 
+  const tradingHeartbeat = runtimeProfile === "trading_lab"
+    ? new TradingHeartbeat(
+        db,
+        (reason) => {
+          logger.info(`[TRADING HEARTBEAT] Wake request: ${reason}`);
+          insertWakeEvent(db.raw, "heartbeat", reason);
+        },
+        (message) => logger.warn(`[TRADING HEARTBEAT] ${message}`),
+      )
+    : undefined;
+
   heartbeat?.start();
+  tradingHeartbeat?.start();
   if (heartbeat) logger.info(`[${new Date().toISOString()}] Heartbeat daemon started.`);
 
   // Handle graceful shutdown
   const shutdown = () => {
     logger.info(`[${new Date().toISOString()}] Shutting down...`);
     heartbeat?.stop();
+    tradingHeartbeat?.stop();
     db.setAgentState("sleeping");
     db.close();
     process.exit(0);
@@ -521,6 +535,7 @@ async function run(): Promise<void> {
         onTurnComplete: (turn) => {
           if (runtimeProfile === "trading_lab") {
             recordTradingLabTurn(turn, config, tradingLabWindowsSid as string);
+            recordProcessedTradingBar(turn, db);
           }
           logger.info(
             `[${new Date().toISOString()}] Turn ${turn.id}: ${turn.toolCalls.length} tools, ${turn.tokenUsage.totalTokens} tokens`,

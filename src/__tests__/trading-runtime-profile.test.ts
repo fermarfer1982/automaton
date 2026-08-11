@@ -24,9 +24,10 @@ describe("trading runtime profile", () => {
 
   it("removes dangerous upstream and installed tools", () => {
     const selected = selectRuntimeTools([
-      tool("observe_xauusd"),
-      tool("propose_xauusd_trade"),
+      tool("get_market_snapshot"),
+      tool("propose_trade"),
       tool("remember_fact"),
+      tool("save_procedure"),
       tool("exec"),
       tool("git_push"),
       tool("transfer_credits"),
@@ -34,9 +35,8 @@ describe("trading runtime profile", () => {
       tool("unknown_installed_tool"),
     ], "trading_lab");
     expect(selected.map((entry) => entry.name)).toEqual([
-      "observe_xauusd",
-      "propose_xauusd_trade",
-      "remember_fact",
+      "get_market_snapshot",
+      "propose_trade",
     ]);
   });
 });

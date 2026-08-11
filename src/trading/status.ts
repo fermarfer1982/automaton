@@ -58,11 +58,11 @@ export function recordTradingLabTurn(
     lastInferenceAt: now,
     lastGatewayHealthAt: successfulTools.has("trading_lab_status")
       ? now : sameRuntime ? previous.lastGatewayHealthAt : undefined,
-    lastMarketObservationAt: successfulTools.has("observe_xauusd")
+    lastMarketObservationAt: successfulTools.has("get_market_snapshot")
       ? now : sameRuntime ? previous.lastMarketObservationAt : undefined,
-    lastResearchReviewAt: successfulTools.has("review_trading_evidence")
+    lastResearchReviewAt: successfulTools.has("get_strategy_statistics")
       ? now : sameRuntime ? previous.lastResearchReviewAt : undefined,
-    lastProposalAt: successfulTools.has("propose_xauusd_trade")
+    lastProposalAt: successfulTools.has("propose_trade")
       ? now : sameRuntime ? previous.lastProposalAt : undefined,
   };
   const temporary = `${STATUS_PATH}.${process.pid}.tmp`;
