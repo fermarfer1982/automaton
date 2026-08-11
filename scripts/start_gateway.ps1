@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string] $Config = 'C:\ProgramData\AutomatonMT5Lab\control\trading.yaml',
-    [string] $PidFile = 'C:\ProgramData\AutomatonMT5Lab\data\gateway.pid'
+    [string] $PidFile = 'C:\ProgramData\AutomatonMT5Lab\operational\gateway.pid'
 )
 $ErrorActionPreference = 'Stop'
 $workspace = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))

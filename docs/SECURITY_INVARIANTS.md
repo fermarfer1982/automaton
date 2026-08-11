@@ -20,11 +20,12 @@ Este perfil es un laboratorio aislado y *fail-closed*. No hereda las capacidades
 14. **S14 — Sin escalado de pérdidas.** SL es obligatorio; grid, martingala, averaging down, ampliar SL y aumentar una posición perdedora están prohibidos.
 15. **S15 — Incertidumbre durable.** Una respuesta perdida tras autorizar el envío produce `EXECUTION_UNCERTAIN`; no hay reintento automático.
 16. **S16 — IPC local autenticado.** La API escucha solo en `127.0.0.1`; todas las rutas `/v1` exigen exactamente una clave IPC externa.
-17. **S17 — Kill switch independiente.** Prevalece sobre aperturas, pero permite únicamente gestión ya validada que reduzca riesgo.
+17. **S17 — Kill switch independiente.** Su existencia bloquea aperturas y solo permite gestión validada reductora; un error o estado ambiguo al comprobarlo bloquea fail-closed.
 18. **S18 — Habilitación humana.** `DEMO_EXECUTION` vincula cuenta, servidor, configuración y readiness completo en `OBSERVE_ONLY`.
 19. **S19 — Privilegio mínimo.** Gateway y Automaton requieren usuarios Windows distintos, no administradores, y ACL verificadas.
 20. **S20 — Evidencia antes de conclusión.** La elegibilidad estadística empieza en 30 observaciones y nunca promociona automáticamente hipótesis.
 21. **S21 — Perfil sin capacidades externas.** Shell, instalaciones, pagos, wallet, replicación, social, orquestación y `git push` quedan fuera del allowlist.
+22. **S22 — ACL por dominio.** No existe un árbol global de datos Gateway con `Modify`; control/IPC son read-only, SQLite se reconoce mutable y journal/security log usan privilegio append propuesto pendiente de validación real post-apply.
 
 ## Pruebas que sostienen el límite
 

@@ -58,6 +58,7 @@ class SecurityConfig:
     api_key_path: Path | None = None
     gateway_lock_path: Path | None = None
     log_dir: Path | None = None
+    security_log_dir: Path | None = None
 
 
 def security_config_hash(config: SecurityConfig) -> str:
@@ -77,6 +78,7 @@ def security_config_hash(config: SecurityConfig) -> str:
         "api_key_path": str(config.api_key_path),
         "gateway_lock_path": str(config.gateway_lock_path),
         "log_dir": str(config.log_dir),
+        "security_log_dir": str(config.security_log_dir),
         "demo_authorization_path": str(config.demo_authorization_path),
         "kill_switch_path": str(config.kill_switch_path),
         "automaton_state_dir": str(config.automaton_state_dir),
@@ -109,7 +111,7 @@ _TOP_LEVEL_KEYS = {
     "automaton_state_dir", "gateway_windows_identity",
     "automaton_windows_identity", "risk",
     "authorized_account_name", "audit_db_path", "api_key_path",
-    "gateway_lock_path", "log_dir",
+    "gateway_lock_path", "log_dir", "security_log_dir",
 }
 _RISK_KEYS = {
     "max_risk_per_trade_fraction", "max_volume", "max_spread_points",
@@ -303,15 +305,20 @@ def load_security_config(path: str | Path) -> SecurityConfig:
     authorization_path = Path(_required_string(raw, "demo_authorization_path"))
     kill_path = Path(_required_string(raw, "kill_switch_path"))
     automaton_state_dir = Path(_required_string(raw, "automaton_state_dir"))
-    audit_db_path = Path(str(raw.get("audit_db_path") or audit_path.parent / "audit.db"))
+    lab_root = kill_path.parent.parent
+    audit_db_path = Path(str(
+        raw.get("audit_db_path") or lab_root / "audit" / "sqlite" / "audit.db"
+    ))
     api_key_path = Path(str(
-        raw.get("api_key_path")
-        or authorization_path.parent.parent / "ipc" / "automaton.key"
+        raw.get("api_key_path") or lab_root / "ipc" / "automaton.key"
     ))
     gateway_lock_path = Path(str(
-        raw.get("gateway_lock_path") or audit_path.parent / "gateway.lock"
+        raw.get("gateway_lock_path") or lab_root / "operational" / "gateway.lock"
     ))
-    log_dir = Path(str(raw.get("log_dir") or audit_path.parent / "logs"))
+    log_dir = Path(str(raw.get("log_dir") or lab_root / "logs" / "gateway"))
+    security_log_dir = Path(str(
+        raw.get("security_log_dir") or lab_root / "logs" / "security"
+    ))
     gateway_identity = _required_string(raw, "gateway_windows_identity")
     automaton_identity = _required_string(raw, "automaton_windows_identity")
     if any("REPLACE_WITH" in value.upper() or value.upper() == "CHANGE_ME" for value in (
@@ -331,44 +338,55 @@ def load_security_config(path: str | Path) -> SecurityConfig:
         "api_key_path": api_key_path,
         "gateway_lock_path": gateway_lock_path,
         "log_dir": log_dir,
+        "security_log_dir": security_log_dir,
     }
     for name, configured_path in named_paths.items():
         if not configured_path.is_absolute():
             raise ConfigError(f"{name} must be an absolute path")
-    operational_paths = (
+    protected_paths = (
         audit_path, research_path, authorization_path, kill_path, automaton_state_dir,
-        audit_db_path, api_key_path, gateway_lock_path,
+        audit_db_path, api_key_path, gateway_lock_path, log_dir, security_log_dir,
     )
-    if len({str(Path(os.path.abspath(item))).casefold() for item in operational_paths}) != len(operational_paths):
-        raise ConfigError("Audit, research, authorization, and kill-switch paths must be distinct")
-    for configured_path in operational_paths:
+    if len({str(Path(os.path.abspath(item))).casefold() for item in protected_paths}) != len(protected_paths):
+        raise ConfigError("Protected control, IPC, data, log, and state paths must be distinct")
+    for configured_path in protected_paths:
         try:
             if Path(os.path.abspath(configured_path)).is_relative_to(workspace):
                 raise ConfigError("Protected operational paths must remain outside the workspace")
         except OSError as exc:
             raise ConfigError(f"Cannot resolve protected operational path: {exc}") from exc
-    if Path(os.path.abspath(audit_path.parent)) != Path(os.path.abspath(research_path.parent)):
-        raise ConfigError("Audit and research database must share the protected data directory")
-    data_directory = Path(os.path.abspath(audit_path.parent))
-    if any(
-        Path(os.path.abspath(item.parent)) != data_directory
-        for item in (audit_db_path, gateway_lock_path)
-    ) or not Path(os.path.abspath(log_dir)).is_relative_to(data_directory):
-        raise ConfigError("Audit DB, gateway lock, and logs must remain in the protected data directory")
-    if Path(os.path.abspath(authorization_path.parent)) != Path(os.path.abspath(kill_path.parent)):
-        raise ConfigError("Authorization and kill switch must share the protected control directory")
-    if Path(os.path.abspath(audit_path.parent)) == Path(os.path.abspath(authorization_path.parent)):
-        raise ConfigError("Writable gateway data and read-only control directories must be distinct")
-    gateway_directories = (
-        config_path.parent, audit_path.parent, authorization_path.parent,
-    )
+    normalized_root = Path(os.path.abspath(lab_root))
+    expected_paths = {
+        "audit_path": normalized_root / "audit" / "journal" / "audit.jsonl",
+        "audit_db_path": normalized_root / "audit" / "sqlite" / "audit.db",
+        "research_db_path": normalized_root / "research" / "research.db",
+        "api_key_path": normalized_root / "ipc" / "automaton.key",
+        "gateway_lock_path": normalized_root / "operational" / "gateway.lock",
+        "log_dir": normalized_root / "logs" / "gateway",
+        "security_log_dir": normalized_root / "logs" / "security",
+        "demo_authorization_path": (
+            normalized_root / "control" / "demo-authorization" / "authorization.json"
+        ),
+        "kill_switch_path": normalized_root / "control" / "STOP_TRADING",
+    }
+    actual_paths = {
+        "audit_path": audit_path,
+        "audit_db_path": audit_db_path,
+        "research_db_path": research_path,
+        "api_key_path": api_key_path,
+        "gateway_lock_path": gateway_lock_path,
+        "log_dir": log_dir,
+        "security_log_dir": security_log_dir,
+        "demo_authorization_path": authorization_path,
+        "kill_switch_path": kill_path,
+    }
+    for name, expected in expected_paths.items():
+        if Path(os.path.abspath(actual_paths[name])) != expected:
+            raise ConfigError(f"{name} must use the separated protected domain: {expected}")
+
+    gateway_directories = (normalized_root,)
     if any(_paths_overlap(automaton_state_dir, item) for item in gateway_directories):
-        raise ConfigError("Automaton state must be separate from gateway control and data")
-    if _paths_overlap(audit_path.parent, authorization_path.parent):
-        raise ConfigError("Gateway control and data directory trees must not overlap")
-    for protected in (audit_path.parent, authorization_path.parent, automaton_state_dir):
-        if _paths_overlap(api_key_path.parent, protected):
-            raise ConfigError("IPC key directory must be separate from control, data, and agent state")
+        raise ConfigError("Automaton state must be separate from every Gateway domain")
 
     return SecurityConfig(
         schema_version=1,
@@ -391,4 +409,5 @@ def load_security_config(path: str | Path) -> SecurityConfig:
         api_key_path=api_key_path,
         gateway_lock_path=gateway_lock_path,
         log_dir=log_dir,
+        security_log_dir=security_log_dir,
     )

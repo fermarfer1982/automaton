@@ -13,8 +13,14 @@ from .config import SecurityConfig
 SYSTEM_SID = "S-1-5-18"
 ADMINISTRATORS_SID = "S-1-5-32-544"
 READ_RIGHTS = 131209
+READ_EXECUTE_RIGHTS = 131241
 MODIFY_RIGHTS = 197055
+FULL_CONTROL_RIGHTS = 2032127
+APPEND_DATA_RIGHT = 4
+EXECUTE_RIGHT = 32
+APPEND_ONLY_RIGHTS = READ_RIGHTS | APPEND_DATA_RIGHT
 WRITE_OR_SECURITY_RIGHTS = 2 | 4 | 16 | 64 | 256 | 65536 | 262144 | 524288
+APPEND_FORBIDDEN_RIGHTS = WRITE_OR_SECURITY_RIGHTS & ~APPEND_DATA_RIGHT
 
 
 @dataclass(frozen=True)
@@ -98,15 +104,33 @@ foreach ($target in $request.targets) {
 
 def _targets(config_path: Path, config: SecurityConfig, include_automaton_state: bool) -> list[dict[str, Any]]:
     workspace = Path(__file__).resolve().parents[1]
+    if any(item is None for item in (
+        config.audit_db_path, config.api_key_path, config.gateway_lock_path,
+        config.log_dir, config.security_log_dir,
+    )):
+        raise ValueError("Separated protected paths are required for ACL verification")
+    lab_root = config.kill_switch_path.parent.parent
     raw: list[tuple[Path, str, bool, bool]] = [
-        (config_path, "gateway_control", False, False),
-        (config_path.parent, "gateway_control", True, True),
-        (config.demo_authorization_path.parent, "gateway_control", True, True),
-        (config.audit_path.parent, "gateway_data", True, True),
+        (lab_root, "shared_navigation", True, True),
+        (config_path.parent, "gateway_navigation", True, True),
+        (config_path, "control_file", False, True),
+        (config.kill_switch_path, "control_file", False, True),
+        (config.demo_authorization_path.parent, "gateway_navigation", True, True),
+        (config.demo_authorization_path, "control_file", False, True),
+        (config.api_key_path.parent, "shared_navigation", True, True),  # type: ignore[union-attr]
+        (config.api_key_path, "ipc_file", False, True),  # type: ignore[arg-type]
+        (config.gateway_lock_path.parent, "gateway_modify", True, True),  # type: ignore[union-attr]
+        (config.research_db_path.parent, "gateway_modify", True, True),
+        (config.audit_path.parent.parent, "gateway_navigation", True, True),
+        (config.audit_db_path.parent, "gateway_modify", True, True),  # type: ignore[union-attr]
+        (config.audit_path.parent, "append_directory", True, True),
+        (config.audit_path, "append_file", False, True),
+        (config.log_dir.parent, "gateway_navigation", True, True),  # type: ignore[union-attr]
+        (config.log_dir, "gateway_modify", True, True),  # type: ignore[arg-type]
+        (config.security_log_dir, "append_directory", True, True),  # type: ignore[arg-type]
+        (config.security_log_dir / "security.log", "append_file", False, True),  # type: ignore[operator]
         (workspace, "workspace_code", True, True),
     ]
-    if config.api_key_path is not None:
-        raw.append((config.api_key_path.parent, "gateway_ipc", True, True))
     for relative in (
         "trading_lab", "src/trading", "src/index.ts", "src/config.ts",
         "src/agent/loop.ts", "src/agent/tools.ts", "src/conway/inference.ts",
@@ -115,27 +139,15 @@ def _targets(config_path: Path, config: SecurityConfig, include_automaton_state:
         "scripts/setup.ps1", "scripts/start_gateway.ps1", "scripts/start_automaton.ps1",
         "scripts/status.ps1", "scripts/stop.ps1", "scripts/test_gateway.ps1",
         "scripts/enable_demo_trading.ps1", "scripts/disable_trading.ps1",
-        "scripts/emergency_stop.ps1", "config/trading.security.example.json",
+        "scripts/emergency_stop.ps1", "scripts/New-TradingLabUsers.ps1",
+        "config/trading.security.example.json",
         "config/trading.example.yaml", "requirements-mt5.txt",
         "requirements-gateway-win-py314.lock",
+        "docs/TRADING_LAB.md", "docs/SECURITY_INVARIANTS.md",
+        "docs/READINESS_AUDIT.md", "docs/WINDOWS_ACL_MODEL.md",
     ):
         item = workspace / relative
         raw.append((item, "workspace_code", item.is_dir(), False))
-    for item, role in (
-        (config.demo_authorization_path, "gateway_control"),
-        (config.kill_switch_path, "gateway_control"),
-        (config.audit_path, "gateway_data"),
-        (config.research_db_path, "gateway_data"),
-    ):
-        if item.exists():
-            raw.append((item, role, item.is_dir(), False))
-    for item in (config.audit_db_path, config.gateway_lock_path):
-        if item is not None and item.exists():
-            raw.append((item, "gateway_data", item.is_dir(), False))
-    if config.log_dir is not None and config.log_dir.exists():
-        raw.append((config.log_dir, "gateway_data", True, True))
-    if config.api_key_path is not None and config.api_key_path.exists():
-        raw.append((config.api_key_path, "gateway_ipc", False, False))
     if include_automaton_state:
         raw.append((config.automaton_state_dir, "automaton_state", True, True))
     deduplicated: dict[tuple[str, str], dict[str, Any]] = {}
@@ -183,7 +195,7 @@ def evaluate_acl_snapshot(
                 raise ValueError(f"ACL target cannot be a reparse point: {path}")
             if target.get("require_protected", target.get("is_directory")) and not target.get("protected"):
                 raise ValueError(f"directory inheritance is not disabled: {path}")
-            if role in {"workspace_code", "gateway_ipc"}:
+            if role in {"workspace_code", "shared_navigation", "ipc_file"}:
                 required_sids = {gateway_sid, automaton_sid}
                 forbidden_sid = None
             else:
@@ -192,10 +204,7 @@ def evaluate_acl_snapshot(
                 forbidden_sid = gateway_sid if role == "automaton_state" else automaton_sid
             allowed_sids = {SYSTEM_SID, ADMINISTRATORS_SID, *required_sids}
             owner_sid = str(target.get("owner_sid", ""))
-            safe_owners = {SYSTEM_SID, ADMINISTRATORS_SID}
-            if role in {"gateway_data", "automaton_state"}:
-                safe_owners.update(required_sids)
-            if owner_sid not in safe_owners:
+            if owner_sid != ADMINISTRATORS_SID:
                 raise ValueError(f"unsafe owner on {path}")
 
             allow_rights = {sid: 0 for sid in required_sids}
@@ -204,6 +213,8 @@ def evaluate_acl_snapshot(
                 sid = str(rule.get("sid", ""))
                 access_type = str(rule.get("type", ""))
                 rights = int(rule.get("rights", 0))
+                if rule.get("inherited"):
+                    raise ValueError(f"inherited ACE remains on protected target {path}")
                 if access_type == "Allow":
                     if sid not in allowed_sids:
                         raise ValueError(f"unexpected allow SID {sid} on {path}")
@@ -211,34 +222,69 @@ def evaluate_acl_snapshot(
                         raise ValueError(f"forbidden identity has access to {path}")
                     if sid in required_sids:
                         allow_rights[sid] |= rights
-                elif access_type == "Deny" and sid in required_sids:
-                    deny_rights[sid] |= rights
+                elif access_type == "Deny":
+                    raise ValueError(f"Deny ACE is forbidden by the explicit allowlist model on {path}")
                 elif access_type not in {"Allow", "Deny"}:
                     raise ValueError(f"unknown ACL rule type on {path}")
 
-            if role == "gateway_control":
+            system_rights = 0
+            administrator_rights = 0
+            for rule in target.get("rules", []):
+                if str(rule.get("type", "")) != "Allow":
+                    continue
+                sid = str(rule.get("sid", ""))
+                if sid == SYSTEM_SID:
+                    system_rights |= int(rule.get("rights", 0))
+                elif sid == ADMINISTRATORS_SID:
+                    administrator_rights |= int(rule.get("rights", 0))
+            if system_rights & FULL_CONTROL_RIGHTS != FULL_CONTROL_RIGHTS:
+                raise ValueError(f"SYSTEM lacks FullControl on {path}")
+            if administrator_rights & FULL_CONTROL_RIGHTS != FULL_CONTROL_RIGHTS:
+                raise ValueError(f"Administrators lack FullControl on {path}")
+
+            if role in {"gateway_navigation", "append_directory"}:
                 rights = allow_rights[gateway_sid]
                 denied = deny_rights[gateway_sid]
-                if rights & READ_RIGHTS != READ_RIGHTS:
-                    raise ValueError(f"gateway lacks read access to control target {path}")
+                if rights & READ_EXECUTE_RIGHTS != READ_EXECUTE_RIGHTS:
+                    raise ValueError(f"gateway lacks directory traversal access to {path}")
                 if rights & WRITE_OR_SECURITY_RIGHTS:
-                    raise ValueError(f"gateway can modify protected control target {path}")
-                if denied & READ_RIGHTS:
+                    raise ValueError(f"gateway can modify read-only directory {path}")
+                if denied & READ_EXECUTE_RIGHTS:
                     raise ValueError(f"gateway read access is denied on {path}")
-            elif role in {"gateway_data", "automaton_state"}:
+            elif role == "control_file":
+                rights = allow_rights[gateway_sid]
+                if rights & READ_RIGHTS != READ_RIGHTS:
+                    raise ValueError(f"gateway lacks read access to control file {path}")
+                if rights & (WRITE_OR_SECURITY_RIGHTS | EXECUTE_RIGHT):
+                    raise ValueError(f"gateway can modify or execute protected control file {path}")
+            elif role in {"gateway_modify", "automaton_state"}:
                 principal = next(iter(required_sids))
                 if allow_rights[principal] & MODIFY_RIGHTS != MODIFY_RIGHTS:
                     raise ValueError(f"required identity lacks modify access to {path}")
                 if deny_rights[principal] & MODIFY_RIGHTS:
                     raise ValueError(f"required modify access is denied on {path}")
-            elif role in {"workspace_code", "gateway_ipc"}:
+            elif role in {"workspace_code", "shared_navigation"}:
                 for principal in required_sids:
-                    if allow_rights[principal] & READ_RIGHTS != READ_RIGHTS:
+                    required = READ_EXECUTE_RIGHTS if target.get("is_directory") else READ_RIGHTS
+                    if allow_rights[principal] & required != required:
                         raise ValueError(f"runtime identity lacks read access to protected target {path}")
                     if allow_rights[principal] & WRITE_OR_SECURITY_RIGHTS:
                         raise ValueError(f"runtime identity can modify protected target {path}")
-                    if deny_rights[principal] & READ_RIGHTS:
+                    if deny_rights[principal] & required:
                         raise ValueError(f"runtime identity read access is denied on {path}")
+            elif role == "ipc_file":
+                for principal in required_sids:
+                    rights = allow_rights[principal]
+                    if rights & READ_RIGHTS != READ_RIGHTS:
+                        raise ValueError(f"runtime identity lacks read access to IPC key {path}")
+                    if rights & (WRITE_OR_SECURITY_RIGHTS | EXECUTE_RIGHT):
+                        raise ValueError(f"runtime identity can modify or execute IPC key {path}")
+            elif role == "append_file":
+                rights = allow_rights[gateway_sid]
+                if rights & APPEND_ONLY_RIGHTS != APPEND_ONLY_RIGHTS:
+                    raise ValueError(f"gateway lacks read/append access to append-only file {path}")
+                if rights & (APPEND_FORBIDDEN_RIGHTS | EXECUTE_RIGHT):
+                    raise ValueError(f"gateway has overwrite/delete/security rights on append-only file {path}")
             else:
                 raise ValueError(f"unknown ACL target role: {role}")
         return AclVerification(

@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string] $KillSwitch = 'C:\ProgramData\AutomatonMT5Lab\control\KILL_SWITCH'
+    [string] $KillSwitch = 'C:\ProgramData\AutomatonMT5Lab\control\STOP_TRADING'
 )
 $ErrorActionPreference = 'Stop'
 $workspace = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..')).TrimEnd('\')
@@ -25,7 +25,7 @@ if (Test-Path -LiteralPath $target) {
         throw 'Kill switch cannot be a reparse point.'
     }
 }
-$temporary = Join-Path $parent ('.KILL_SWITCH.' + [System.Diagnostics.Process]::GetCurrentProcess().Id + '.tmp')
+$temporary = Join-Path $parent ('.STOP_TRADING.' + [System.Diagnostics.Process]::GetCurrentProcess().Id + '.tmp')
 [System.IO.File]::WriteAllText($temporary, "HALT`n", [System.Text.Encoding]::ASCII)
 if (Test-Path -LiteralPath $target) {
     [System.IO.File]::Replace($temporary, $target, $null)

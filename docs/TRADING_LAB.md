@@ -101,13 +101,22 @@ Los scripts resuelven exclusivamente el runtime portable local
 `.runtime\node-v22.22.0-win-x64`, verifican Node v22.22.0 x64 y el SHA-256 del
 ejecutable antes de usar Corepack con pnpm 10.28.1. `.runtime/` no se versiona.
 
-ACLs separadas:
+ACLs separadas (la matriz exacta y sus limitaciones están en
+[WINDOWS_ACL_MODEL.md](WINDOWS_ACL_MODEL.md)):
 
-- `control`: administradores escriben; Gateway solo lee; Agent sin acceso.
-- `ipc`: Gateway y Agent solo leen la key.
-- `data`: solo Gateway modifica auditoría, research, lock y logs.
-- estado Agent: solo Agent modifica.
-- código: Gateway y Agent solo lectura/ejecución.
+- `control`: administradores escriben; Gateway solo lee config, stop y
+  autorización; Agent sin acceso.
+- `ipc`: Gateway y Agent solo leen la key; el fichero no concede execute.
+- `operational`: solo Gateway modifica lock, idempotencia y lifecycle.
+- `research`: solo Gateway/SQLite modifica; Agent usa exclusivamente la API.
+- `audit\sqlite`: Gateway necesita `Modify` para DB/WAL/SHM y no se presenta
+  como inmutable.
+- `audit\journal`: fichero precreado con `Read + AppendData + Synchronize`
+  propuesto; su eficacia NTFS queda pendiente de tests negativos post-apply.
+- `logs\gateway`: rotación UTC con `Modify`; `logs\security\security.log` no
+  rota y usa el mismo patrón append propuesto que el journal.
+- estado Agent: solo Agent modifica; Gateway sin acceso.
+- código: Gateway y Agent solo lectura/ejecución, sin `Authenticated Users:M`.
 
 ## Operación
 
@@ -124,10 +133,11 @@ $env:AUTOMATON_LAB_MODEL = 'MODELO_EXPLICITO'
 
 Comandos disponibles: `status.ps1`, `stop.ps1` (dry-run/`-Apply`),
 `test_gateway.ps1`, `disable_trading.ps1` y `emergency_stop.ps1`. El emergency
-stop no depende de Python, Automaton ni del gateway y activa inmediatamente el
-archivo kill switch externo. Los logs operativos
-`gateway`, `security` y `trading` rotan a medianoche UTC; Agent escribe un JSONL
-por día UTC. Los journals de auditoría no se rotan automáticamente.
+stop no depende de Python, Automaton ni del gateway y activa
+`control\STOP_TRADING`. Un error o ambigüedad al comprobar ese fichero bloquea
+fail-closed. Los logs `gateway` y `trading` rotan a medianoche UTC;
+`security.log` y los journals de auditoría no rotan automáticamente. Agent
+escribe un JSONL por día UTC en su estado privado.
 
 Política de firewall a aplicar manualmente:
 

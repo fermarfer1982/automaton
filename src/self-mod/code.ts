@@ -114,6 +114,7 @@ const PROTECTED_FILES: readonly string[] = Object.freeze([
   "docs/TRADING_LAB.md",
   "docs/SECURITY_INVARIANTS.md",
   "docs/READINESS_AUDIT.md",
+  "docs/WINDOWS_ACL_MODEL.md",
 ]);
 
 /**

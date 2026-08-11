@@ -34,7 +34,17 @@ class FileExecutionAuthorization:
         self._expected_config_hash = expected_config_hash
 
     def evaluate(self) -> AuthorizationDecision:
-        if self._kill_switch_path.exists():
+        try:
+            self._kill_switch_path.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return AuthorizationDecision(
+                False,
+                "KILL_SWITCH_UNREADABLE",
+                "Independent kill switch state cannot be verified",
+            )
+        else:
             return AuthorizationDecision(False, "KILL_SWITCH_ENGAGED", "Independent kill switch is engaged")
         try:
             if self._authorization_path.is_symlink():

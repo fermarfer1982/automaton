@@ -26,7 +26,7 @@ def serve(config_path: str | Path, port: int = 8765) -> None:
     )
     if not acl.passed:
         raise PermissionError(f"Gateway ACL verification failed: {acl.detail}")
-    configure_gateway_logging(config.log_dir)
+    configure_gateway_logging(config.log_dir, config.security_log_dir)
     logger = logging.getLogger("automaton.gateway")
     if config.api_key_path is None or config.gateway_lock_path is None:
         raise RuntimeError("Gateway IPC key or process lock path is missing")

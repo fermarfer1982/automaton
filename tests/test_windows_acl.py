@@ -4,7 +4,10 @@ import unittest
 
 from trading_lab.windows_acl import (
     ADMINISTRATORS_SID,
+    APPEND_ONLY_RIGHTS,
+    FULL_CONTROL_RIGHTS,
     MODIFY_RIGHTS,
+    READ_EXECUTE_RIGHTS,
     READ_RIGHTS,
     SYSTEM_SID,
     evaluate_acl_snapshot,
@@ -19,89 +22,104 @@ def rule(sid: str, rights: int, access_type: str = "Allow") -> dict[str, object]
     return {"sid": sid, "type": access_type, "rights": rights, "inherited": False}
 
 
-def target(path: str, role: str, principal: str, rights: int) -> dict[str, object]:
+def target(
+    path: str, role: str, principal: str, rights: int, *, is_directory: bool = True
+) -> dict[str, object]:
     return {
         "path": path,
         "role": role,
-        "is_directory": True,
+        "is_directory": is_directory,
+        "require_protected": True,
         "exists": True,
         "protected": True,
+        "reparse": False,
         "owner_sid": ADMINISTRATORS_SID,
         "rules": [
-            rule(SYSTEM_SID, 2032127),
-            rule(ADMINISTRATORS_SID, 2032127),
+            rule(SYSTEM_SID, FULL_CONTROL_RIGHTS),
+            rule(ADMINISTRATORS_SID, FULL_CONTROL_RIGHTS),
             rule(principal, rights),
         ],
     }
 
 
+def shared_target(path: str, role: str, rights: int, *, is_directory: bool) -> dict[str, object]:
+    item = target(path, role, GATEWAY, rights, is_directory=is_directory)
+    item["rules"].append(rule(AGENT, rights))  # type: ignore[union-attr]
+    return item
+
+
 def safe_snapshot() -> dict[str, object]:
-    ipc = target("C:/ipc", "gateway_ipc", GATEWAY, READ_RIGHTS)
-    ipc["rules"].append(rule(AGENT, READ_RIGHTS))  # type: ignore[union-attr]
     return {
         "gateway_sid": GATEWAY,
         "automaton_sid": AGENT,
         "current_sid": GATEWAY,
         "administrator_member_sids": [],
         "targets": [
-            target("C:/control", "gateway_control", GATEWAY, READ_RIGHTS),
-            target("C:/data", "gateway_data", GATEWAY, MODIFY_RIGHTS),
+            target("C:/control", "gateway_navigation", GATEWAY, READ_EXECUTE_RIGHTS),
+            target("C:/control/trading.yaml", "control_file", GATEWAY, READ_RIGHTS, is_directory=False),
+            target("C:/operational", "gateway_modify", GATEWAY, MODIFY_RIGHTS),
             target("C:/agent", "automaton_state", AGENT, MODIFY_RIGHTS),
-            ipc,
+            shared_target("C:/ipc", "shared_navigation", READ_EXECUTE_RIGHTS, is_directory=True),
+            shared_target("C:/ipc/automaton.key", "ipc_file", READ_RIGHTS, is_directory=False),
+            target("C:/audit/journal", "append_directory", GATEWAY, READ_EXECUTE_RIGHTS),
+            target("C:/audit/journal/audit.jsonl", "append_file", GATEWAY, APPEND_ONLY_RIGHTS, is_directory=False),
         ],
     }
 
 
-def workspace_target() -> dict[str, object]:
-    item = target("C:/automaton", "workspace_code", GATEWAY, READ_RIGHTS)
-    item["rules"].append(rule(AGENT, READ_RIGHTS))  # type: ignore[union-attr]
-    return item
-
-
 class WindowsAclTests(unittest.TestCase):
-    def test_accepts_strict_control_data_ipc_state_separation(self) -> None:
+    def test_accepts_separated_least_privilege_domains(self) -> None:
         result = evaluate_acl_snapshot(safe_snapshot(), require_current_gateway=True)
         self.assertTrue(result.passed, result.detail)
 
-    def test_rejects_agent_access_to_gateway_data(self) -> None:
+    def test_rejects_agent_access_to_gateway_domain(self) -> None:
         snapshot = safe_snapshot()
-        snapshot["targets"][1]["rules"].append(rule(AGENT, READ_RIGHTS))  # type: ignore[index,union-attr]
+        snapshot["targets"][2]["rules"].append(rule(AGENT, READ_RIGHTS))  # type: ignore[index,union-attr]
         self.assertFalse(evaluate_acl_snapshot(snapshot).passed)
 
-    def test_rejects_gateway_write_access_to_control(self) -> None:
+    def test_rejects_gateway_write_or_execute_access_to_control_file(self) -> None:
+        for unsafe in (MODIFY_RIGHTS, READ_RIGHTS | 32):
+            snapshot = safe_snapshot()
+            snapshot["targets"][1]["rules"][2] = rule(GATEWAY, unsafe)  # type: ignore[index]
+            self.assertFalse(evaluate_acl_snapshot(snapshot).passed)
+
+    def test_rejects_ipc_key_write_delete_or_execute(self) -> None:
+        for unsafe in (MODIFY_RIGHTS, READ_RIGHTS | 32, READ_RIGHTS | 65536):
+            snapshot = safe_snapshot()
+            snapshot["targets"][5]["rules"][2] = rule(GATEWAY, unsafe)  # type: ignore[index]
+            self.assertFalse(evaluate_acl_snapshot(snapshot).passed)
+
+    def test_append_file_allows_append_but_rejects_overwrite_delete_and_modify(self) -> None:
+        self.assertTrue(evaluate_acl_snapshot(safe_snapshot()).passed)
+        for unsafe in (APPEND_ONLY_RIGHTS | 2, APPEND_ONLY_RIGHTS | 65536, MODIFY_RIGHTS):
+            snapshot = safe_snapshot()
+            snapshot["targets"][7]["rules"][2] = rule(GATEWAY, unsafe)  # type: ignore[index]
+            self.assertFalse(evaluate_acl_snapshot(snapshot).passed)
+
+    def test_rejects_deny_inherited_unexpected_and_missing_admin_recovery_aces(self) -> None:
         snapshot = safe_snapshot()
-        snapshot["targets"][0]["rules"][2] = rule(GATEWAY, MODIFY_RIGHTS)  # type: ignore[index]
+        snapshot["targets"][0]["rules"].append(rule(GATEWAY, 1, "Deny"))  # type: ignore[index,union-attr]
+        self.assertFalse(evaluate_acl_snapshot(snapshot).passed)
+        snapshot = safe_snapshot()
+        snapshot["targets"][0]["rules"][2]["inherited"] = True  # type: ignore[index]
+        self.assertFalse(evaluate_acl_snapshot(snapshot).passed)
+        snapshot = safe_snapshot()
+        snapshot["targets"][0]["rules"].append(rule("S-1-5-11", READ_RIGHTS))  # type: ignore[index,union-attr]
+        self.assertFalse(evaluate_acl_snapshot(snapshot).passed)
+        snapshot = safe_snapshot()
+        snapshot["targets"][0]["rules"][0] = rule(SYSTEM_SID, READ_RIGHTS)  # type: ignore[index]
         self.assertFalse(evaluate_acl_snapshot(snapshot).passed)
 
-    def test_rejects_inherited_directory_or_wrong_runtime_identity(self) -> None:
+    def test_requires_administrators_owner_and_dedicated_non_admin_runtime(self) -> None:
         snapshot = safe_snapshot()
-        snapshot["targets"][0]["protected"] = False  # type: ignore[index]
+        snapshot["targets"][0]["owner_sid"] = GATEWAY  # type: ignore[index]
         self.assertFalse(evaluate_acl_snapshot(snapshot).passed)
-        snapshot = safe_snapshot()
-        snapshot["current_sid"] = AGENT
-        self.assertFalse(
-            evaluate_acl_snapshot(snapshot, require_current_gateway=True).passed
-        )
-
-    def test_rejects_administrator_membership_and_gateway_owned_control(self) -> None:
         snapshot = safe_snapshot()
         snapshot["administrator_member_sids"] = [GATEWAY]
         self.assertFalse(evaluate_acl_snapshot(snapshot).passed)
         snapshot = safe_snapshot()
-        snapshot["targets"][0]["owner_sid"] = GATEWAY  # type: ignore[index]
-        self.assertFalse(evaluate_acl_snapshot(snapshot).passed)
-
-    def test_workspace_requires_both_identities_read_only(self) -> None:
-        snapshot = safe_snapshot()
-        snapshot["targets"].append(workspace_target())  # type: ignore[union-attr]
-        self.assertTrue(evaluate_acl_snapshot(snapshot).passed)
-        snapshot["targets"][-1]["rules"][-1] = rule(AGENT, MODIFY_RIGHTS)  # type: ignore[index]
-        self.assertFalse(evaluate_acl_snapshot(snapshot).passed)
-
-    def test_ipc_requires_both_identities_read_only(self) -> None:
-        snapshot = safe_snapshot()
-        snapshot["targets"][3]["rules"][-1] = rule(AGENT, MODIFY_RIGHTS)  # type: ignore[index]
-        self.assertFalse(evaluate_acl_snapshot(snapshot).passed)
+        snapshot["current_sid"] = AGENT
+        self.assertFalse(evaluate_acl_snapshot(snapshot, require_current_gateway=True).passed)
 
 
 if __name__ == "__main__":

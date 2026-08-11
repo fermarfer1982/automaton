@@ -562,6 +562,7 @@ class GatewayApplication:
             security_codes = {
                 "ACCOUNT_NOT_DEMO", "ACCOUNT_LOGIN_MISMATCH", "ACCOUNT_SERVER_MISMATCH",
                 "AUDIT_CHAIN_INVALID", "DEMO_EXECUTION_NOT_AUTHORIZED", "KILL_SWITCH_ENGAGED",
+                "KILL_SWITCH_UNREADABLE",
             }
             execution_codes = {
                 "ORDER_CHECK_FAILED", "ORDER_SEND_FAILED", "PRE_SEND_GUARD_REJECTED",

@@ -153,6 +153,7 @@ def run_readiness(config_path: str | Path, *, run_tests: bool = True) -> dict[st
             ("api_key_outside_workspace", config.api_key_path),
             ("gateway_lock_outside_workspace", config.gateway_lock_path),
             ("logs_outside_workspace", config.log_dir),
+            ("security_logs_outside_workspace", config.security_log_dir),
             ("authorization_outside_workspace", config.demo_authorization_path),
             ("kill_switch_outside_workspace", config.kill_switch_path),
         ):

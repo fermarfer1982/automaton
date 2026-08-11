@@ -78,7 +78,13 @@ class MT5Gateway:
         return {
             "trading_enabled": decision.allowed,
             "kill_switch": (
-                "ENGAGED" if decision.code == "KILL_SWITCH_ENGAGED" else "CLEAR"
+                (
+                    "ENGAGED"
+                    if decision.code == "KILL_SWITCH_ENGAGED"
+                    else "CLEAR"
+                    if decision.allowed or decision.code == "DEMO_EXECUTION_NOT_AUTHORIZED"
+                    else "UNKNOWN_FAIL_CLOSED"
+                )
             ),
         }
 

@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from trading_lab.authorization import FileExecutionAuthorization
 
@@ -45,6 +46,13 @@ class BoundExecutionAuthorizationTests(unittest.TestCase):
             ).evaluate()
             self.assertFalse(decision.allowed)
             self.assertEqual("KILL_SWITCH_ENGAGED", decision.code)
+
+    def test_kill_switch_permission_or_state_error_fails_closed(self) -> None:
+        verifier = FileExecutionAuthorization("authorization.json", "STOP_TRADING")
+        with mock.patch.object(Path, "lstat", side_effect=PermissionError("denied")):
+            decision = verifier.evaluate()
+        self.assertFalse(decision.allowed)
+        self.assertEqual("KILL_SWITCH_UNREADABLE", decision.code)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -10,6 +11,12 @@ from trading_lab.audit import HashChainAuditLog
 
 
 class AuditLogTests(unittest.TestCase):
+    def test_writer_uses_append_mode_without_truncate_replace_or_delete(self) -> None:
+        source = inspect.getsource(HashChainAuditLog.append)
+        self.assertIn('self.path.open("a"', source)
+        for forbidden in ("write_text(", ".replace(", ".unlink(", 'open("w"'):
+            self.assertNotIn(forbidden, source)
+
     def test_serializes_dataclasses_as_structured_payloads(self) -> None:
         @dataclass(frozen=True)
         class Example:

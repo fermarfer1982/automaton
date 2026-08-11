@@ -35,6 +35,7 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn('"scripts/Resolve-TradingLabNode.ps1"', source)
         self.assertIn('"docs/SECURITY_INVARIANTS.md"', source)
         self.assertIn('"docs/READINESS_AUDIT.md"', source)
+        self.assertIn('"docs/WINDOWS_ACL_MODEL.md"', source)
         self.assertIn('"requirements-gateway-win-py314.lock"', source)
         invariants = (ROOT / "docs" / "SECURITY_INVARIANTS.md").read_text(encoding="utf-8")
         for invariant in range(1, 13):
@@ -202,13 +203,31 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn("acl_proposals", source)
         self.assertIn("inherited_aces_preserved = $false", source)
         self.assertIn("deny_aces = 0", source)
-        self.assertIn("'KILL_SWITCH'", source)
-        self.assertIn("'audit.db'", source)
-        self.assertIn("'research.db'", source)
+        self.assertIn("'STOP_TRADING'", source)
+        self.assertIn("'demo-authorization'", source)
+        self.assertIn("'operational'", source)
+        self.assertIn("'research'", source)
+        self.assertIn("'sqlite'", source)
+        self.assertIn("'journal'", source)
+        self.assertIn("'Read,AppendData,Synchronize'", source)
+        self.assertIn("sqlite_immutable = $false", source)
+        self.assertIn("$protectedSourceDirectories", source)
+        self.assertIn("Protected source tree contains a reparse point", source)
+        self.assertNotIn("gateway_writable_data", source)
         dry_run_exit = source.index("if (-not $Apply)")
         self.assertLess(dry_run_exit, source.index("New-Item -ItemType Directory"))
         self.assertLess(dry_run_exit, source.index("WriteAllText"))
         self.assertLess(dry_run_exit, source.index("Set-Acl -LiteralPath"))
+
+    def test_agent_trading_integration_has_no_direct_programdata_or_mt5_access(self) -> None:
+        sources = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (ROOT / "src" / "trading").glob("*.ts")
+        )
+        self.assertNotIn("ProgramData", sources)
+        self.assertNotIn("AutomatonMT5Lab", sources)
+        self.assertNotIn("MetaTrader5", sources)
+        self.assertNotIn("DEMO_EXECUTION", (ROOT / "src" / "self-mod" / "code.ts").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

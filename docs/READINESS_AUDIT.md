@@ -26,7 +26,7 @@ identidades dedicadas y con `TRADING_MODE=OBSERVE_ONLY`.
 | Scripts, ACL, kill switch independiente y enable DEMO humano | `scripts/*.ps1`, `operator.py`, tests ACL/operator | AST/tests locales; aplicación real pendiente |
 
 La `.venv` local se instaló con `--require-hashes` y el lock CPython 3.14 x64.
-La suite `pytest` ejecuta 126 tests y 6 subtests: todos pasan. TypeScript
+La suite `pytest` ejecuta 131 tests y 11 subtests: todos pasan. TypeScript
 typecheck y build pasan; Vitest ejecuta 69 ficheros y 1.656 tests: todos pasan,
 incluidos los 5 ficheros/12 tests específicos de trading.
 
@@ -39,12 +39,16 @@ scripts nativos de `better-sqlite3` y `esbuild` se completaron correctamente.
 
 ## Evidencia todavía ausente por gates humanos
 
-1. Creación manual de dos usuarios Windows distintos y no administradores, sin
-   compartir contraseñas con el proyecto o el agente. La inspección confirmó
-   que `AutomatonAgent` y `AutomatonGateway` todavía no existen; el script
-   `New-TradingLabUsers.ps1` está preparado para que el humano introduzca ambas
-   contraseñas como `SecureString` en una consola elevada.
-2. Aplicación humana de ACL después de revisar el dry-run de SIDs y rutas.
+1. Los usuarios locales `AutomatonAgent` y `AutomatonGateway` ya existen,
+   están habilitados, son distintos, no administradores y pertenecen solo a
+   `BUILTIN\Users`. Sus contraseñas no se almacenaron en el proyecto.
+2. Aplicación humana del modelo endurecido de
+   `WINDOWS_ACL_MODEL.md` después de revisar el dry-run. Mientras tanto,
+   `Authenticated Users: Modify` heredado en `C:\automaton` sigue siendo una
+   exposición y prohíbe arrancar procesos bajo las identidades dedicadas.
+   El dry-run endurecido con los SID locales resolvió 20 targets, confirmó
+   pertenencia exclusiva a `BUILTIN\Users`, no propuso Deny y no cambió SDDL,
+   timestamps, existencia de directorios ni el worktree.
 3. Configuración protegida del login DEMO, servidor/nombre exactos, ruta del
    terminal y límites revisados; no contiene contraseña.
 4. Selección explícita del proveedor/modelo y claves solo en el entorno Agent.

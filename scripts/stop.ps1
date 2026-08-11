@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string[]] $PidFiles = @('C:\ProgramData\AutomatonMT5Lab\data\gateway.pid'),
+    [string[]] $PidFiles = @('C:\ProgramData\AutomatonMT5Lab\operational\gateway.pid'),
     [switch] $Apply
 )
 $ErrorActionPreference = 'Stop'

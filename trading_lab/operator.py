@@ -25,7 +25,9 @@ def verify_gateway_role(config_path: Path) -> None:
     result = verify_windows_acl(
         config_path,
         config,
-        include_automaton_state=True,
+        # The Gateway deliberately has no access to Agent state.  Full cross-domain
+        # verification is performed only by the elevated human readiness command.
+        include_automaton_state=False,
         require_current_gateway=True,
     )
     if not result.passed:

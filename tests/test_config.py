@@ -19,10 +19,15 @@ class SecurityConfigTests(unittest.TestCase):
             "allowed_symbol": "XAUUSD",
             "magic_number": 26081101,
             "mt5_terminal_path": "C:\\Program Files\\MetaTrader 5\\terminal64.exe",
-            "audit_path": "C:\\ProgramData\\AutomatonMT5Lab\\data\\audit.jsonl",
-            "research_db_path": "C:\\ProgramData\\AutomatonMT5Lab\\data\\research.db",
-            "demo_authorization_path": "C:\\ProgramData\\AutomatonMT5Lab\\control\\demo.authorization",
-            "kill_switch_path": "C:\\ProgramData\\AutomatonMT5Lab\\control\\KILL_SWITCH",
+            "audit_path": "C:\\ProgramData\\AutomatonMT5Lab\\audit\\journal\\audit.jsonl",
+            "audit_db_path": "C:\\ProgramData\\AutomatonMT5Lab\\audit\\sqlite\\audit.db",
+            "research_db_path": "C:\\ProgramData\\AutomatonMT5Lab\\research\\research.db",
+            "api_key_path": "C:\\ProgramData\\AutomatonMT5Lab\\ipc\\automaton.key",
+            "gateway_lock_path": "C:\\ProgramData\\AutomatonMT5Lab\\operational\\gateway.lock",
+            "log_dir": "C:\\ProgramData\\AutomatonMT5Lab\\logs\\gateway",
+            "security_log_dir": "C:\\ProgramData\\AutomatonMT5Lab\\logs\\security",
+            "demo_authorization_path": "C:\\ProgramData\\AutomatonMT5Lab\\control\\demo-authorization\\authorization.json",
+            "kill_switch_path": "C:\\ProgramData\\AutomatonMT5Lab\\control\\STOP_TRADING",
             "automaton_state_dir": "C:\\Users\\AutomatonLabAgent\\.automaton",
             "gateway_windows_identity": "LAB\\Gateway",
             "automaton_windows_identity": "LAB\\Agent",
@@ -85,10 +90,23 @@ class SecurityConfigTests(unittest.TestCase):
                 load_security_config(self.write(directory, payload))
         with tempfile.TemporaryDirectory() as directory:
             payload = self.valid_config()
-            payload["audit_path"] = "C:\\ProgramData\\AutomatonMT5Lab\\control\\audit.jsonl"
-            payload["research_db_path"] = "C:\\ProgramData\\AutomatonMT5Lab\\control\\research.db"
+            payload["audit_path"] = "C:\\ProgramData\\AutomatonMT5Lab\\data\\audit.jsonl"
             with self.assertRaises(ConfigError):
                 load_security_config(self.write(directory, payload))
+
+    def test_requires_separate_sqlite_research_operational_and_log_domains(self) -> None:
+        for field, invalid in (
+            ("audit_db_path", "C:\\ProgramData\\AutomatonMT5Lab\\data\\audit.db"),
+            ("research_db_path", "C:\\ProgramData\\AutomatonMT5Lab\\data\\research.db"),
+            ("gateway_lock_path", "C:\\ProgramData\\AutomatonMT5Lab\\data\\gateway.lock"),
+            ("log_dir", "C:\\ProgramData\\AutomatonMT5Lab\\data\\logs"),
+            ("security_log_dir", "C:\\ProgramData\\AutomatonMT5Lab\\logs\\gateway"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                payload = self.valid_config()
+                payload[field] = invalid
+                with self.assertRaises(ConfigError):
+                    load_security_config(self.write(directory, payload))
     def test_rejects_protected_paths_inside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             payload = self.valid_config()

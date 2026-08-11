@@ -18,6 +18,9 @@ $plan = [pscustomobject]@{
     captures_passwords = $false
 }
 $plan | ConvertTo-Json
+if ($Apply -and -not (Test-Path -LiteralPath $Config -PathType Leaf)) {
+    throw 'Copy and human-review trading.yaml in the protected control directory before ACL application.'
+}
 & (Join-Path $PSScriptRoot 'Initialize-TradingLabAcl.ps1') `
     -GatewayIdentity $GatewayIdentity `
     -AutomatonIdentity $AutomatonIdentity `
@@ -25,9 +28,6 @@ $plan | ConvertTo-Json
     -WorkspaceRoot $workspace `
     -Apply:$Apply
 if (-not $Apply) { exit 0 }
-if (-not (Test-Path -LiteralPath $Config -PathType Leaf)) {
-    throw 'Copy and human-review trading.yaml in the protected control directory first.'
-}
 if ($InstallDependencies) {
     $nodeRuntime = & (Join-Path $PSScriptRoot 'Resolve-TradingLabNode.ps1')
     $pythonRuntime = (& python -c "import platform,sys; print(f'{sys.version_info.major}.{sys.version_info.minor}|{platform.architecture()[0]}')").Trim()
