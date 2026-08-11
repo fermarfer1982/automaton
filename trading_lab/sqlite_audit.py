@@ -62,7 +62,7 @@ def _projections_for(event: str, payload: dict[str, Any]) -> tuple[str, ...]:
     if (
         "guard" in event
         or ("risk" in event and "decision" in event)
-        or event == "execution_authorization_decision"
+        or "authorization_decision" in event
     ):
         tables.append("audit_gates")
     if "order_check" in event or "order_send" in event or "pre_send_guard" in event:

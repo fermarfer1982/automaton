@@ -20,11 +20,15 @@ from tests.test_risk_engine import proposal
 
 
 class PositionManagementTests(unittest.TestCase):
-    def build(self, directory: Path, mode: TradingMode):
+    def build(self, directory: Path, mode: TradingMode, *, authorize: bool = True):
         adapter = FakeMT5Adapter()
         audit = HashChainAuditLog(directory / "audit.jsonl")
         store = ResearchStore(directory / "research.db")
         paper = PaperEngine(store, audit)
+        if mode is TradingMode.DEMO_EXECUTION and authorize:
+            (directory / "demo.authorization").write_text(
+                "ALLOW_DEMO_EXECUTION\n", encoding="utf-8"
+            )
         gateway = MT5Gateway(
             mode=mode,
             adapter=adapter,
@@ -110,6 +114,27 @@ class PositionManagementTests(unittest.TestCase):
             )
             self.assertEqual("EXECUTED", result["status"])
 
+    def test_demo_management_requires_authorization_but_kill_allows_risk_reduction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            gateway, adapter, _, _ = self.build(
+                root, TradingMode.DEMO_EXECUTION, authorize=False
+            )
+            adapter.open_positions = [self.owned_position()]
+            rejected = gateway.manage_position("CLOSE", {"ticket": 77, "reason": "exit"})
+            self.assertEqual("REJECTED_SECURITY", rejected["status"])
+            self.assertIn("DEMO_EXECUTION_NOT_AUTHORIZED", rejected["failed_codes"])
+            self.assertNotIn("order_check", adapter.calls)
+
+            (root / "KILL_SWITCH").write_text("HALT\n", encoding="ascii")
+            adapter.calls.clear()
+            allowed = gateway.manage_position("CLOSE", {"ticket": 77, "reason": "exit"})
+            self.assertEqual("EXECUTED", allowed["status"])
+            self.assertIn("KILL_SWITCH_RISK_REDUCTION_ALLOWED", [
+                item["code"] for item in allowed["checks"]
+            ])
+            self.assertIn("order_send", adapter.calls)
+
     def test_uncertain_management_is_durably_blocked_from_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             gateway, adapter, _, _ = self.build(Path(temporary), TradingMode.DEMO_EXECUTION)
@@ -127,6 +152,22 @@ class PositionManagementTests(unittest.TestCase):
             self.assertEqual("EXECUTION_UNCERTAIN", second["status"])
             self.assertIn("EXECUTION_RECONCILIATION_REQUIRED", second["failed_codes"])
             self.assertEqual(1, adapter.calls.count("order_send"))
+
+    def test_management_authorization_is_rechecked_after_order_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            gateway, adapter, _, _ = self.build(root, TradingMode.DEMO_EXECUTION)
+            adapter.open_positions = [self.owned_position()]
+
+            def revoke_after_check(request):
+                adapter.calls.append("order_check")
+                (root / "demo.authorization").unlink()
+                return adapter.order_check_result
+
+            adapter.order_check = revoke_after_check  # type: ignore[method-assign]
+            result = gateway.manage_position("CLOSE", {"ticket": 77, "reason": "exit"})
+            self.assertEqual("REJECTED", result["status"])
+            self.assertNotIn("order_send", adapter.calls)
 
 
 if __name__ == "__main__":

@@ -263,7 +263,22 @@ class MT5Gateway:
                 stop_loss=float(payload["stop_loss"]) if action == "MODIFY" else None,
                 take_profit=payload.get("take_profit"),
             )
-        return GuardDecision(account_decision.checks + risk.checks)
+        authorization = self._execution_authorization.evaluate()
+        risk_reduction_allowed = authorization.allowed or authorization.code == "KILL_SWITCH_ENGAGED"
+        authorization_check = CheckResult(
+            (
+                "KILL_SWITCH_RISK_REDUCTION_ALLOWED"
+                if authorization.code == "KILL_SWITCH_ENGAGED"
+                else authorization.code
+            ),
+            risk_reduction_allowed,
+            (
+                "Kill switch permits only this independently validated risk reduction"
+                if authorization.code == "KILL_SWITCH_ENGAGED"
+                else authorization.detail
+            ),
+        )
+        return GuardDecision(account_decision.checks + risk.checks + (authorization_check,))
 
     def _manage_demo(
         self,
@@ -338,6 +353,32 @@ class MT5Gateway:
             return self._management_response(
                 operation_id=operation_id, action=action, mode=self._mode,
                 status="REJECTED", checks=checks,
+            )
+        authorization = self._execution_authorization.evaluate()
+        risk_reduction_allowed = authorization.allowed or authorization.code == "KILL_SWITCH_ENGAGED"
+        authorization_check = CheckResult(
+            (
+                "KILL_SWITCH_RISK_REDUCTION_ALLOWED"
+                if authorization.code == "KILL_SWITCH_ENGAGED"
+                else authorization.code
+            ),
+            risk_reduction_allowed,
+            (
+                "Kill switch permits only this independently validated risk reduction"
+                if authorization.code == "KILL_SWITCH_ENGAGED"
+                else authorization.detail
+            ),
+        )
+        checks = checks + (authorization_check,)
+        self._audit.append("position_management_authorization_decision", {
+            "stage": RiskStage.PRE_EXECUTION_CHECK.value,
+            "operation_id": operation_id,
+            "check": authorization_check,
+        })
+        if not risk_reduction_allowed:
+            return self._management_response(
+                operation_id=operation_id, action=action, mode=self._mode,
+                status="REJECTED_SECURITY", checks=checks,
             )
         execution = self._execution_engine.execute_management(
             request,
