@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 from .domain import CheckResult, GuardDecision, PositionSnapshot, Side, SymbolSnapshot
 
@@ -8,9 +9,17 @@ from .domain import CheckResult, GuardDecision, PositionSnapshot, Side, SymbolSn
 class PositionManagementRiskEngine:
     """Pure rules for full exits and risk-reducing protective-order changes."""
 
-    def __init__(self, allowed_symbol: str, required_magic_number: int) -> None:
+    def __init__(
+        self,
+        allowed_symbol: str,
+        required_magic_number: int,
+        max_spread_points: float,
+        max_tick_age_seconds: float,
+    ) -> None:
         self._allowed_symbol = allowed_symbol
         self._required_magic_number = required_magic_number
+        self._max_spread_points = max_spread_points
+        self._max_tick_age_seconds = max_tick_age_seconds
 
     def evaluate_position(
         self,
@@ -47,6 +56,18 @@ class PositionManagementRiskEngine:
             and market.ask >= market.bid
         )
         add("MARKET_DATA_INVALID", valid_market, "Fresh visible open-market data is required")
+        tick_age_msc = int(time.time() * 1000) - market.tick_time_msc
+        add(
+            "MARKET_TICK_STALE",
+            -2_000 <= tick_age_msc <= int(self._max_tick_age_seconds * 1000),
+            "Latest MT5 tick is stale or implausibly in the future",
+        )
+        spread_points = (market.ask - market.bid) / market.point if valid_market else math.inf
+        add(
+            "SPREAD_TOO_WIDE",
+            valid_market and spread_points <= self._max_spread_points,
+            "Current spread exceeds the deterministic management limit",
+        )
         if action == "CLOSE":
             return GuardDecision(tuple(checks))
         if action != "MODIFY":

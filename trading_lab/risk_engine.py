@@ -44,6 +44,14 @@ class RiskEngine:
     def cooldown_seconds(self) -> int:
         return self._limits.cooldown_seconds
 
+    @property
+    def max_spread_points(self) -> float:
+        return self._limits.max_spread_points
+
+    @property
+    def max_tick_age_seconds(self) -> float:
+        return self._limits.max_tick_age_seconds
+
     @staticmethod
     def fingerprint(proposal: TradeProposal) -> str:
         material = {

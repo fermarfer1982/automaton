@@ -65,6 +65,8 @@ class MT5Gateway:
         self._management_risk = PositionManagementRiskEngine(
             risk_engine.allowed_symbol,
             risk_engine.required_magic_number,
+            risk_engine.max_spread_points,
+            risk_engine.max_tick_age_seconds,
         )
         # Serializing the whole decision prevents duplicate races and interleaved MT5 calls.
         self._submit_lock = threading.Lock()

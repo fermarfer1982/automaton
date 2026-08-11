@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from time import time
 
 from trading_lab.account_guard import AccountGuard
 from trading_lab.audit import HashChainAuditLog
@@ -168,6 +169,27 @@ class PositionManagementTests(unittest.TestCase):
             result = gateway.manage_position("CLOSE", {"ticket": 77, "reason": "exit"})
             self.assertEqual("REJECTED", result["status"])
             self.assertNotIn("order_send", adapter.calls)
+
+    def test_demo_close_rechecks_tick_and_spread_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            gateway, adapter, _, _ = self.build(
+                Path(temporary), TradingMode.DEMO_EXECUTION
+            )
+            adapter.open_positions = [self.owned_position()]
+            adapter.symbol = replace(
+                adapter.symbol, tick_time_msc=int((time() - 10) * 1000)
+            )
+            stale = gateway.manage_position("CLOSE", {"ticket": 77, "reason": "exit"})
+            self.assertIn("MARKET_TICK_STALE", stale["failed_codes"])
+            self.assertNotIn("order_check", adapter.calls)
+
+            adapter.calls.clear()
+            adapter.symbol = replace(
+                adapter.symbol, ask=2401.0, tick_time_msc=int(time() * 1000)
+            )
+            wide = gateway.manage_position("CLOSE", {"ticket": 77, "reason": "exit"})
+            self.assertIn("SPREAD_TOO_WIDE", wide["failed_codes"])
+            self.assertNotIn("order_check", adapter.calls)
 
 
 if __name__ == "__main__":
