@@ -12,7 +12,7 @@ from trading_lab.config import load_security_config, security_config_hash
 from trading_lab.domain import TradingMode
 from trading_lab.operator import enable_demo
 from trading_lab.windows_acl import AclVerification
-from tests.test_config import SecurityConfigTests
+from tests import test_config as config_test_helpers
 
 
 class HumanOperatorTests(unittest.TestCase):
@@ -34,7 +34,7 @@ class HumanOperatorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source_path = root / "security.json"
-            original = SecurityConfigTests().valid_config()
+            original = config_test_helpers.SecurityConfigTests().valid_config()
             source_path.write_text(json.dumps(original), encoding="utf-8")
             config = load_security_config(source_path)
             config_path = root / "security.yaml"
@@ -78,8 +78,8 @@ class HumanOperatorTests(unittest.TestCase):
 
     def test_config_hash_changes_with_protected_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = SecurityConfigTests().write(
-                directory, SecurityConfigTests().valid_config()
+            path = config_test_helpers.SecurityConfigTests().write(
+                directory, config_test_helpers.SecurityConfigTests().valid_config()
             )
             observe = load_security_config(path)
             demo = replace(observe, trading_mode=TradingMode.DEMO_EXECUTION)
