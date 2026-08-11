@@ -6,6 +6,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $workspace = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $python = Join-Path $workspace '.venv\Scripts\python.exe'
+if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'Reviewed .venv is absent.' }
+$pnpmVersion = (& pnpm --version).Trim()
+if ($pnpmVersion -ne '10.28.1') { throw "Reviewed pnpm 10.28.1 is required; found $pnpmVersion." }
 Push-Location $workspace
 try {
     & $python -m pytest -q

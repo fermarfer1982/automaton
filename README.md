@@ -152,6 +152,58 @@ scripts/
   conways-rules.txt # Core rules for the automaton
 ```
 
+## MT5 DEMO Research Lab (Windows)
+
+The `trading_lab` runtime is a separate, fail-closed profile for autonomous
+XAUUSD research on one explicitly authorized MetaTrader 5 DEMO account. Its
+fixed boundary is:
+
+```text
+Automaton -> authenticated localhost tools -> FastAPI gateway -> Account Guard
+          -> deterministic Risk Engine -> Execution Engine -> MT5
+```
+
+Requirements are a disposable Windows VM, a visible x64 MT5 terminal already
+logged into the intended DEMO account, CPython 3.14 x64, Node 20+, and pnpm
+10.28.1. Create two distinct non-administrator Windows users manually: one for
+the visible terminal/gateway and one for Automaton. Never provide their
+passwords to Automaton or commit them.
+
+Installation and preparation are deliberately human-gated:
+
+1. Review [the security invariants](docs/SECURITY_INVARIANTS.md).
+2. Copy [the YAML example](config/trading.example.yaml) to the protected
+   `C:\ProgramData\AutomatonMT5Lab\control\trading.yaml` path and replace only
+   the explicit DEMO login, exact server/name, terminal path, identities, and
+   reviewed risk limits. Do not add a password.
+3. Run `scripts\setup.ps1` without `-Apply` to inspect resolved SIDs and paths.
+   Applying ACLs or `-InstallDependencies` requires separate human approval.
+4. Start the visible MT5 terminal and `scripts\start_gateway.ps1` as the Gateway
+   user. The gateway binds only `127.0.0.1:8765`; every `/v1` route requires the
+   external `X-AUTOMATON-KEY` secret.
+5. Select an explicit inference provider/model in the Agent user's environment,
+   then run `scripts\start_automaton.ps1` as that user.
+6. Use `scripts\test_gateway.ps1` for authenticated health, read-only MT5 smoke
+   checks, Python/Node tests, and the digest-bound readiness report.
+
+`OBSERVE_ONLY` is the default and milestone mode. `PAPER` uses durable virtual
+positions. `DEMO_EXECUTION` is implemented but must not be enabled before a
+complete `AUTOMATON_MT5_LAB_READY=true` report and a later, separate human
+decision. The enable script is dry-run unless `-Apply` is deliberately supplied.
+
+Use `scripts\status.ps1` for readiness, `scripts\stop.ps1` for exact PID-based
+shutdown, `scripts\disable_trading.ps1` for a controlled return to
+`OBSERVE_ONLY`, and `scripts\emergency_stop.ps1` for the dependency-independent
+kill switch. Operational logs are under the protected data/state directories;
+audit journals are never automatically rotated. If startup fails, keep trading
+disabled and inspect ACL verification, exact account/server, terminal visibility,
+API-key permissions, dependency versions, tick freshness, audit integrity, and
+the relevant UTC log. Firewall guidance, full installation, MT5 preparation,
+API examples, modes, logging and troubleshooting are in
+[the complete Windows guide](docs/TRADING_LAB.md).
+El estado de evidencia y los gates pendientes se mantienen en
+[la auditoría de readiness](docs/READINESS_AUDIT.md).
+
 ## License
 
 MIT

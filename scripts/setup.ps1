@@ -29,6 +29,10 @@ if (-not (Test-Path -LiteralPath $Config -PathType Leaf)) {
     throw 'Copy and human-review trading.yaml in the protected control directory first.'
 }
 if ($InstallDependencies) {
+    $pythonRuntime = (& python -c "import platform,sys; print(f'{sys.version_info.major}.{sys.version_info.minor}|{platform.architecture()[0]}')").Trim()
+    if ($pythonRuntime -ne '3.14|64bit') {
+        throw "Reviewed CPython 3.14 x64 is required; found $pythonRuntime."
+    }
     $pnpmVersion = (& pnpm --version).Trim()
     if ($pnpmVersion -ne '10.28.1') {
         throw "Reviewed pnpm 10.28.1 is required; found $pnpmVersion."

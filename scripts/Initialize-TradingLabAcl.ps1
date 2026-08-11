@@ -211,7 +211,9 @@ foreach ($relativeFile in @(
     'scripts\enable_demo_trading.ps1', 'scripts\disable_trading.ps1',
     'scripts\emergency_stop.ps1',
     'config\trading.security.example.json', 'config\trading.example.yaml',
-    'requirements-mt5.txt', 'requirements-gateway-win-py314.lock'
+    'requirements-mt5.txt', 'requirements-gateway-win-py314.lock',
+    'requirements-gateway.in', 'docs\TRADING_LAB.md',
+    'docs\SECURITY_INVARIANTS.md', 'docs\READINESS_AUDIT.md'
 )) {
     $protectedFile = Join-Path $workspace $relativeFile
     if (-not (Test-Path -LiteralPath $protectedFile -PathType Leaf)) {

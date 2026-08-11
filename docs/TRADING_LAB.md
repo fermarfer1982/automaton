@@ -115,7 +115,8 @@ $env:AUTOMATON_LAB_MODEL = 'MODELO_EXPLICITO'
 
 Comandos disponibles: `status.ps1`, `stop.ps1` (dry-run/`-Apply`),
 `test_gateway.ps1`, `disable_trading.ps1` y `emergency_stop.ps1`. El emergency
-stop activa inmediatamente el archivo kill switch externo. Los logs operativos
+stop no depende de Python, Automaton ni del gateway y activa inmediatamente el
+archivo kill switch externo. Los logs operativos
 `gateway`, `security` y `trading` rotan a medianoche UTC; Agent escribe un JSONL
 por día UTC. Los journals de auditoría no se rotan automáticamente.
 

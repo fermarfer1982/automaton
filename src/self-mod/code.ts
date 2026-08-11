@@ -111,6 +111,7 @@ const PROTECTED_FILES: readonly string[] = Object.freeze([
   "requirements-gateway.in",
   "docs/TRADING_LAB.md",
   "docs/SECURITY_INVARIANTS.md",
+  "docs/READINESS_AUDIT.md",
 ]);
 
 /**

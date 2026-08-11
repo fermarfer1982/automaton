@@ -31,7 +31,11 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn('"conway/inference.ts"', source)
         self.assertIn('"scripts/Initialize-TradingLabAcl.ps1"', source)
         self.assertIn('"docs/SECURITY_INVARIANTS.md"', source)
+        self.assertIn('"docs/READINESS_AUDIT.md"', source)
         self.assertIn('"requirements-gateway-win-py314.lock"', source)
+        invariants = (ROOT / "docs" / "SECURITY_INVARIANTS.md").read_text(encoding="utf-8")
+        for invariant in range(1, 13):
+            self.assertIn(f"S{invariant} —", invariants)
 
     def test_windows_local_identity_uses_native_home_not_root_fallback(self) -> None:
         wallet = (ROOT / "src" / "identity" / "wallet.ts").read_text(encoding="utf-8")
