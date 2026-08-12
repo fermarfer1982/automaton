@@ -125,13 +125,27 @@ points. Un canario confirma escritura y borrado. El directorio del RunId se
 elimina al terminar; un fallo de limpieza queda registrado y hace fallar el
 reporte. No se usa ni se modifica `C:\Windows\TEMP`.
 
+El Gateway ejecuta los probes Python mediante `ProcessStartInfo`, con stdout y
+stderr redirigidos por separado. Esto evita que Windows PowerShell 5.1 convierta
+stderr nativo en un `RemoteException` sin contexto. Antes de SQLite valida la
+ruta fijada de `python.exe`, ejecución del intérprete, `import sqlite3` y el
+TEMP privado. El canario SQLite registra por separado DB, modo WAL, WAL, SHM,
+commit, lectura, checkpoint, close y cleanup; nunca usa `audit.db` real.
+
+Los fallos se clasifican como `TEST_FAILED_EXPECTATION`,
+`TEST_INFRASTRUCTURE_ERROR` o `CRITICAL_UNEXPECTED_ALLOW`. Una excepción añade
+un bloque saneado con etapa, test, tipo/mensaje, `FullyQualifiedErrorId`, línea,
+invocación, stack y último test completado. Las rutas de perfiles ajenos y los
+patrones con aspecto de secreto se redactan; ninguna key o credencial se
+incluye en el reporte.
+
 Los canarios mutables se limitan al estado privado del Agent y a los dominios
 `operational`, `research` y `audit\sqlite` del Gateway. El journal y el log de
 seguridad reciben un único append identificable y durable; esos eventos no se
 eliminan. Las comprobaciones de overwrite, truncate, delete, rename, replace y
 change-ACL sobre ficheros protegidos abren un handle solicitando el derecho
 NTFS correspondiente, pero nunca ejecutan la mutación si el derecho resulta
-inesperadamente concedido. Esa situación produce `CRITICAL_FAIL` y detiene el
+inesperadamente concedido. Esa situación produce `CRITICAL_UNEXPECTED_ALLOW` y detiene el
 test Gateway.
 
 `Collect-RuntimeAclResults.ps1` debe ejecutarse después desde una consola

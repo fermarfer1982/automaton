@@ -226,6 +226,26 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertLess(dry_run_exit, source.index("Initialize-TradingLabBootstrapState"))
         self.assertLess(dry_run_exit, source.index("Set-Acl -LiteralPath"))
 
+    def test_runtime_acl_python_probes_compile_and_preserve_diagnostics(self) -> None:
+        gateway = (ROOT / "scripts" / "Test-GatewayRuntimeAcl.ps1").read_text(encoding="utf-8")
+        collector = (ROOT / "scripts" / "Collect-RuntimeAclResults.ps1").read_text(encoding="utf-8")
+        pattern = re.compile(r"\$(?:\w+Source|source)\s*=\s*@'\n(.*?)\n'@", re.DOTALL)
+        gateway_blocks = pattern.findall(gateway)
+        collector_blocks = pattern.findall(collector)
+        self.assertEqual(6, len(gateway_blocks))
+        self.assertEqual(1, len(collector_blocks))
+        for index, block in enumerate([*gateway_blocks, *collector_blocks], start=1):
+            compile(block, f"<runtime-acl-inline-{index}>", "exec")
+        self.assertNotIn("2>&1", gateway)
+        self.assertIn("[System.Diagnostics.ProcessStartInfo]::new()", gateway)
+        self.assertIn("New-FailureDiagnostic $_", gateway)
+        for classification in (
+            "TEST_FAILED_EXPECTATION",
+            "TEST_INFRASTRUCTURE_ERROR",
+            "CRITICAL_UNEXPECTED_ALLOW",
+        ):
+            self.assertIn(classification, gateway)
+
     def test_agent_trading_integration_has_no_direct_programdata_or_mt5_access(self) -> None:
         sources = "\n".join(
             path.read_text(encoding="utf-8")

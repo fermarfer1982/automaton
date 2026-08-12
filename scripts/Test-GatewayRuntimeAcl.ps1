@@ -27,6 +27,7 @@ $runtimeTempPath = Join-Path $runtimeTempBase $normalizedRunId
 $runtimeTempCleanupAttempted = $false
 $runtimeTempCleanupSucceeded = $false
 $scriptExitCode = 0
+$nativeProbeLoadError = $null
 
 function Get-CanonicalDirectoryPath([string] $Path) {
     return [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
@@ -127,6 +128,7 @@ try {
 # Add-Type is retained to request exact NTFS rights without performing a
 # destructive mutation; standard File APIs cannot request WRITE_DAC or DELETE_CHILD.
 if (-not ('Automaton.RuntimeAcl.GatewayNativeMethods' -as [type])) {
+try {
     Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -147,6 +149,9 @@ namespace Automaton.RuntimeAcl {
     }
 }
 '@
+} catch {
+    $nativeProbeLoadError = $_
+}
 }
 
 $FILE_LIST_DIRECTORY = [uint32]1
@@ -180,6 +185,56 @@ $journalEvidence = $null
 $securityLogEvidence = $null
 $criticalFail = $false
 $runtimeError = $null
+$failureClassification = $null
+$diagnostic = $null
+$currentStage = 'HARNESS_SETUP'
+$currentTestName = 'RUNTIME_TEMP_PRIVATE'
+$lastCompletedTest = $null
+$infrastructureFailure = $false
+
+function ConvertTo-SafeDiagnosticText([object] $Value, [int] $MaximumLength = 2048) {
+    if ($null -eq $Value) { return $null }
+    $safe = [string]$Value
+    $safe = [regex]::Replace(
+        $safe,
+        '(?i)(password|passwd|credential|api[_-]?key|private[_-]?key|secret|token)\s*[:=]\s*[^\s,;]+',
+        '$1=[REDACTED]'
+    )
+    $safe = [regex]::Replace($safe, '(?i)C:\\Users\\[^\\\r\n]+', 'C:\Users\[REDACTED_PROFILE]')
+    $safe = [regex]::Replace($safe, '(?<![0-9A-Fa-f-])[A-Za-z0-9_-]{48,}(?![0-9A-Fa-f-])', '[REDACTED_TOKEN]')
+    if ($safe.Length -gt $MaximumLength) {
+        $safe = $safe.Substring(0, $MaximumLength) + '...[TRUNCATED]'
+    }
+    return $safe
+}
+
+function Set-TestContext([string] $Stage, [string] $TestName) {
+    $script:currentStage = $Stage
+    $script:currentTestName = $TestName
+}
+
+function New-FailureDiagnostic([System.Management.Automation.ErrorRecord] $ErrorRecord) {
+    $invocationInfo = $ErrorRecord.InvocationInfo
+    $scriptLine = if ($null -ne $invocationInfo) { [int]$invocationInfo.ScriptLineNumber } else { 0 }
+    $invocation = if ($null -ne $invocationInfo -and $invocationInfo.Line) {
+        $invocationInfo.Line.Trim()
+    } elseif ($null -ne $invocationInfo -and $invocationInfo.InvocationName) {
+        $invocationInfo.InvocationName
+    } else {
+        $null
+    }
+    return [ordered]@{
+        stage = $script:currentStage
+        test_name = $script:currentTestName
+        exception_type = $ErrorRecord.Exception.GetType().FullName
+        exception_message = ConvertTo-SafeDiagnosticText $ErrorRecord.Exception.Message
+        FullyQualifiedErrorId = ConvertTo-SafeDiagnosticText $ErrorRecord.FullyQualifiedErrorId
+        script_line = $scriptLine
+        invocation = ConvertTo-SafeDiagnosticText $invocation
+        stack_trace = ConvertTo-SafeDiagnosticText $ErrorRecord.ScriptStackTrace 4096
+        last_completed_test = $script:lastCompletedTest
+    }
+}
 
 function Add-TestResult(
     [string] $Name,
@@ -192,6 +247,10 @@ function Add-TestResult(
         observed = $Observed
         passed = ($Expected -eq $Observed)
         evidence = $Evidence
+    }
+    $script:lastCompletedTest = $Name
+    if ($Observed -eq 'ERROR') {
+        $script:infrastructureFailure = $true
     }
 }
 
@@ -223,6 +282,7 @@ function Add-DeniedRightTest(
     [bool] $Directory,
     [bool] $Critical
 ) {
+    Set-TestContext 'NTFS_ACCESS_PROBE' $Name
     $probe = Invoke-NativeAccessProbe $Path $Right $Directory
     if ($probe.Allowed) {
         Add-TestResult $Name 'DENY' 'ALLOW' 'PROTECTED_RIGHT_GRANTED_NO_MUTATION_PERFORMED'
@@ -234,6 +294,7 @@ function Add-DeniedRightTest(
         Add-TestResult $Name 'DENY' 'DENY' 'WIN32_ACCESS_DENIED'
     } else {
         Add-TestResult $Name 'DENY' 'ERROR' "WIN32_ERROR_$($probe.ErrorCode)"
+        throw "UNEXPECTED_WIN32_ACCESS_PROBE_ERROR:${Name}:$($probe.ErrorCode)"
     }
 }
 
@@ -242,6 +303,7 @@ function Add-AllowedFileReadTest(
     [string] $Path,
     [bool] $RequireNonEmpty
 ) {
+    Set-TestContext 'FILE_READ_PROBE' $Name
     $stream = $null
     try {
         $stream = [System.IO.File]::Open(
@@ -260,12 +322,14 @@ function Add-AllowedFileReadTest(
         Add-TestResult $Name 'ALLOW' 'DENY' 'WIN32_ACCESS_DENIED'
     } catch {
         Add-TestResult $Name 'ALLOW' 'ERROR' $_.Exception.GetType().Name
+        throw
     } finally {
         if ($null -ne $stream) { $stream.Dispose() }
     }
 }
 
 function Add-DeniedCanaryCreateTest([string] $Name, [string] $Path) {
+    Set-TestContext 'CANARY_CREATE_PROBE' $Name
     $stream = $null
     $created = $false
     try {
@@ -281,6 +345,7 @@ function Add-DeniedCanaryCreateTest([string] $Name, [string] $Path) {
         Add-TestResult $Name 'DENY' 'DENY' 'WIN32_ACCESS_DENIED'
     } catch {
         Add-TestResult $Name 'DENY' 'ERROR' $_.Exception.GetType().Name
+        throw
     } finally {
         if ($null -ne $stream) { $stream.Dispose() }
         if ($created) {
@@ -290,6 +355,7 @@ function Add-DeniedCanaryCreateTest([string] $Name, [string] $Path) {
 }
 
 function Add-MutableDirectoryCanaryTest([string] $Name, [string] $Directory) {
+    Set-TestContext 'MUTABLE_DIRECTORY_CANARY' $Name
     $first = Join-Path $Directory "acl-runtime-$normalizedRunId.canary"
     $renamed = Join-Path $Directory "acl-runtime-$normalizedRunId.renamed.canary"
     $expected = "AUTOMATON_GATEWAY_RUNTIME_ACL_CANARY:$normalizedRunId"
@@ -306,6 +372,7 @@ function Add-MutableDirectoryCanaryTest([string] $Name, [string] $Directory) {
         Add-TestResult $Name 'ALLOW' 'DENY' 'WIN32_ACCESS_DENIED'
     } catch {
         Add-TestResult $Name 'ALLOW' 'ERROR' $_.Exception.GetType().Name
+        throw
     } finally {
         foreach ($candidate in @($first, $renamed)) {
             try { if ([System.IO.File]::Exists($candidate)) { [System.IO.File]::Delete($candidate) } } catch {}
@@ -313,85 +380,326 @@ function Add-MutableDirectoryCanaryTest([string] $Name, [string] $Directory) {
     }
 }
 
-function Invoke-LocalPythonJson([string] $Source, [string[]] $Arguments) {
-    if (-not [System.IO.File]::Exists($pythonExe)) {
-        return [pscustomobject]@{ Success = $false; Evidence = 'PINNED_LOCAL_PYTHON_NOT_FOUND'; Value = $null }
-    }
-    $output = @(& $pythonExe -I -c $Source @Arguments 2>&1)
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0 -or $output.Count -eq 0) {
-        return [pscustomobject]@{ Success = $false; Evidence = "PYTHON_EXIT_$exitCode"; Value = $null }
-    }
+function Invoke-LocalPythonJson(
+    [string] $Source,
+    [hashtable] $Environment,
+    [string] $ProbeName
+) {
+    $safeProbeName = $ProbeName -replace '[^A-Za-z0-9_-]', '_'
+    $sourcePath = Join-Path $runtimeTempPath "$safeProbeName-$([guid]::NewGuid().ToString('N')).py"
+    $process = $null
     try {
-        $value = ($output[-1] | ConvertFrom-Json)
-        return [pscustomobject]@{ Success = $true; Evidence = 'LOCAL_PYTHON_COMPLETED'; Value = $value }
-    } catch {
-        return [pscustomobject]@{ Success = $false; Evidence = 'PYTHON_OUTPUT_INVALID'; Value = $null }
+        $sourceStream = [System.IO.File]::Open(
+            $sourcePath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::Read
+        )
+        try {
+            $writer = [System.IO.StreamWriter]::new(
+                $sourceStream, [System.Text.UTF8Encoding]::new($false)
+            )
+            try { $writer.Write($Source); $writer.Flush() } finally { $writer.Dispose() }
+        } finally {
+            $sourceStream.Dispose()
+        }
+
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $pythonExe
+        $startInfo.Arguments = '-I "' + $sourcePath + '"'
+        $startInfo.WorkingDirectory = $runtimeTempPath
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.EnvironmentVariables['TEMP'] = $runtimeTempPath
+        $startInfo.EnvironmentVariables['TMP'] = $runtimeTempPath
+        foreach ($key in $Environment.Keys) {
+            $startInfo.EnvironmentVariables[[string]$key] = [string]$Environment[$key]
+        }
+        $process = [System.Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) {
+            throw 'PYTHON_PROCESS_START_RETURNED_FALSE'
+        }
+        $standardOutput = $process.StandardOutput.ReadToEnd()
+        $standardError = $process.StandardError.ReadToEnd()
+        $process.WaitForExit()
+        $exitCode = $process.ExitCode
+        $safeStandardError = ConvertTo-SafeDiagnosticText $standardError
+        if ($exitCode -ne 0) {
+            return [pscustomobject]@{
+                Success = $false
+                Evidence = "PYTHON_EXIT_$exitCode"
+                ExitCode = $exitCode
+                StandardError = $safeStandardError
+                Value = $null
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($standardError)) {
+            return [pscustomobject]@{
+                Success = $false
+                Evidence = 'PYTHON_UNEXPECTED_STDERR'
+                ExitCode = 0
+                StandardError = $safeStandardError
+                Value = $null
+            }
+        }
+        try {
+            $value = $standardOutput.Trim() | ConvertFrom-Json
+            return [pscustomobject]@{
+                Success = $true
+                Evidence = 'LOCAL_PYTHON_COMPLETED'
+                ExitCode = 0
+                StandardError = $safeStandardError
+                Value = $value
+            }
+        } catch {
+            return [pscustomobject]@{
+                Success = $false
+                Evidence = 'PYTHON_OUTPUT_INVALID'
+                ExitCode = 0
+                StandardError = $safeStandardError
+                Value = $null
+            }
+        }
+    } finally {
+        if ($null -ne $process) { $process.Dispose() }
+        try { if ([System.IO.File]::Exists($sourcePath)) { [System.IO.File]::Delete($sourcePath) } } catch {}
+    }
+}
+
+function Assert-PythonInvocation(
+    [string] $TestName,
+    [object] $Invocation,
+    [string] $SuccessEvidence
+) {
+    Set-TestContext $script:currentStage $TestName
+    if ($Invocation.Success) {
+        Add-TestResult $TestName 'ALLOW' 'ALLOW' $SuccessEvidence
+        return $Invocation.Value
+    }
+    $failureEvidence = $Invocation.Evidence
+    if ($Invocation.StandardError) {
+        $failureEvidence += ':' + $Invocation.StandardError
+    }
+    Add-TestResult $TestName 'ALLOW' 'ERROR' (ConvertTo-SafeDiagnosticText $failureEvidence)
+    throw "${TestName}_FAILED:$failureEvidence"
+}
+
+function Add-PythonRuntimePreflightTests {
+    Set-TestContext 'PYTHON_PREFLIGHT' 'PYTHON_EXECUTABLE_PATH'
+    $expectedPythonPath = 'C:\automaton\.venv\Scripts\python.exe'
+    $actualPythonPath = [System.IO.Path]::GetFullPath($pythonExe)
+    if ($actualPythonPath -ne $expectedPythonPath -or -not [System.IO.File]::Exists($actualPythonPath)) {
+        Add-TestResult 'PYTHON_EXECUTABLE_PATH' 'ALLOW' 'ERROR' 'PINNED_LOCAL_PYTHON_NOT_FOUND_OR_CHANGED'
+        throw 'PYTHON_EXECUTABLE_PATH_INVALID'
+    }
+    $pythonItem = Get-Item -LiteralPath $actualPythonPath -Force
+    if ($pythonItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        Add-TestResult 'PYTHON_EXECUTABLE_PATH' 'ALLOW' 'ERROR' 'PYTHON_EXECUTABLE_IS_REPARSE_POINT'
+        throw 'PYTHON_EXECUTABLE_REPARSE_POINT'
+    }
+    Add-TestResult 'PYTHON_EXECUTABLE_PATH' 'ALLOW' 'ALLOW' $expectedPythonPath
+
+    Set-TestContext 'PYTHON_PREFLIGHT' 'PYTHON_EXECUTE'
+    $executeSource = @'
+import json
+import sys
+print(json.dumps({"executable": sys.executable, "ok": True}, sort_keys=True, separators=(",", ":")))
+'@
+    $execute = Invoke-LocalPythonJson $executeSource @{} 'python-execute'
+    $executeValue = Assert-PythonInvocation 'PYTHON_EXECUTE' $execute 'PINNED_INTERPRETER_EXECUTED'
+    Set-TestContext 'PYTHON_PREFLIGHT' 'PYTHON_EXECUTABLE_IDENTITY'
+    if (-not $executeValue.ok -or $executeValue.executable -ne $expectedPythonPath) {
+        Add-TestResult 'PYTHON_EXECUTABLE_IDENTITY' $expectedPythonPath 'MISMATCH' 'PYTHON_REPORTED_UNEXPECTED_EXECUTABLE'
+        throw 'PYTHON_EXECUTABLE_IDENTITY_MISMATCH'
+    }
+    Add-TestResult 'PYTHON_EXECUTABLE_IDENTITY' $expectedPythonPath $expectedPythonPath 'PYTHON_REPORTED_PINNED_EXECUTABLE'
+
+    Set-TestContext 'PYTHON_PREFLIGHT' 'PYTHON_SQLITE_IMPORT'
+    $importSource = @'
+import json
+import sqlite3
+print(json.dumps({"imported": True, "sqlite_version": sqlite3.sqlite_version}, sort_keys=True, separators=(",", ":")))
+'@
+    $import = Invoke-LocalPythonJson $importSource @{} 'python-sqlite-import'
+    $importValue = Assert-PythonInvocation 'PYTHON_SQLITE_IMPORT' $import 'SQLITE3_IMPORT_SUCCEEDED'
+    if (-not $importValue.imported) { throw 'PYTHON_SQLITE_IMPORT_RESULT_INVALID' }
+
+    Set-TestContext 'PYTHON_PREFLIGHT' 'PYTHON_RUNTIME_TEMP'
+    $tempSource = @'
+import json
+import os
+import pathlib
+import tempfile
+
+expected = pathlib.Path(os.environ["AUTOMATON_RUNTIME_TEST_TEMP"]).resolve()
+observed = pathlib.Path(tempfile.gettempdir()).resolve()
+canary = expected / "python-temp-write.canary"
+if canary.exists():
+    raise RuntimeError("TEMP_CANARY_ALREADY_EXISTS")
+try:
+    with canary.open("x", encoding="utf-8") as handle:
+        handle.write("runtime-temp")
+    read_back = canary.read_text(encoding="utf-8") == "runtime-temp"
+finally:
+    if canary.exists():
+        canary.unlink()
+print(json.dumps({"confined": observed == expected, "read_back": read_back, "cleanup": not canary.exists()}, sort_keys=True, separators=(",", ":")))
+'@
+    $temp = Invoke-LocalPythonJson $tempSource @{
+        AUTOMATON_RUNTIME_TEST_TEMP = $runtimeTempPath
+    } 'python-runtime-temp'
+    $tempValue = Assert-PythonInvocation 'PYTHON_RUNTIME_TEMP' $temp 'PYTHON_PRIVATE_TEMP_PROBE_COMPLETED'
+    Set-TestContext 'PYTHON_PREFLIGHT' 'PYTHON_RUNTIME_TEMP_CONFINED'
+    if ($tempValue.confined -and $tempValue.read_back -and $tempValue.cleanup) {
+        Add-TestResult 'PYTHON_RUNTIME_TEMP_CONFINED' 'ALLOW' 'ALLOW' 'TEMP_CREATE_READ_DELETE_SUCCEEDED'
+    } else {
+        Add-TestResult 'PYTHON_RUNTIME_TEMP_CONFINED' 'ALLOW' 'ERROR' 'PYTHON_TEMP_NOT_CONFINED_OR_CLEAN'
+        throw 'PYTHON_RUNTIME_TEMP_NOT_CONFINED_OR_CLEAN'
     }
 }
 
 function Add-SqliteWalCanaryTest {
+    Set-TestContext 'SQLITE_WAL_CANARY' 'SQLITE_DB_CREATE'
     $databasePath = Join-Path $auditSqlitePath "runtime-acl-$normalizedRunId.db"
     $source = @'
 import json
+import os
 import pathlib
 import sqlite3
-import sys
 
-path = pathlib.Path(sys.argv[1])
+path = pathlib.Path(os.environ["AUTOMATON_RUNTIME_TEST_DB"])
 artifacts = [path, pathlib.Path(str(path) + "-wal"), pathlib.Path(str(path) + "-shm")]
-if any(item.exists() for item in artifacts):
-    raise RuntimeError("CANARY_ALREADY_EXISTS")
+result = {
+    "db_create": False,
+    "wal_mode": False,
+    "wal_create": False,
+    "shm_create": False,
+    "commit": False,
+    "read_back": False,
+    "checkpoint": False,
+    "close": False,
+    "cleanup": False,
+    "failure_stage": None,
+    "error_type": None,
+    "error_message": None,
+    "errno": None,
+    "winerror": None,
+}
 connection = None
 try:
+    if any(item.exists() for item in artifacts):
+        raise RuntimeError("CANARY_ALREADY_EXISTS")
+    result["failure_stage"] = "DB_CREATE"
     connection = sqlite3.connect(path)
+    result["db_create"] = path.is_file()
+    result["failure_stage"] = "WAL_MODE"
     mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+    result["wal_mode"] = mode.lower() == "wal"
     connection.execute("CREATE TABLE canary (value TEXT NOT NULL)")
     connection.execute("INSERT INTO canary(value) VALUES (?)", ("runtime-acl",))
+    result["failure_stage"] = "COMMIT"
     connection.commit()
-    wal_seen = pathlib.Path(str(path) + "-wal").is_file()
-    shm_seen = pathlib.Path(str(path) + "-shm").is_file()
-    value = connection.execute("SELECT value FROM canary").fetchone()[0]
-    result = {"mode": mode, "wal_seen": wal_seen, "shm_seen": shm_seen, "read_back": value == "runtime-acl"}
+    result["commit"] = True
+    result["wal_create"] = pathlib.Path(str(path) + "-wal").is_file()
+    result["shm_create"] = pathlib.Path(str(path) + "-shm").is_file()
+    result["failure_stage"] = "READ_BACK"
+    result["read_back"] = connection.execute("SELECT value FROM canary").fetchone()[0] == "runtime-acl"
+    result["failure_stage"] = "CHECKPOINT"
+    checkpoint = connection.execute("PRAGMA wal_checkpoint(FULL)").fetchone()
+    result["checkpoint"] = checkpoint is not None and len(checkpoint) == 3
+    result["failure_stage"] = None
+except Exception as exc:
+    result["error_type"] = type(exc).__name__
+    result["error_message"] = str(exc)[:512]
+    result["errno"] = getattr(exc, "errno", None)
+    result["winerror"] = getattr(exc, "winerror", None)
 finally:
     if connection is not None:
-        connection.close()
+        try:
+            connection.close()
+            result["close"] = True
+        except Exception as exc:
+            if result["error_type"] is None:
+                result["failure_stage"] = "CLOSE"
+                result["error_type"] = type(exc).__name__
+                result["error_message"] = str(exc)[:512]
+                result["errno"] = getattr(exc, "errno", None)
+                result["winerror"] = getattr(exc, "winerror", None)
     cleanup = True
     for item in artifacts:
         try:
             if item.exists():
                 item.unlink()
-        except OSError:
+        except OSError as exc:
             cleanup = False
-if not cleanup:
-    raise RuntimeError("CANARY_CLEANUP_FAILED")
-result["cleanup"] = True
+            if result["error_type"] is None:
+                result["failure_stage"] = "CLEANUP"
+                result["error_type"] = type(exc).__name__
+                result["error_message"] = str(exc)[:512]
+                result["errno"] = getattr(exc, "errno", None)
+                result["winerror"] = getattr(exc, "winerror", None)
+    result["cleanup"] = cleanup and not any(item.exists() for item in artifacts)
 print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 '@
-    $invocation = Invoke-LocalPythonJson $source @($databasePath)
-    if (-not $invocation.Success) {
-        Add-TestResult 'SQLITE_WAL' 'ALLOW' 'ERROR' $invocation.Evidence
-        return
+    $invocation = Invoke-LocalPythonJson $source @{
+        AUTOMATON_RUNTIME_TEST_DB = $databasePath
+    } 'sqlite-wal-canary'
+    $value = Assert-PythonInvocation 'SQLITE_PROCESS' $invocation 'SQLITE_CANARY_PROCESS_COMPLETED'
+    $checks = [ordered]@{
+        SQLITE_DB_CREATE = [bool]$value.db_create
+        SQLITE_WAL_MODE = [bool]$value.wal_mode
+        SQLITE_WAL_CREATE = [bool]$value.wal_create
+        SQLITE_SHM_CREATE = [bool]$value.shm_create
+        SQLITE_COMMIT = [bool]$value.commit
+        SQLITE_READ_BACK = [bool]$value.read_back
+        SQLITE_CHECKPOINT = [bool]$value.checkpoint
+        SQLITE_CLOSE = [bool]$value.close
+        SQLITE_CLEANUP = [bool]$value.cleanup
     }
-    $value = $invocation.Value
-    if ($value.mode -eq 'wal' -and $value.wal_seen -and $value.shm_seen -and $value.read_back -and $value.cleanup) {
-        Add-TestResult 'SQLITE_WAL' 'ALLOW' 'ALLOW' 'DB_WAL_SHM_COMMIT_READ_CLEANUP_SUCCEEDED'
-    } else {
-        Add-TestResult 'SQLITE_WAL' 'ALLOW' 'ERROR' 'SQLITE_WAL_INCOMPLETE'
+    foreach ($entry in $checks.GetEnumerator()) {
+        Set-TestContext 'SQLITE_WAL_CANARY' $entry.Key
+        Add-TestResult `
+            $entry.Key 'ALLOW' `
+            $(if ($entry.Value) { 'ALLOW' } else { 'MISSING' }) `
+            $(if ($entry.Value) { 'SQLITE_STAGE_SUCCEEDED' } else { 'SQLITE_STAGE_INCOMPLETE' })
     }
+    if ($value.error_type) {
+        $failureTestName = switch ([string]$value.failure_stage) {
+            'DB_CREATE' { 'SQLITE_DB_CREATE' }
+            'WAL_MODE' { 'SQLITE_WAL_MODE' }
+            'COMMIT' { 'SQLITE_COMMIT' }
+            'READ_BACK' { 'SQLITE_READ_BACK' }
+            'CHECKPOINT' { 'SQLITE_CHECKPOINT' }
+            'CLOSE' { 'SQLITE_CLOSE' }
+            'CLEANUP' { 'SQLITE_CLEANUP' }
+            default { 'SQLITE_WAL' }
+        }
+        Set-TestContext 'SQLITE_WAL_CANARY' $failureTestName
+        $sqliteError = "stage=$($value.failure_stage);type=$($value.error_type);message=$($value.error_message);errno=$($value.errno);winerror=$($value.winerror)"
+        Add-TestResult 'SQLITE_WAL' 'ALLOW' 'ERROR' (ConvertTo-SafeDiagnosticText $sqliteError)
+        throw "SQLITE_CANARY_INFRASTRUCTURE_ERROR:$sqliteError"
+    }
+    $sqlitePassed = -not @($checks.Values | Where-Object { -not $_ }).Count
+    Add-TestResult `
+        'SQLITE_WAL' 'ALLOW' `
+        $(if ($sqlitePassed) { 'ALLOW' } else { 'MISSING' }) `
+        $(if ($sqlitePassed) { 'DB_WAL_SHM_COMMIT_CHECKPOINT_CLOSE_CLEANUP_SUCCEEDED' } else { 'SQLITE_EXPECTATION_INCOMPLETE' })
 }
 
 function Add-AuditJournalAppendTest {
+    Set-TestContext 'AUDIT_JOURNAL' 'JOURNAL_APPEND'
     $source = @'
 import datetime
 import hashlib
 import json
 import os
 import pathlib
-import sys
 
-path = pathlib.Path(sys.argv[1])
-run_id = sys.argv[2]
+path = pathlib.Path(os.environ["AUTOMATON_RUNTIME_TEST_JOURNAL"])
+run_id = os.environ["AUTOMATON_RUNTIME_TEST_RUN_ID"]
 before = path.read_bytes()
 previous_hash = "0" * 64
 records = 0
@@ -437,27 +745,26 @@ result = {
 }
 print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 '@
-    $invocation = Invoke-LocalPythonJson $source @($auditJournalPath, $normalizedRunId)
-    if ($invocation.Success) {
-        $script:journalEvidence = $invocation.Value
-        Add-TestResult 'JOURNAL_APPEND' 'ALLOW' 'ALLOW' 'CPYTHON_APPEND_FLUSH_FSYNC_SUCCEEDED'
-    } else {
-        Add-TestResult 'JOURNAL_APPEND' 'ALLOW' 'ERROR' $invocation.Evidence
-    }
+    $invocation = Invoke-LocalPythonJson $source @{
+        AUTOMATON_RUNTIME_TEST_JOURNAL = $auditJournalPath
+        AUTOMATON_RUNTIME_TEST_RUN_ID = $normalizedRunId
+    } 'audit-journal-append'
+    $script:journalEvidence = Assert-PythonInvocation `
+        'JOURNAL_APPEND' $invocation 'CPYTHON_APPEND_FLUSH_FSYNC_SUCCEEDED'
 }
 
 function Add-SecurityLogAppendTest {
+    Set-TestContext 'SECURITY_LOG' 'SECURITY_APPEND'
     $source = @'
 import hashlib
 import json
 import logging
 import os
 import pathlib
-import sys
 import time
 
-path = pathlib.Path(sys.argv[1])
-run_id = sys.argv[2]
+path = pathlib.Path(os.environ["AUTOMATON_RUNTIME_TEST_SECURITY_LOG"])
+run_id = os.environ["AUTOMATON_RUNTIME_TEST_RUN_ID"]
 before = path.read_bytes()
 logger = logging.getLogger("automaton.runtime_acl_canary." + run_id)
 logger.setLevel(logging.WARNING)
@@ -486,13 +793,12 @@ result = {
 }
 print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 '@
-    $invocation = Invoke-LocalPythonJson $source @($securityLogPath, $normalizedRunId)
-    if ($invocation.Success) {
-        $script:securityLogEvidence = $invocation.Value
-        Add-TestResult 'SECURITY_APPEND' 'ALLOW' 'ALLOW' 'PYTHON_FILEHANDLER_APPEND_FLUSH_FSYNC_SUCCEEDED'
-    } else {
-        Add-TestResult 'SECURITY_APPEND' 'ALLOW' 'ERROR' $invocation.Evidence
-    }
+    $invocation = Invoke-LocalPythonJson $source @{
+        AUTOMATON_RUNTIME_TEST_SECURITY_LOG = $securityLogPath
+        AUTOMATON_RUNTIME_TEST_RUN_ID = $normalizedRunId
+    } 'security-log-append'
+    $script:securityLogEvidence = Assert-PythonInvocation `
+        'SECURITY_APPEND' $invocation 'PYTHON_FILEHANDLER_APPEND_FLUSH_FSYNC_SUCCEEDED'
 }
 
 function Write-ExclusiveJsonReport([string] $Path, [object] $Value) {
@@ -513,7 +819,15 @@ function Write-ExclusiveJsonReport([string] $Path, [object] $Value) {
     }
 }
 
+if ($null -ne $nativeProbeLoadError) {
+    Set-TestContext 'NATIVE_ACCESS_PROBE_COMPILER' 'ADD_TYPE_NATIVE_METHODS'
+    $diagnostic = New-FailureDiagnostic $nativeProbeLoadError
+    $runtimeError = $diagnostic.exception_type
+    $failureClassification = 'TEST_INFRASTRUCTURE_ERROR'
+    $infrastructureFailure = $true
+} else {
 try {
+    Set-TestContext 'IDENTITY' 'IDENTITY'
     Add-TestResult 'IDENTITY' $expectedSid $effectiveSid 'EFFECTIVE_WINDOWS_TOKEN_SID'
     Add-AllowedFileReadTest 'WORKSPACE_READ' (Join-Path $workspace 'package.json') $true
     Add-DeniedCanaryCreateTest 'WORKSPACE_CREATE' (Join-Path $workspace ".acl-runtime-$normalizedRunId.canary")
@@ -521,9 +835,10 @@ try {
     Add-DeniedRightTest 'WORKSPACE_DELETE_CODE' (Join-Path $workspace 'package.json') $DELETE $false $false
 
     Add-AllowedFileReadTest 'CONFIG_READ' $configPath $true
+    Set-TestContext 'CONFIG_VALIDATION' 'CONFIG_OBSERVE_ONLY'
     $configText = [System.IO.File]::ReadAllText($configPath, [System.Text.Encoding]::UTF8)
     if ($configText -notmatch '(?m)^\s*trading_mode\s*:\s*OBSERVE_ONLY\s*$') {
-        Add-TestResult 'CONFIG_OBSERVE_ONLY' 'OBSERVE_ONLY' 'ERROR' 'CONFIG_MODE_NOT_OBSERVE_ONLY'
+        Add-TestResult 'CONFIG_OBSERVE_ONLY' 'OBSERVE_ONLY' 'MISMATCH' 'CONFIG_MODE_NOT_OBSERVE_ONLY'
     } else {
         Add-TestResult 'CONFIG_OBSERVE_ONLY' 'OBSERVE_ONLY' 'OBSERVE_ONLY' 'MODE_READ_WITHOUT_REPORTING_CONFIG'
     }
@@ -541,6 +856,7 @@ try {
 
     Add-MutableDirectoryCanaryTest 'OPERATIONAL_MODIFY' $operationalPath
     Add-MutableDirectoryCanaryTest 'RESEARCH_MODIFY' $researchPath
+    Add-PythonRuntimePreflightTests
     Add-SqliteWalCanaryTest
 
     Add-AuditJournalAppendTest
@@ -563,6 +879,7 @@ try {
     Add-DeniedRightTest 'AGENT_STATE_READ' $agentStatePath $FILE_LIST_DIRECTORY $true $false
     Add-DeniedRightTest 'AGENT_STATE_WRITE' $agentStatePath $FILE_ADD_FILE $true $false
 
+    Set-TestContext 'CONTROL_ISOLATION' 'DEMO_AUTH_READ'
     $demoRead = Invoke-NativeAccessProbe $demoAuthorizationPath $FILE_LIST_DIRECTORY $true
     if ($demoRead.Allowed) {
         Add-TestResult 'DEMO_AUTH_READ' 'ALLOW' 'ALLOW' 'DIRECTORY_READ_RIGHT_GRANTED'
@@ -570,6 +887,7 @@ try {
         Add-TestResult 'DEMO_AUTH_READ' 'ALLOW' 'DENY' 'WIN32_ACCESS_DENIED'
     } else {
         Add-TestResult 'DEMO_AUTH_READ' 'ALLOW' 'ERROR' "WIN32_ERROR_$($demoRead.ErrorCode)"
+        throw "UNEXPECTED_DEMO_AUTH_READ_ERROR:$($demoRead.ErrorCode)"
     }
     Add-DeniedRightTest 'DEMO_AUTH_CREATE' $demoAuthorizationPath $FILE_ADD_FILE $true $false
     if ([System.IO.File]::Exists($demoAuthorizationFile)) {
@@ -580,6 +898,7 @@ try {
         Add-DeniedRightTest 'DEMO_AUTH_DELETE' $demoAuthorizationPath $FILE_DELETE_CHILD $true $false
     }
 
+    Set-TestContext 'CONTROL_ISOLATION' 'KILL_SWITCH_DETECT'
     $killSwitchPresent = [System.IO.File]::Exists($killSwitchPath)
     Add-TestResult 'KILL_SWITCH_DETECT' 'ALLOW' 'ALLOW' $(if ($killSwitchPresent) { 'PRESENT' } else { 'ABSENT' })
     Add-DeniedRightTest 'KILL_SWITCH_CREATE' $controlPath $FILE_ADD_FILE $true $false
@@ -591,9 +910,17 @@ try {
         Add-DeniedRightTest 'KILL_SWITCH_DELETE' $controlPath $FILE_DELETE_CHILD $true $false
     }
 } catch {
-    $runtimeError = if ($criticalFail) { 'CRITICAL_PROTECTED_RIGHT_GRANTED' } else { $_.Exception.GetType().Name }
+    $diagnostic = New-FailureDiagnostic $_
+    $runtimeError = $diagnostic.exception_type
+    $failureClassification = if ($criticalFail) {
+        'CRITICAL_UNEXPECTED_ALLOW'
+    } else {
+        'TEST_INFRASTRUCTURE_ERROR'
+    }
+}
 }
 
+Set-TestContext 'HARNESS_CLEANUP' 'RUNTIME_TEMP_CLEANUP'
 $runtimeTempCleanupAttempted = $true
 $runtimeTempCleanupSucceeded = Clear-PrivateRuntimeTemp $operationalPath $runtimeTempPath
 Add-TestResult `
@@ -605,7 +932,16 @@ $allPassed = -not $criticalFail -and $null -eq $runtimeError
 foreach ($test in $tests.Values) {
     if (-not $test.passed) { $allPassed = $false }
 }
-$status = if ($criticalFail) { 'CRITICAL_FAIL' } elseif ($allPassed) { 'PASS' } else { 'FAIL' }
+$status = if ($criticalFail) {
+    'CRITICAL_UNEXPECTED_ALLOW'
+} elseif ($null -ne $diagnostic -or $infrastructureFailure) {
+    'TEST_INFRASTRUCTURE_ERROR'
+} elseif (-not $allPassed) {
+    'TEST_FAILED_EXPECTATION'
+} else {
+    'PASS'
+}
+if ($status -ne 'PASS') { $failureClassification = $status }
 $report = [ordered]@{
     schema_version = 1
     role = 'AutomatonGateway'
@@ -614,6 +950,8 @@ $report = [ordered]@{
     status = $status
     completed_at_utc = [DateTime]::UtcNow.ToString('o')
     runtime_error = $runtimeError
+    failure_classification = $failureClassification
+    diagnostic = $diagnostic
     tests = $tests
     journal_evidence = $journalEvidence
     security_log_evidence = $securityLogEvidence

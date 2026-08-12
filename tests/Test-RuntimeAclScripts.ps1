@@ -141,6 +141,45 @@ foreach ($required in @(
 )) {
     Assert-True ($gateway.Contains($required)) "Gateway runtime primitive is missing: $required"
 }
+foreach ($required in @(
+    'Add-PythonRuntimePreflightTests', 'PYTHON_EXECUTABLE_PATH',
+    'PYTHON_EXECUTE', 'PYTHON_EXECUTABLE_IDENTITY', 'PYTHON_SQLITE_IMPORT',
+    'PYTHON_RUNTIME_TEMP', 'PYTHON_RUNTIME_TEMP_CONFINED',
+    'SQLITE_PROCESS', 'SQLITE_DB_CREATE', 'SQLITE_WAL_MODE',
+    'SQLITE_WAL_CREATE', 'SQLITE_SHM_CREATE', 'SQLITE_COMMIT',
+    'SQLITE_READ_BACK', 'SQLITE_CHECKPOINT', 'SQLITE_CLOSE', 'SQLITE_CLEANUP',
+    '[System.Diagnostics.ProcessStartInfo]::new()',
+    '$startInfo.RedirectStandardError = $true',
+    '$process.StandardError.ReadToEnd()',
+    'PYTHON_UNEXPECTED_STDERR',
+    'AUTOMATON_RUNTIME_TEST_TEMP', 'AUTOMATON_RUNTIME_TEST_DB'
+)) {
+    Assert-True ($gateway.Contains($required)) "Gateway Python/SQLite diagnostic stage is missing: $required"
+}
+Assert-True `
+    (-not $gateway.Contains('2>&1')) `
+    'Python stderr must not be converted into a generic PowerShell RemoteException.'
+Assert-True `
+    (-not $gateway.Contains('$output = @(& $pythonExe')) `
+    'Python must run through redirected ProcessStartInfo diagnostics.'
+Assert-True `
+    ($gateway.IndexOf("Add-MutableDirectoryCanaryTest 'RESEARCH_MODIFY'") -lt $gateway.LastIndexOf('Add-PythonRuntimePreflightTests')) `
+    'Python preflight must immediately follow the research canary.'
+Assert-True `
+    ($gateway.LastIndexOf('Add-PythonRuntimePreflightTests') -lt $gateway.LastIndexOf('Add-SqliteWalCanaryTest')) `
+    'Python preflight must precede the SQLite WAL canary.'
+foreach ($required in @(
+    'stage = $script:currentStage', 'test_name = $script:currentTestName',
+    'exception_type =', 'exception_message =', 'FullyQualifiedErrorId =',
+    'script_line =', 'invocation =', 'stack_trace =',
+    'last_completed_test =', 'New-FailureDiagnostic $_',
+    '$nativeProbeLoadError = $_',
+    "Set-TestContext 'NATIVE_ACCESS_PROBE_COMPILER' 'ADD_TYPE_NATIVE_METHODS'",
+    'TEST_FAILED_EXPECTATION', 'TEST_INFRASTRUCTURE_ERROR',
+    'CRITICAL_UNEXPECTED_ALLOW', 'failure_classification =', 'diagnostic ='
+)) {
+    Assert-True ($gateway.Contains($required)) "Structured runtime diagnostic is missing: $required"
+}
 Assert-True `
     (-not $gateway.Contains('ReadAllText($ipcKeyPath')) `
     'Gateway script must not materialize the IPC key as text.'
@@ -183,4 +222,8 @@ Assert-True `
     WINDOWS_TEMP_NOT_USED = 'PASS'
     TEMP_PATH_CONFINED = 'PASS'
     REPARSE_POINT_FAIL_CLOSED = 'PASS'
+    UNEXPECTED_EXCEPTION_DIAGNOSTIC = 'PASS'
+    FAILURE_CLASSIFICATION = 'PASS'
+    PYTHON_STDERR_CAPTURE = 'PASS'
+    SQLITE_STAGE_DIAGNOSTICS = 'PASS'
 } | ConvertTo-Json
