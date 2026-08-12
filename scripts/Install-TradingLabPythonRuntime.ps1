@@ -52,7 +52,6 @@ $gatewaySid = 'S-1-5-21-568964486-193631783-1609210587-1007'
 $fullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
 $readExecute = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
 $gatewayReadExecute = $readExecute -bor [System.Security.AccessControl.FileSystemRights]::Synchronize
-$modifyMask = [int64][System.Security.AccessControl.FileSystemRights]::Modify
 $runId = [guid]::NewGuid().ToString('D').ToLowerInvariant()
 $reportDirectory = Join-Path $maintenanceRoot 'python-runtime-results'
 $reportPath = Join-Path $reportDirectory "python-runtime-$runId.json"
@@ -88,7 +87,11 @@ $report = [ordered]@{
     machine_runtime_acl_modified = $false
     acl_apply_requested = $false
     acl_applied = $false
+    acl_reapplied = $false
+    must_not_call_set_acl = $false
+    set_acl_call_count = 0
     acl_plan = $null
+    acl_recursive_audit = $null
     must_not_execute_installer = $false
     recovery_state = $null
     installer_result_log = $null
@@ -108,6 +111,7 @@ $report = [ordered]@{
 
 . (Join-Path $PSScriptRoot 'TradingLabPythonInventory.ps1')
 . (Join-Path $PSScriptRoot 'TradingLabPythonAclPlan.ps1')
+. (Join-Path $PSScriptRoot 'TradingLabFileSystemRights.ps1')
 
 function Get-CanonicalPath([string] $Path) {
     if (-not [System.IO.Path]::IsPathRooted($Path)) { throw "Path must be absolute: $Path" }
@@ -179,7 +183,7 @@ function Assert-NoUntrustedModify([string] $Path, [string[]] $ProtectedSids) {
     foreach ($rule in $acl.Access) {
         if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
         $sid = Resolve-IdentitySid $rule.IdentityReference
-        if ($sid -in $ProtectedSids -and (([int64]$rule.FileSystemRights -band $modifyMask) -ne 0)) {
+        if ($sid -in $ProtectedSids -and (Test-TradingLabFileSystemRightsMutation ([int64]$rule.FileSystemRights))) {
             throw "Untrusted principal has Modify-equivalent rights on ${Path}: $sid"
         }
     }
@@ -362,8 +366,10 @@ function Protect-ExactRuntimeTree([string] $Root, [object] $Plan) {
             -not (Test-PathWithin $item.FullName $canonicalRoot)) {
             throw "ACL_APPLY_TARGET_CHANGED=FAIL: $($item.FullName)"
         }
+        $report.set_acl_call_count++
         Set-Acl -LiteralPath $item.FullName -AclObject $(if ($entry.is_directory) { $directorySecurity } else { $fileSecurity })
     }
+    $report.set_acl_call_count++
     Set-Acl -LiteralPath $canonicalRoot -AclObject $directorySecurity
 }
 
@@ -399,32 +405,38 @@ function Protect-AdministrativeMaintenanceTree([string] $Root) {
     Set-Acl -LiteralPath $Root -AclObject (New-AdministrativeMaintenanceSecurity $true)
 }
 
-function Assert-ExactBaseAcl([string] $Root) {
-    $allowedSids = @($systemSid, $administratorsSid, $gatewaySid)
+function Get-MachineRuntimeAclAudit([string] $Root) {
+    $auditItems = [System.Collections.Generic.List[object]]::new()
     foreach ($item in @(Get-ExactRuntimeTreeSnapshot $Root)) {
         $acl = Get-Acl -LiteralPath $item.path -ErrorAction Stop
-        if ((Resolve-IdentitySid $acl.Owner) -ne $administratorsSid -or -not $acl.AreAccessRulesProtected) {
-            throw "Python runtime owner/inheritance is not exact: $($item.path)"
-        }
-        $rightsBySid = @{}
-        foreach ($rule in $acl.Access) {
-            $sid = Resolve-IdentitySid $rule.IdentityReference
-            if ($rule.AccessControlType -ne 'Allow' -or $sid -notin $allowedSids) {
-                throw "Unexpected Python runtime ACE on $($item.path): $sid"
+        $rules = @($acl.Access | ForEach-Object {
+            [pscustomobject]@{
+                sid = Resolve-IdentitySid $_.IdentityReference
+                rights = [int64]$_.FileSystemRights
+                type = $_.AccessControlType.ToString()
+                inherited = [bool]$_.IsInherited
             }
-            if ($rightsBySid.ContainsKey($sid)) { throw "Duplicate Python runtime ACE on $($item.path): $sid" }
-            $rightsBySid[$sid] = [int64]$rule.FileSystemRights
-        }
-        if (
-            $rightsBySid.Count -ne 3 -or
-            -not $rightsBySid.ContainsKey($systemSid) -or
-            -not $rightsBySid.ContainsKey($administratorsSid) -or
-            -not $rightsBySid.ContainsKey($gatewaySid) -or
-            $rightsBySid[$systemSid] -ne [int64]$fullControl -or
-            $rightsBySid[$administratorsSid] -ne [int64]$fullControl -or
-            $rightsBySid[$gatewaySid] -ne [int64]$gatewayReadExecute
-        ) { throw "Python runtime ACL is not the exact three-ACE model: $($item.path)" }
+        })
+        $auditItems.Add([pscustomobject]@{
+            path = $item.path
+            is_directory = $item.is_directory
+            is_reparse_point = $false
+            owner_sid = Resolve-IdentitySid $acl.Owner
+            inheritance_protected = [bool]$acl.AreAccessRulesProtected
+            rules = $rules
+        })
     }
+    return Test-TradingLabRuntimeAclAudit @($auditItems) $pythonBase `
+        $systemSid $administratorsSid $gatewaySid $agentSid `
+        ([int64]$fullControl) ([int64]$gatewayReadExecute)
+}
+
+function Assert-ExactBaseAcl([string] $Root) {
+    $audit = Get-MachineRuntimeAclAudit $Root
+    if (-not $audit.valid) {
+        throw "PYTHON_RUNTIME_ACL=FAIL: $(@($audit.findings | Select-Object -First 5) -join ';')"
+    }
+    return $audit
 }
 
 function Assert-Installer([string] $Path) {
@@ -1142,22 +1154,37 @@ function Assert-MachineInstallationInventory([object] $Inventory) {
 }
 
 function Get-MachineRuntimeAclState {
-    try {
-        Assert-ExactBaseAcl $pythonBase
-        Assert-TreeNotModifiableByServices $pythonBase
-        return 'EXACT'
-    } catch { return 'INCOMPLETE' }
+    $audit = Get-MachineRuntimeAclAudit $pythonBase
+    return [pscustomobject]@{
+        state = if ($audit.valid) { 'EXACT' } else { 'INCOMPLETE' }
+        audit = $audit
+    }
 }
 
-function Set-MachineRuntimeAclPassGates {
+function Set-MachineRuntimeAclPassGates([object] $Audit) {
+    if ($null -eq $Audit -or -not $Audit.valid) {
+        throw 'PYTHON_RUNTIME_ACL=FAIL: recursive audit did not pass.'
+    }
+    $report.acl_recursive_audit = $Audit
+    $report.gates.ACL_OWNER_ADMINISTRATORS = 'PASS'
+    $report.gates.ACL_INHERITANCE_PROTECTED = 'PASS'
     $report.gates.SYSTEM_FULLCONTROL = 'PASS'
     $report.gates.ADMINISTRATORS_FULLCONTROL = 'PASS'
     $report.gates.PYTHON_GATEWAY_EXECUTE = 'PASS'
+    $report.gates.PYTHON_GATEWAY_READ = 'PASS'
+    $report.gates.PYTHON_GATEWAY_WRITE_DENY = 'PASS'
     $report.gates.PYTHON_GATEWAY_MODIFY_DENY = 'PASS'
+    $report.gates.PYTHON_GATEWAY_DELETE_DENY = 'PASS'
+    $report.gates.PYTHON_GATEWAY_CHANGE_PERMISSIONS_DENY = 'PASS'
+    $report.gates.PYTHON_GATEWAY_TAKE_OWNERSHIP_DENY = 'PASS'
     $report.gates.PYTHON_AGENT_ACCESS_DENY = 'PASS'
     $report.gates.AUTHENTICATED_USERS_MODIFY = 'false'
     $report.gates.USERS_MODIFY = 'false'
     $report.gates.DENY_ACES_USED = 'false'
+    $report.gates.ACL_UNEXPECTED_PRINCIPALS = $Audit.unexpected_principals
+    $report.gates.ACL_RECURSIVE_FINDINGS = $Audit.recursive_findings
+    $report.gates.ACL_REPARSE_POINTS = $Audit.reparse_points
+    $report.gates.ACL_OTHER_DOMAINS_MODIFIED = 'false'
     $report.gates.PYTHON_RUNTIME_ACL = 'PASS'
 }
 
@@ -1192,8 +1219,15 @@ function Complete-InstalledMachineRuntime([object] $Inventory) {
     $report.acl_apply_requested = [bool]$Apply
 
     $aclState = Get-MachineRuntimeAclState
-    if ($aclState -eq 'EXACT') {
-        Set-MachineRuntimeAclPassGates
+    $report.acl_recursive_audit = $aclState.audit
+    if ($aclState.state -eq 'EXACT') {
+        $report.recovery_state = 'TARGET_RUNTIME_ACL_ALREADY_APPLIED_VALIDATION_PENDING'
+        $report.must_not_call_set_acl = $true
+        $report.acl_reapplied = $false
+        $report.gates.TARGET_RUNTIME_ACL_ALREADY_APPLIED_VALIDATION_PENDING = 'PASS'
+        $report.gates.MUST_NOT_CALL_SET_ACL = 'true'
+        $report.gates.ACL_REAPPLIED = 'false'
+        Set-MachineRuntimeAclPassGates $aclState.audit
         if ($Apply) {
             Initialize-PhaseStorage
             $report.current_run_applied_phase = 'MachineRuntimeValidationRecovered'
@@ -1208,10 +1242,10 @@ function Complete-InstalledMachineRuntime([object] $Inventory) {
     Protect-ExactRuntimeTree $pythonBase $aclPlan
     $report.machine_runtime_acl_modified = $true
     $report.acl_applied = $true
-    Assert-ExactBaseAcl $pythonBase
-    Assert-TreeNotModifiableByServices $pythonBase
+    $report.acl_reapplied = $true
+    $postApplyAudit = Assert-ExactBaseAcl $pythonBase
     $report.current_run_applied_phase = 'MachineRuntimeAclRecovered'
-    Set-MachineRuntimeAclPassGates
+    Set-MachineRuntimeAclPassGates $postApplyAudit
 }
 
 function Write-Report {
@@ -1236,8 +1270,15 @@ function Write-MutationBoundarySummary {
     Write-Output "machine_runtime_acl_modified=$($report.machine_runtime_acl_modified.ToString().ToLowerInvariant())"
     Write-Output "acl_apply_requested=$($report.acl_apply_requested.ToString().ToLowerInvariant())"
     Write-Output "ACL_APPLIED=$($report.acl_applied.ToString().ToLowerInvariant())"
+    Write-Output "MUST_NOT_CALL_SET_ACL=$($report.must_not_call_set_acl.ToString().ToLowerInvariant())"
+    Write-Output "ACL_REAPPLIED=$($report.acl_reapplied.ToString().ToLowerInvariant())"
+    Write-Output "SET_ACL_CALL_COUNT=$($report.set_acl_call_count)"
+    Write-Output "installer_executed=$($report.installer_executed.ToString().ToLowerInvariant())"
     Write-Output "VENV_REBUILT=$($report.venv_rebuilt.ToString().ToLowerInvariant())"
+    Write-Output "VENV_PROMOTED=$($report.venv_promoted.ToString().ToLowerInvariant())"
     Write-Output "MT5_ACCESSED=$($report.mt5_accessed.ToString().ToLowerInvariant())"
+    Write-Output "GATEWAY_STARTED=$($report.gateway_started.ToString().ToLowerInvariant())"
+    Write-Output "AUTOMATON_STARTED=$($report.automaton_started.ToString().ToLowerInvariant())"
 }
 
 function Write-UninstallPreflightSummary {
@@ -1481,10 +1522,9 @@ try {
             Protect-ExactRuntimeTree $pythonBase $aclPlan
             $report.machine_runtime_acl_modified = $true
             $report.acl_applied = $true
-            Assert-ExactBaseAcl $pythonBase
-            Assert-TreeNotModifiableByServices $pythonBase
+            $freshAclAudit = Assert-ExactBaseAcl $pythonBase
             Set-MachineRuntimePassGates $metadata
-            Set-MachineRuntimeAclPassGates
+            Set-MachineRuntimeAclPassGates $freshAclAudit
             $report.gates.INSTALLER_REEXECUTED = 'false'
         }
         'ResumeMachineRuntime' {

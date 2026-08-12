@@ -265,6 +265,7 @@ class SourceBoundaryTests(unittest.TestCase):
                 "Install-TradingLabPythonRuntime.ps1",
                 "TradingLabPythonInventory.ps1",
                 "TradingLabPythonAclPlan.ps1",
+                "TradingLabFileSystemRights.ps1",
                 "Initialize-GatewayPythonEnvironment.ps1",
             )
         ]
@@ -313,6 +314,11 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn("GATEWAY_READ_EXECUTE_PLANNED", installer)
         self.assertIn("AGENT_ACCESS_ABSENT_PLANNED", installer)
         self.assertIn("DENY_ACES_PLANNED", installer)
+        self.assertIn("TARGET_RUNTIME_ACL_ALREADY_APPLIED_VALIDATION_PENDING", installer)
+        self.assertIn("MUST_NOT_CALL_SET_ACL", installer)
+        self.assertIn("ACL_REAPPLIED", installer)
+        self.assertIn("ACL_RECURSIVE_FINDINGS", installer)
+        self.assertIn("ACL_REPARSE_POINTS", installer)
         self.assertIn("Assert-InstallMachinePreconditions", installer)
         self.assertIn("INSTALL_CPYTHON_MACHINE_WIDE_MINIMAL", installer)
         self.assertIn("INSTALL_ALL_USERS", installer)
@@ -356,6 +362,12 @@ class SourceBoundaryTests(unittest.TestCase):
         plan_source = (ROOT / "scripts" / "TradingLabPythonAclPlan.ps1").read_text(
             encoding="utf-8"
         )
+        rights_source = (ROOT / "scripts" / "TradingLabFileSystemRights.ps1").read_text(
+            encoding="utf-8"
+        )
+        acl_gate = (ROOT / "scripts" / "Apply-TradingLabAclGate.ps1").read_text(
+            encoding="utf-8"
+        )
         for invariant in (
             "ACL_TARGET_NOT_EXACT_RUNTIME",
             "ACL_TARGET_REPARSE_POINT",
@@ -377,6 +389,18 @@ class SourceBoundaryTests(unittest.TestCase):
         dry_return = complete.index("if (-not $Apply) { return }")
         mutation = complete.index("Protect-ExactRuntimeTree $pythonBase $aclPlan")
         self.assertLess(dry_return, mutation)
+        already_applied = complete.index("if ($aclState.state -eq 'EXACT')")
+        already_return = complete.index("return", already_applied)
+        self.assertLess(already_applied, already_return)
+        self.assertLess(already_return, mutation)
+        self.assertIn(
+            "$report.must_not_call_set_acl = $true",
+            complete[already_applied:already_return],
+        )
+        self.assertIn(
+            "$report.acl_reapplied = $false",
+            complete[already_applied:already_return],
+        )
         self.assertNotIn("Set-Acl", complete[:dry_return])
         self.assertNotIn(".SetOwner(", complete[:dry_return])
 
@@ -392,6 +416,32 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn("REPARSE_POINT_FAIL_CLOSED", installer)
         self.assertIn("[System.IO.Directory]::EnumerateFileSystemEntries", installer)
         self.assertNotIn("AccessControlType]::Deny", installer)
+        self.assertIn("Test-TradingLabRuntimeAclAudit", plan_source)
+        self.assertIn("Get-TradingLabFileSystemRightsClassification", plan_source)
+        for atomic_right in (
+            "WriteData",
+            "AppendData",
+            "WriteExtendedAttributes",
+            "WriteAttributes",
+            "DeleteSubdirectoriesAndFiles",
+            "Delete",
+            "ChangePermissions",
+            "TakeOwnership",
+        ):
+            self.assertIn(f"FileSystemRights]::{atomic_right}", rights_source)
+        self.assertNotIn("FileSystemRights]::Modify", rights_source)
+        self.assertNotIn("$modifyMask", installer)
+        self.assertIn("Test-TradingLabFileSystemRightsMutation", installer)
+        self.assertIn("Get-TradingLabProhibitedMutationRightsMask", acl_gate)
+        self.assertIn("Test-TradingLabFileSystemRightsMutation", acl_gate)
+        composite_partial = re.compile(
+            r"-band\s+(?:\[[^\]]+\]::)?(?:Modify|Write|FullControl)\s*\)\s*-ne\s*0",
+            re.IGNORECASE,
+        )
+        scripts = "\n".join(
+            path.read_text(encoding="utf-8") for path in (ROOT / "scripts").glob("*.ps1")
+        )
+        self.assertIsNone(composite_partial.search(scripts))
 
     def test_agent_trading_integration_has_no_direct_programdata_or_mt5_access(self) -> None:
         sources = "\n".join(

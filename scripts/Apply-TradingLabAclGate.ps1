@@ -15,13 +15,14 @@ $gatewaySid = 'S-1-5-21-568964486-193631783-1609210587-1007'
 $usersSid = 'S-1-5-32-545'
 $systemSid = 'S-1-5-18'
 $administratorsSid = 'S-1-5-32-544'
+. (Join-Path $PSScriptRoot 'TradingLabFileSystemRights.ps1')
 $fullControl = 2032127L
 $readRights = 131209L
 $readExecuteRights = 131241L
 $modifyRights = 197055L
 $synchronizeRight = 1048576L
 $appendDataRight = 4L
-$writeOrSecurityRights = 2L -bor 4L -bor 16L -bor 64L -bor 256L -bor 65536L -bor 262144L -bor 524288L
+$writeOrSecurityRights = Get-TradingLabProhibitedMutationRightsMask
 $appendForbiddenRights = $writeOrSecurityRights -band (-bnot $appendDataRight)
 $report = [ordered]@{
     acl_prevalidation = 'FAIL'
@@ -341,7 +342,8 @@ try {
 
     $authenticatedUsersModify = $false
     foreach ($rule in $snapshots.workspace.rules) {
-        if ($rule.sid -eq 'S-1-5-11' -and $rule.type -eq 'Allow' -and ($rule.rights -band $modifyRights) -eq $modifyRights) {
+        if ($rule.sid -eq 'S-1-5-11' -and $rule.type -eq 'Allow' -and
+            (Test-TradingLabFileSystemRightsMutation ([int64]$rule.rights))) {
             $authenticatedUsersModify = $true
         }
     }

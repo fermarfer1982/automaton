@@ -3,6 +3,8 @@ $root = Split-Path $PSScriptRoot -Parent
 $installerPath = Join-Path $root 'scripts\Install-TradingLabPythonRuntime.ps1'
 $inventoryPath = Join-Path $root 'scripts\TradingLabPythonInventory.ps1'
 $aclPlanPath = Join-Path $root 'scripts\TradingLabPythonAclPlan.ps1'
+$rightsPath = Join-Path $root 'scripts\TradingLabFileSystemRights.ps1'
+$aclGatePath = Join-Path $root 'scripts\Apply-TradingLabAclGate.ps1'
 $setupPath = Join-Path $root 'scripts\setup.ps1'
 $gatewayPath = Join-Path $root 'scripts\Test-GatewayRuntimeAcl.ps1'
 $collectorPath = Join-Path $root 'scripts\Collect-RuntimeAclResults.ps1'
@@ -14,7 +16,8 @@ function Assert-True([bool] $Condition, [string] $Message) {
 }
 
 foreach ($path in @(
-    $installerPath, $inventoryPath, $aclPlanPath, $setupPath, $gatewayPath, $collectorPath,
+    $installerPath, $inventoryPath, $aclPlanPath, $rightsPath, $aclGatePath,
+    $setupPath, $gatewayPath, $collectorPath,
     $gatewayEnvironmentPath, $gatewayStartPath
 )) {
     $tokens = $null
@@ -28,6 +31,8 @@ foreach ($path in @(
 $installer = [System.IO.File]::ReadAllText($installerPath)
 $inventorySource = [System.IO.File]::ReadAllText($inventoryPath)
 $aclPlanSource = [System.IO.File]::ReadAllText($aclPlanPath)
+$rightsSource = [System.IO.File]::ReadAllText($rightsPath)
+$aclGateSource = [System.IO.File]::ReadAllText($aclGatePath)
 $setup = [System.IO.File]::ReadAllText($setupPath)
 $gateway = [System.IO.File]::ReadAllText($gatewayPath)
 $collector = [System.IO.File]::ReadAllText($collectorPath)
@@ -120,6 +125,13 @@ foreach ($required in @(
     'AUTHENTICATED_USERS_MODIFY_ABSENT_PLANNED', 'USERS_MODIFY_ABSENT_PLANNED',
     'DENY_ACES_PLANNED', 'ACL_OTHER_DOMAINS_MODIFIED',
     'machine_runtime_acl_modified', 'acl_apply_requested', 'acl_applied', 'acl_plan',
+    'TARGET_RUNTIME_ACL_ALREADY_APPLIED_VALIDATION_PENDING',
+    'MUST_NOT_CALL_SET_ACL', 'ACL_REAPPLIED', 'SET_ACL_CALL_COUNT',
+    'ACL_OWNER_ADMINISTRATORS', 'ACL_INHERITANCE_PROTECTED',
+    'PYTHON_GATEWAY_READ', 'PYTHON_GATEWAY_WRITE_DENY',
+    'PYTHON_GATEWAY_DELETE_DENY', 'PYTHON_GATEWAY_CHANGE_PERMISSIONS_DENY',
+    'PYTHON_GATEWAY_TAKE_OWNERSHIP_DENY', 'ACL_UNEXPECTED_PRINCIPALS',
+    'ACL_RECURSIVE_FINDINGS', 'ACL_REPARSE_POINTS',
     'VENV_BASE_OUTSIDE_USER_PROFILE', 'VENV_LOCK_MATCH',
     'META_TRADER5_PACKAGE_PRESENT',
     "trading_mode\s*:\s*OBSERVE_ONLY",
@@ -164,8 +176,12 @@ foreach ($forbidden in @(
     'import MetaTrader5', '.initialize(', '.login(', '.symbol_select(', '.order_check(', '.order_send(',
     'Start-Service', 'New-LocalUser', 'Add-LocalGroupMember', 'Invoke-Expression'
 )) {
-    Assert-True (-not ($installer + $inventorySource + $aclPlanSource).Contains($forbidden)) "Python recovery gate contains forbidden action: $forbidden"
+    Assert-True (-not ($installer + $inventorySource + $aclPlanSource + $rightsSource).Contains($forbidden)) "Python recovery gate contains forbidden action: $forbidden"
 }
+Assert-True (-not $installer.Contains('$modifyMask')) 'Composite Modify mask anti-pattern must be removed from Python recovery.'
+Assert-True ($installer.Contains('Test-TradingLabFileSystemRightsMutation')) 'Python recovery must use the centralized atomic mutation classifier.'
+Assert-True ($aclGateSource.Contains('Get-TradingLabProhibitedMutationRightsMask')) 'Global ACL gate must share the centralized mutation mask.'
+Assert-True ($aclGateSource.Contains('Test-TradingLabFileSystemRightsMutation')) 'Global ACL gate must classify broad-principal mutation semantically.'
 
 $inventoryApply = $installer.IndexOf('INVENTORY_APPLY_FORBIDDEN')
 $phaseSwitch = $installer.IndexOf('switch ($Phase)')
@@ -216,6 +232,11 @@ $completeBlock = $installer.Substring($completeStart, $completeEnd - $completeSt
 $dryRunReturn = $completeBlock.IndexOf('if (-not $Apply) { return }')
 $aclMutationCall = $completeBlock.IndexOf('Protect-ExactRuntimeTree $pythonBase $aclPlan')
 Assert-True ($dryRunReturn -ge 0 -and $aclMutationCall -gt $dryRunReturn) 'Dry-run must return before the only machine runtime ACL mutation call.'
+$alreadyAppliedBranch = $completeBlock.IndexOf("if (`$aclState.state -eq 'EXACT')")
+$alreadyAppliedReturn = $completeBlock.IndexOf('return', $alreadyAppliedBranch)
+Assert-True ($alreadyAppliedBranch -ge 0 -and $alreadyAppliedReturn -gt $alreadyAppliedBranch -and $alreadyAppliedReturn -lt $aclMutationCall) 'Already-applied ACL recovery must return before Set-Acl.'
+Assert-True ($completeBlock.Substring($alreadyAppliedBranch, $alreadyAppliedReturn - $alreadyAppliedBranch).Contains("`$report.must_not_call_set_acl = `$true")) 'Already-applied ACL recovery must set MUST_NOT_CALL_SET_ACL.'
+Assert-True ($completeBlock.Substring($alreadyAppliedBranch, $alreadyAppliedReturn - $alreadyAppliedBranch).Contains("`$report.acl_reapplied = `$false")) 'Already-applied ACL recovery must report ACL_REAPPLIED=false.'
 Assert-True (-not $completeBlock.Substring(0, $dryRunReturn).Contains('Set-Acl')) 'Dry-run path must never call Set-Acl.'
 Assert-True (-not $completeBlock.Substring(0, $dryRunReturn).Contains('.SetOwner(')) 'Dry-run path must never modify owner.'
 Assert-True ($installer.Contains('Assert-ExactRuntimeTarget $Root')) 'ACL application must validate the exact runtime target.'
@@ -230,9 +251,63 @@ Assert-True ($inventorySource.Contains("separators=(',', ':')")) 'Metadata JSON 
 
 . $inventoryPath
 . $aclPlanPath
+. $rightsPath
 Assert-True ((Resolve-TradingLabInstallerExit 0) -eq 'SUCCESS') 'Installer exit 0 classification regressed.'
 Assert-True ((Resolve-TradingLabInstallerExit 1603) -eq 'INSTALLER_MAINTENANCE_COLLISION') 'Bootstrapper 1603 must be classified as a maintenance collision.'
 Assert-True ((Resolve-TradingLabInstallerExit 5) -eq 'INSTALLER_EXIT_NONZERO') 'Unexpected installer exits must fail closed.'
+
+$safeRights = @(
+    [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+    ([System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [System.Security.AccessControl.FileSystemRights]::Synchronize),
+    [System.Security.AccessControl.FileSystemRights]::Read,
+    [System.Security.AccessControl.FileSystemRights]::ReadData,
+    [System.Security.AccessControl.FileSystemRights]::ExecuteFile,
+    [System.Security.AccessControl.FileSystemRights]::ReadAttributes,
+    [System.Security.AccessControl.FileSystemRights]::ReadExtendedAttributes,
+    [System.Security.AccessControl.FileSystemRights]::ReadPermissions,
+    [System.Security.AccessControl.FileSystemRights]::Synchronize
+)
+foreach ($rights in $safeRights) {
+    $classification = Get-TradingLabFileSystemRightsClassification ([int64]$rights)
+    Assert-True (-not $classification.modify_equivalent -and -not $classification.write_capable) "Safe rights misclassified: $rights"
+    Assert-True ($classification.mutation_intersection -eq 0) "Safe rights intersect prohibited mask: $rights"
+}
+$unsafeRights = @(
+    [System.Security.AccessControl.FileSystemRights]::WriteData,
+    [System.Security.AccessControl.FileSystemRights]::AppendData,
+    [System.Security.AccessControl.FileSystemRights]::WriteAttributes,
+    [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes,
+    [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles,
+    [System.Security.AccessControl.FileSystemRights]::Delete,
+    [System.Security.AccessControl.FileSystemRights]::ChangePermissions,
+    [System.Security.AccessControl.FileSystemRights]::TakeOwnership,
+    [System.Security.AccessControl.FileSystemRights]::Write,
+    [System.Security.AccessControl.FileSystemRights]::Modify,
+    [System.Security.AccessControl.FileSystemRights]::FullControl
+)
+foreach ($rights in $unsafeRights) {
+    $classification = Get-TradingLabFileSystemRightsClassification ([int64]$rights)
+    Assert-True ($classification.modify_equivalent -and $classification.write_capable) "Unsafe rights misclassified: $rights"
+    Assert-True ($classification.mutation_intersection -ne 0) "Unsafe rights do not intersect prohibited mask: $rights"
+}
+$rightsMask = Get-TradingLabProhibitedMutationRightsMask
+$gatewayRightsFixture = [int64](
+    [System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor
+    [System.Security.AccessControl.FileSystemRights]::Synchronize
+)
+Assert-True ($rightsMask -eq 852310L -and ('0x' + $rightsMask.ToString('X')) -eq '0xD0156') 'Atomic prohibited mutation mask changed unexpectedly.'
+Assert-True ($gatewayRightsFixture -eq 1179817L -and ('0x' + $gatewayRightsFixture.ToString('X')) -eq '0x1200A9') 'Gateway rights mask changed unexpectedly.'
+Assert-True (($gatewayRightsFixture -band $rightsMask) -eq 0) 'Gateway RX plus Synchronize must have zero mutation intersection.'
+foreach ($rights in @(
+    [System.Security.AccessControl.FileSystemRights]::Write,
+    [System.Security.AccessControl.FileSystemRights]::Modify,
+    [System.Security.AccessControl.FileSystemRights]::FullControl,
+    [System.Security.AccessControl.FileSystemRights]::Delete,
+    [System.Security.AccessControl.FileSystemRights]::ChangePermissions,
+    [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+)) {
+    Assert-True (([int64]$rights -band $rightsMask) -ne 0) "Required unsafe mask intersection is zero: $rights"
+}
 
 $aclSystemSid = 'S-1-5-18'
 $aclAdministratorsSid = 'S-1-5-32-544'
@@ -332,6 +407,65 @@ $usersCase.entries = @($usersCase.entries) + @([pscustomobject]@{
     identity = 'BUILTIN\Users'; sid = $aclUsersSid; rights = 'Modify'; rights_value = [int64][System.Security.AccessControl.FileSystemRights]::Modify; type = 'Allow'
 })
 Assert-True (-not (Test-AclPlanFixture $usersCase).valid) 'BUILTIN Users Modify must fail closed.'
+
+function New-ValidAclAuditItem([string] $Path) {
+    [pscustomobject]@{
+        path = $Path
+        is_directory = $true
+        is_reparse_point = $false
+        owner_sid = $aclAdministratorsSid
+        inheritance_protected = $true
+        rules = @(
+            [pscustomobject]@{ sid = $aclSystemSid; rights = $aclFullControl; type = 'Allow'; inherited = $false },
+            [pscustomobject]@{ sid = $aclAdministratorsSid; rights = $aclFullControl; type = 'Allow'; inherited = $false },
+            [pscustomobject]@{ sid = $aclGatewaySid; rights = $aclGatewayRx; type = 'Allow'; inherited = $false }
+        )
+    }
+}
+function Test-AclAuditFixture([object[]] $Items) {
+    Test-TradingLabRuntimeAclAudit $Items 'C:\Program Files\AutomatonPython\3.14.5' `
+        $aclSystemSid $aclAdministratorsSid $aclGatewaySid $aclAgentSid `
+        $aclFullControl $aclGatewayRx
+}
+function Copy-AclAuditFixture([object] $Value) {
+    return ($Value | ConvertTo-Json -Depth 8 | ConvertFrom-Json)
+}
+
+$cleanAuditItems = @(
+    (New-ValidAclAuditItem 'C:\Program Files\AutomatonPython\3.14.5'),
+    (New-ValidAclAuditItem 'C:\Program Files\AutomatonPython\3.14.5\Lib')
+)
+$cleanAudit = Test-AclAuditFixture $cleanAuditItems
+Assert-True ($cleanAudit.valid -and $cleanAudit.recursive_findings -eq 0 -and $cleanAudit.reparse_points -eq 0) 'Exact recursive ACL audit must pass with zero findings.'
+Assert-True ($cleanAudit.unexpected_principals -eq 0 -and $cleanAudit.gateway_mutation_intersection -eq 0) 'Exact recursive ACL audit masks/principals regressed.'
+foreach ($unsafeGatewayRight in @(
+    [System.Security.AccessControl.FileSystemRights]::Modify,
+    [System.Security.AccessControl.FileSystemRights]::FullControl,
+    [System.Security.AccessControl.FileSystemRights]::Delete,
+    [System.Security.AccessControl.FileSystemRights]::ChangePermissions,
+    [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+)) {
+    $case = Copy-AclAuditFixture $cleanAuditItems
+    ($case[0].rules | Where-Object { $_.sid -eq $aclGatewaySid }).rights = [int64]$unsafeGatewayRight
+    Assert-True (-not (Test-AclAuditFixture $case).valid) "Unsafe Gateway audit rights must fail closed: $unsafeGatewayRight"
+}
+$agentAuditCase = Copy-AclAuditFixture $cleanAuditItems
+$agentAuditCase[0].rules = @($agentAuditCase[0].rules) + @([pscustomobject]@{ sid = $aclAgentSid; rights = 1L; type = 'Allow'; inherited = $false })
+Assert-True (-not (Test-AclAuditFixture $agentAuditCase).valid) 'Agent Allow in recursive audit must fail closed.'
+$denyAuditCase = Copy-AclAuditFixture $cleanAuditItems
+$denyAuditCase[0].rules = @($denyAuditCase[0].rules) + @([pscustomobject]@{ sid = $aclAgentSid; rights = 1L; type = 'Deny'; inherited = $false })
+Assert-True (-not (Test-AclAuditFixture $denyAuditCase).valid) 'Deny ACE in recursive audit must fail closed.'
+$unexpectedAuditCase = Copy-AclAuditFixture $cleanAuditItems
+$unexpectedAuditCase[0].rules = @($unexpectedAuditCase[0].rules) + @([pscustomobject]@{ sid = 'S-1-5-11'; rights = 2L; type = 'Allow'; inherited = $false })
+$unexpectedAudit = Test-AclAuditFixture $unexpectedAuditCase
+Assert-True (-not $unexpectedAudit.valid -and $unexpectedAudit.unexpected_principals -eq 1) 'Additional write-capable principal must fail closed.'
+$inheritanceAuditCase = Copy-AclAuditFixture $cleanAuditItems; $inheritanceAuditCase[0].inheritance_protected = $false
+Assert-True (-not (Test-AclAuditFixture $inheritanceAuditCase).valid) 'Unprotected runtime inheritance must fail closed.'
+$ownerAuditCase = Copy-AclAuditFixture $cleanAuditItems; $ownerAuditCase[0].owner_sid = $aclSystemSid
+Assert-True (-not (Test-AclAuditFixture $ownerAuditCase).valid) 'Incorrect runtime owner must fail closed.'
+$reparseAuditCase = Copy-AclAuditFixture $cleanAuditItems; $reparseAuditCase[0].is_reparse_point = $true
+$reparseAudit = Test-AclAuditFixture $reparseAuditCase
+Assert-True (-not $reparseAudit.valid -and $reparseAudit.reparse_points -eq 1) 'Runtime reparse point must fail closed.'
 
 $lockedWheelFixture = @(
     [pscustomobject]@{ name = 'MetaTrader5'; version = '5.0.6090'; sha256 = ('a' * 64) },
@@ -712,6 +846,16 @@ foreach ($gate in @(
     ACL_INHERITANCE_PROTECTED_REQUIRED = 'PASS'
     ACL_BROAD_GROUP_MODIFY_FAIL_CLOSED = 'PASS'
     ACL_DRY_RUN_NO_MUTATION = 'PASS'
+    FILESYSTEM_RIGHTS_SAFE_CASES = 'PASS'
+    FILESYSTEM_RIGHTS_UNSAFE_CASES = 'PASS'
+    ATOMIC_MUTATION_MASK = 'PASS'
+    GATEWAY_MUTATION_INTERSECTION_ZERO = 'PASS'
+    ACL_ALREADY_APPLIED_NO_REAPPLY = 'PASS'
+    ACL_RECURSIVE_AUDIT_EXACT = 'PASS'
+    ACL_RECURSIVE_GATEWAY_UNSAFE_FAIL_CLOSED = 'PASS'
+    ACL_RECURSIVE_AGENT_DENY_UNEXPECTED_FAIL_CLOSED = 'PASS'
+    ACL_RECURSIVE_OWNER_INHERITANCE_REPARSE_FAIL_CLOSED = 'PASS'
+    COMPOSITE_RIGHTS_ANTIPATTERN_REMOVED = 'PASS'
     FAILURE_PRESERVES_INSTALLED_RUNTIME = 'PASS'
     VENV_STAGING_AND_ROLLBACK = 'PASS'
     VENV_HASH_LOCK_ONLY = 'PASS'

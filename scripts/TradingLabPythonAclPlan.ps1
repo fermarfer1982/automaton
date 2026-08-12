@@ -1,4 +1,5 @@
 Set-StrictMode -Version 2.0
+. (Join-Path $PSScriptRoot 'TradingLabFileSystemRights.ps1')
 
 function Get-TradingLabAclPlanProperty([object] $InputObject, [string] $Name) {
     if ($null -eq $InputObject) { return $null }
@@ -150,4 +151,101 @@ function New-TradingLabRuntimeSecurityDescriptor([bool] $Directory, [object] $Pl
         ))
     }
     return $security
+}
+
+function Test-TradingLabRuntimeAclAudit(
+    [object[]] $Items,
+    [string] $ExpectedTarget,
+    [string] $SystemSid,
+    [string] $AdministratorsSid,
+    [string] $GatewaySid,
+    [string] $AgentSid,
+    [int64] $FullControlValue,
+    [int64] $GatewayReadExecuteValue
+) {
+    $findings = [System.Collections.Generic.List[string]]::new()
+    $unexpectedPrincipals = 0
+    $reparsePoints = 0
+    $canonicalTarget = [System.IO.Path]::GetFullPath($ExpectedTarget).TrimEnd('\')
+    if (@($Items).Count -eq 0) { $findings.Add('ACL_AUDIT_EMPTY') }
+
+    foreach ($item in @($Items)) {
+        $path = [string](Get-TradingLabAclPlanProperty $item 'path')
+        try {
+            $canonicalPath = [System.IO.Path]::GetFullPath($path).TrimEnd('\')
+            if (-not ($canonicalPath.Equals($canonicalTarget, [System.StringComparison]::OrdinalIgnoreCase) -or
+                $canonicalPath.StartsWith($canonicalTarget + '\', [System.StringComparison]::OrdinalIgnoreCase))) {
+                $findings.Add("ACL_AUDIT_PATH_OUTSIDE_TARGET:$path")
+            }
+        } catch { $findings.Add("ACL_AUDIT_PATH_INVALID:$path") }
+
+        if ([bool](Get-TradingLabAclPlanProperty $item 'is_reparse_point')) {
+            $reparsePoints++
+            $findings.Add("ACL_AUDIT_REPARSE_POINT:$path")
+        }
+        if ((Get-TradingLabAclPlanProperty $item 'owner_sid') -ne $AdministratorsSid) {
+            $findings.Add("ACL_AUDIT_OWNER_NOT_ADMINISTRATORS:$path")
+        }
+        if (-not [bool](Get-TradingLabAclPlanProperty $item 'inheritance_protected')) {
+            $findings.Add("ACL_AUDIT_INHERITANCE_NOT_PROTECTED:$path")
+        }
+
+        $rightsBySid = @{}
+        foreach ($rule in @((Get-TradingLabAclPlanProperty $item 'rules'))) {
+            $sid = [string](Get-TradingLabAclPlanProperty $rule 'sid')
+            $type = [string](Get-TradingLabAclPlanProperty $rule 'type')
+            $rights = [int64](Get-TradingLabAclPlanProperty $rule 'rights')
+            if ($type -eq 'Deny') {
+                $findings.Add("ACL_AUDIT_DENY_ACE:$path`:$sid")
+                continue
+            }
+            if ($type -ne 'Allow') {
+                $findings.Add("ACL_AUDIT_UNKNOWN_ACE_TYPE:$path`:$sid")
+                continue
+            }
+            if ($rightsBySid.ContainsKey($sid)) {
+                $findings.Add("ACL_AUDIT_DUPLICATE_ALLOW:$path`:$sid")
+                $rightsBySid[$sid] = $rightsBySid[$sid] -bor $rights
+            } else { $rightsBySid[$sid] = $rights }
+            if ($sid -notin @($SystemSid, $AdministratorsSid, $GatewaySid)) {
+                $unexpectedPrincipals++
+                $classification = Get-TradingLabFileSystemRightsClassification $rights
+                $findings.Add("ACL_AUDIT_UNEXPECTED_PRINCIPAL:$path`:$sid`:mutation=$($classification.modify_equivalent)")
+            }
+        }
+
+        if ($rightsBySid.ContainsKey($AgentSid)) {
+            $findings.Add("ACL_AUDIT_AGENT_ALLOW:$path")
+        }
+        if (-not $rightsBySid.ContainsKey($SystemSid) -or $rightsBySid[$SystemSid] -ne $FullControlValue) {
+            $findings.Add("ACL_AUDIT_SYSTEM_NOT_FULLCONTROL:$path")
+        }
+        if (-not $rightsBySid.ContainsKey($AdministratorsSid) -or $rightsBySid[$AdministratorsSid] -ne $FullControlValue) {
+            $findings.Add("ACL_AUDIT_ADMINISTRATORS_NOT_FULLCONTROL:$path")
+        }
+        if (-not $rightsBySid.ContainsKey($GatewaySid)) {
+            $findings.Add("ACL_AUDIT_GATEWAY_MISSING:$path")
+        } elseif ($rightsBySid[$GatewaySid] -ne $GatewayReadExecuteValue -or
+            (Test-TradingLabFileSystemRightsMutation $rightsBySid[$GatewaySid])) {
+            $findings.Add("ACL_AUDIT_GATEWAY_RIGHTS_UNSAFE:$path")
+        }
+        if ($rightsBySid.Count -ne 3) {
+            $findings.Add("ACL_AUDIT_ALLOW_PRINCIPAL_COUNT:$path`:$($rightsBySid.Count)")
+        }
+    }
+
+    $gatewayClassification = Get-TradingLabFileSystemRightsClassification $GatewayReadExecuteValue
+    return [pscustomobject]@{
+        valid = $findings.Count -eq 0
+        scanned_items = @($Items).Count
+        recursive_findings = $findings.Count
+        findings = @($findings)
+        unexpected_principals = $unexpectedPrincipals
+        reparse_points = $reparsePoints
+        gateway_rights = $GatewayReadExecuteValue
+        gateway_rights_hex = '0x' + $GatewayReadExecuteValue.ToString('X')
+        prohibited_mutation_mask = $gatewayClassification.prohibited_mutation_mask
+        prohibited_mutation_mask_hex = $gatewayClassification.prohibited_mutation_mask_hex
+        gateway_mutation_intersection = $gatewayClassification.mutation_intersection
+    }
 }

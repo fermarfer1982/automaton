@@ -196,6 +196,22 @@ owner/ACEs/herencia y enumera el árbol sin seguir junctions ni enlaces. En
 dry-run permanecen explícitamente `machine_runtime_acl_modified=false`,
 `acl_apply_requested=false` y `ACL_APPLIED=false`.
 
+La clasificación de permisos de mutación no intersecta máscaras compuestas
+como `FileSystemRights.Modify`. Usa una única máscara atómica compartida por
+los gates ACL: WriteData/CreateFiles, AppendData/CreateDirectories,
+WriteExtendedAttributes, WriteAttributes, DeleteSubdirectoriesAndFiles,
+Delete, ChangePermissions y TakeOwnership. Su valor es `852310` (`0xD0156`).
+`ReadAndExecute,Synchronize` vale `1179817` (`0x1200A9`) y su intersección con
+la máscara prohibida es cero.
+
+Si la ACL exacta ya está aplicada, `ResumeMachineRuntime` realiza una auditoría
+recursiva read-only de owner, herencia, ACEs, principals, derechos y reparse
+points. El estado pasa a
+`TARGET_RUNTIME_ACL_ALREADY_APPLIED_VALIDATION_PENDING`, fija
+`MUST_NOT_CALL_SET_ACL=true` y `ACL_REAPPLIED=false`, y completa la validación
+sin volver a invocar `Set-Acl`. Cualquier diferencia o enlace inesperado falla
+cerrado.
+
 ## Procedimiento humano elevado para el estado actual
 
 No ejecutar Automaton ni Gateway durante la recuperación. Mantener
