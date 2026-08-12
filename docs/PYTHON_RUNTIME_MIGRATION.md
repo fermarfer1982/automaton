@@ -280,14 +280,42 @@ $Installer = 'C:\ProgramData\AutomatonMT5Lab\maintenance\python-3.14.5-amd64.exe
 # Un Apply de ResumeMachineRuntime requiere autorización humana separada y solo
 # puede validar/aplicar la ACL del runtime; nunca ejecuta el bootstrapper.
 
-# 6. Construir y validar staging; el venv activo aún no cambia.
-.\scripts\Install-TradingLabPythonRuntime.ps1 -Phase BuildVenv
-.\scripts\Install-TradingLabPythonRuntime.ps1 -Phase BuildVenv -Apply
+# 6. Construir y validar staging; el venv activo aún no cambia. BuildVenv exige
+# los UUID explícitos de los dos probes PythonBaseOnly aprobados. No selecciona
+# silenciosamente el reporte más reciente.
+.\scripts\Install-TradingLabPythonRuntime.ps1 -Phase BuildVenv `
+  -GatewayPythonBaseRunId '<GATEWAY_UUID>' `
+  -AgentPythonBaseRunId '<AGENT_UUID>'
+.\scripts\Install-TradingLabPythonRuntime.ps1 -Phase BuildVenv `
+  -GatewayPythonBaseRunId '<GATEWAY_UUID>' `
+  -AgentPythonBaseRunId '<AGENT_UUID>' `
+  -Apply
 
 # 7. Promover únicamente el staging validado, con rollback administrativo.
 .\scripts\Install-TradingLabPythonRuntime.ps1 -Phase PromoteVenv
 .\scripts\Install-TradingLabPythonRuntime.ps1 -Phase PromoteVenv -Apply
 ```
+
+`BuildVenv` encadena el único reporte durable PASS no ambiguo de
+`ResumeMachineRuntime`, verifica su SHA-256 y la evidencia de instalación que
+contiene. Después valida los dos reportes `PYTHON_BASE_ONLY` por ruta canónica,
+UUID, SID, pruebas y boundaries; repite Inventory en modo `LIVE_READ_ONLY` y
+rehace la validación 27/27 del wheelhouse.
+
+El plan crea solamente `C:\automaton\.venv.new` con el Python machine-wide y
+ejecuta pip desde ese staging con `--no-index`, `--require-hashes` y
+`--only-binary=:all:`. El entorno elimina configuración pip/Python heredada y
+usa un TEMP privado de mantenimiento. `.venv` no se ejecuta, mueve, elimina ni
+modifica; su sustitución continúa siendo responsabilidad exclusiva de
+`PromoteVenv`.
+
+La validación posterior usa `python.exe -I -` y stdin, consulta las 27
+distribuciones mediante `importlib.metadata` y permite como bootstrap adicional
+solo `pip`. MetaTrader5 se comprueba por metadata y nunca se importa. También
+valida `pyvenv.cfg`, ausencia de rutas de perfiles de usuario y ACL heredada sin
+derechos de mutación para Agent/Gateway. BuildVenv nunca llama `Set-Acl`. Si un
+Apply futuro falla tras crear el staging, lo conserva para inspección y las
+ejecuciones posteriores fallan cerrado mientras `.venv.new` exista.
 
 No considerar éxito por un exit code 0 aislado. La fase final debe emitir:
 

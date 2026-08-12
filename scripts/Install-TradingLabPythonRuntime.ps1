@@ -5,6 +5,10 @@ param(
     [string] $Phase = 'Inventory',
     [string] $InstallerPath = 'C:\ProgramData\AutomatonMT5Lab\maintenance\python-3.14.5-amd64.exe',
     [string] $RegisteredBundlePath,
+    [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+    [string] $GatewayPythonBaseRunId,
+    [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+    [string] $AgentPythonBaseRunId,
     [switch] $Apply
 )
 
@@ -74,16 +78,34 @@ $report = [ordered]@{
     uninstaller_executed = $false
     venv_rebuilt = $false
     venv_promoted = $false
+    staging_venv_created = $false
+    staging_build_failed = $false
+    staging_left_for_inspection = $false
+    active_venv_modified = $false
+    active_venv_deleted = $false
+    active_venv_renamed = $false
+    active_venv_executed = $false
     current_run_applied_phase = 'NONE'
     required_previous_phase = $null
     previous_phase_verified = $false
     previous_phase_report = $null
     previous_phase_report_sha256 = $null
+    gateway_python_base_run_id = $GatewayPythonBaseRunId
+    gateway_python_base_report = $null
+    gateway_python_base_report_sha256 = $null
+    agent_python_base_run_id = $AgentPythonBaseRunId
+    agent_python_base_report = $null
+    agent_python_base_report_sha256 = $null
     old_venv_backup = $null
     mt5_accessed = $false
+    mt5_package_installed = $false
+    mt5_imported = $false
+    order_check_called = $false
+    order_send_called = $false
     automaton_started = $false
     gateway_started = $false
     acl_existing_domains_modified = $false
+    acl_modified = $false
     machine_runtime_acl_modified = $false
     acl_apply_requested = $false
     acl_applied = $false
@@ -104,12 +126,17 @@ $report = [ordered]@{
     traditional_bundle_uninstaller = $null
     traditional_msi_components = @()
     wheelhouse_validation = $null
+    runtime_verification = $null
+    build_venv_plan = $null
+    post_build_validation_plan = $null
+    post_build_validation = $null
     uninstall_plan = $null
     installer_plan = $null
     error = $null
 }
 
 . (Join-Path $PSScriptRoot 'TradingLabPythonInventory.ps1')
+. (Join-Path $PSScriptRoot 'TradingLabBuildVenvGate.ps1')
 . (Join-Path $PSScriptRoot 'TradingLabPythonAclPlan.ps1')
 . (Join-Path $PSScriptRoot 'TradingLabFileSystemRights.ps1')
 
@@ -741,6 +768,171 @@ function Get-VerifiedInstalledRuntimePendingEvidence {
     }
 }
 
+function Get-VerifiedResumeMachineRuntimeEvidence {
+    Assert-NoReparseComponents $reportDirectory
+    Assert-NoUntrustedModify $reportDirectory @(
+        $gatewaySid, $agentSid, $usersSid, $authenticatedUsersSid, $everyoneSid
+    )
+    $evidence = Find-TradingLabResumeMachineRuntimeReport `
+        $reportDirectory $expectedPythonVersion $pythonBase
+    $item = Get-Item -LiteralPath $evidence.path -Force -ErrorAction Stop
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw 'PREVIOUS_PHASE_RESUME_MACHINE_RUNTIME=FAIL: report is a reparse point.'
+    }
+    Assert-NoUntrustedModify $item.FullName @(
+        $gatewaySid, $agentSid, $usersSid, $authenticatedUsersSid, $everyoneSid
+    )
+    if ($item.Name -ne "python-runtime-$($evidence.record.run_id).json") {
+        throw 'PREVIOUS_PHASE_RESUME_MACHINE_RUNTIME=FAIL: filename/run_id mismatch.'
+    }
+
+    $installPath = Get-CanonicalPath $evidence.record.previous_phase_report
+    if (-not (Test-PathWithin $installPath $reportDirectory)) {
+        throw 'PREVIOUS_PHASE_RESUME_MACHINE_RUNTIME=FAIL: linked install report is outside the protected directory.'
+    }
+    Assert-NoReparseComponents $installPath
+    $installItem = Get-Item -LiteralPath $installPath -Force -ErrorAction Stop
+    Assert-NoUntrustedModify $installItem.FullName @(
+        $gatewaySid, $agentSid, $usersSid, $authenticatedUsersSid, $everyoneSid
+    )
+    $installHash = (Get-FileHash -LiteralPath $installItem.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($installHash -ne $evidence.record.previous_phase_report_sha256) {
+        throw 'PREVIOUS_PHASE_RESUME_MACHINE_RUNTIME=FAIL: linked install report hash mismatch.'
+    }
+    $installRecord = [System.IO.File]::ReadAllText(
+        $installItem.FullName, [System.Text.Encoding]::UTF8
+    ) | ConvertFrom-Json
+    if (-not (Test-TradingLabInstalledRuntimePendingReportRecord `
+        $installRecord $expectedPythonVersion $pythonBase $InstallerPath
+    )) { throw 'PREVIOUS_PHASE_RESUME_MACHINE_RUNTIME=FAIL: linked install evidence is invalid.' }
+
+    $installerLog = Get-CanonicalPath $evidence.record.installer_result_log
+    if (-not (Test-PathWithin $installerLog $logsRoot)) {
+        throw 'PREVIOUS_PHASE_RESUME_MACHINE_RUNTIME=FAIL: installer result log is outside the protected log directory.'
+    }
+    Assert-NoReparseComponents $installerLog
+    Assert-NoUntrustedModify $installerLog @(
+        $gatewaySid, $agentSid, $usersSid, $authenticatedUsersSid, $everyoneSid
+    )
+    $installerLogHash = (Get-FileHash -LiteralPath $installerLog -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($installerLogHash -ne $evidence.record.installer_result_log_sha256) {
+        throw 'PREVIOUS_PHASE_RESUME_MACHINE_RUNTIME=FAIL: installer result log hash mismatch.'
+    }
+    return [pscustomobject]@{
+        path = $item.FullName
+        sha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        record = $evidence.record
+    }
+}
+
+function Get-VerifiedPythonBaseRuntimeEvidence(
+    [string] $Role,
+    [string] $EvidenceRunId,
+    [string] $ExpectedSid
+) {
+    $normalized = ([guid]::ParseExact($EvidenceRunId, 'D')).ToString('D').ToLowerInvariant()
+    $root = if ($Role -eq 'AutomatonGateway') {
+        'C:\ProgramData\AutomatonMT5Lab\operational\acl-runtime-results'
+    } else { 'C:\Users\AutomatonAgent\.automaton\acl-runtime-results' }
+    $stem = if ($Role -eq 'AutomatonGateway') { 'gateway' } else { 'agent' }
+    $path = Join-Path $root "$stem-python-base-$normalized.json"
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "$($stem.ToUpperInvariant())_PYTHON_BASE_RUNTIME_EVIDENCE=FAIL: exact report is absent."
+    }
+    Assert-NoReparseComponents $path
+    if (-not (Test-PathWithin $path $root)) {
+        throw "$($stem.ToUpperInvariant())_PYTHON_BASE_RUNTIME_EVIDENCE=FAIL: report path escaped its canonical root."
+    }
+    try { $record = Read-TradingLabPythonBaseRuntimeEvidenceFile $path $Role $normalized $ExpectedSid }
+    catch { throw "$($stem.ToUpperInvariant())_$($_.Exception.Message)" }
+    return [pscustomobject]@{
+        path = Get-CanonicalPath $path
+        sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        record = $record
+    }
+}
+
+function New-BuildVenvPlan {
+    $stagingPython = Join-Path $stagingVenvPath 'Scripts\python.exe'
+    $environment = [ordered]@{
+        PIP_CONFIG_FILE = 'NUL'
+        PIP_NO_INDEX = '1'
+        PIP_DISABLE_PIP_VERSION_CHECK = '1'
+        PIP_NO_CACHE_DIR = '1'
+        PYTHONNOUSERSITE = '1'
+        PYTHONDONTWRITEBYTECODE = '1'
+        TEMP = (Join-Path $maintenanceRoot "runtime-tmp\build-venv-$runId")
+        TMP = (Join-Path $maintenanceRoot "runtime-tmp\build-venv-$runId")
+    }
+    return [ordered]@{
+        operation = 'BUILD_STAGING_VENV_OFFLINE_HASH_LOCKED'
+        base_python = $basePython
+        staging_venv = $stagingVenvPath
+        active_venv_action = 'UNTOUCHED'
+        lock_file = $lockPath
+        wheelhouse = $wheelhousePath
+        network = 'DISABLED_NO_INDEX'
+        temp_path = (Join-Path $maintenanceRoot "runtime-tmp\build-venv-$runId")
+        steps = @(
+            [ordered]@{
+                name = 'CREATE_STAGING_VENV'
+                executable = $basePython
+                arguments = @('-I', '-m', 'venv', $stagingVenvPath)
+                use_shell = $false
+                environment = $environment
+            },
+            [ordered]@{
+                name = 'INSTALL_HASH_LOCKED_WHEELS'
+                executable = $stagingPython
+                arguments = @(
+                    '-I', '-m', 'pip', 'install', '--disable-pip-version-check',
+                    '--no-input', '--no-index', '--find-links', $wheelhousePath,
+                    '--require-hashes', '--only-binary=:all:', '-r', $lockPath
+                )
+                use_shell = $false
+                environment = $environment
+            }
+        )
+    }
+}
+
+function Assert-BuildVenvPlan([object] $Plan) {
+    $state = Resolve-TradingLabBuildVenvPlanState `
+        $Plan $basePython $stagingVenvPath $lockPath $wheelhousePath $venvPath
+    if (-not $state.valid) { throw "BUILD_VENV_PLAN=FAIL: $($state.failures -join ',')" }
+    $report.gates.BUILD_VENV_PLAN = 'PASS'
+    $report.gates.BASE_PYTHON_EXACT = 'PASS'
+    $report.gates.PIP_OFFLINE_NO_INDEX = 'PASS'
+    $report.gates.PIP_REQUIRE_HASHES = 'PASS'
+    $report.gates.PIP_ONLY_BINARY = 'PASS'
+    $report.gates.PIP_NO_USER = 'PASS'
+    $report.gates.PIP_NO_URL = 'PASS'
+    $report.gates.ACTIVE_VENV_ISOLATED = 'PASS'
+}
+
+function New-PostBuildValidationPlan {
+    return [ordered]@{
+        operation = 'VALIDATE_STAGING_WITHOUT_IMPORTING_METATRADER5'
+        executable = (Join-Path $stagingVenvPath 'Scripts\python.exe')
+        arguments = @('-I', '-')
+        use_shell = $false
+        source_transport = 'STDIN'
+        imports = @('importlib.metadata', 'json', 'platform', 'site', 'sys', 'venv')
+        forbidden_imports = @('MetaTrader5')
+        expected_python_version = $expectedPythonVersion
+        expected_architecture = '64bit'
+        expected_prefix = $stagingVenvPath
+        expected_base_prefix = $pythonBase
+        expected_executable = (Join-Path $stagingVenvPath 'Scripts\python.exe')
+        expected_lock_requirements = $expectedWheelRequirementCount
+        bootstrap_distribution_allowlist = @('pip')
+        validate_pyvenv_cfg = $true
+        validate_no_user_profile_paths = $true
+        validate_service_mutation_denied = $true
+        call_set_acl = $false
+    }
+}
+
 function Set-WheelhousePassGates([object] $State) {
     $report.wheelhouse_validation = $State
     $report.gates.WHEELHOUSE_PRESENT = 'PASS'
@@ -1126,6 +1318,187 @@ function Invoke-LoggedProcess([string] $Executable, [string[]] $Arguments, [stri
     }
 }
 
+function Set-BuildVenvProcessEnvironment(
+    [System.Diagnostics.ProcessStartInfo] $StartInfo,
+    [string] $TempPath
+) {
+    foreach ($key in @($StartInfo.EnvironmentVariables.Keys)) {
+        if ([string]$key -match '^(?i:PIP_|PYTHONPATH$|PYTHONHOME$|PYTHONUSERBASE$|VIRTUAL_ENV$)') {
+            $StartInfo.EnvironmentVariables.Remove([string]$key)
+        }
+    }
+    $StartInfo.EnvironmentVariables['PIP_CONFIG_FILE'] = 'NUL'
+    $StartInfo.EnvironmentVariables['PIP_NO_INDEX'] = '1'
+    $StartInfo.EnvironmentVariables['PIP_DISABLE_PIP_VERSION_CHECK'] = '1'
+    $StartInfo.EnvironmentVariables['PIP_NO_CACHE_DIR'] = '1'
+    $StartInfo.EnvironmentVariables['PYTHONNOUSERSITE'] = '1'
+    $StartInfo.EnvironmentVariables['PYTHONDONTWRITEBYTECODE'] = '1'
+    $StartInfo.EnvironmentVariables['TEMP'] = $TempPath
+    $StartInfo.EnvironmentVariables['TMP'] = $TempPath
+}
+
+function Initialize-BuildVenvPrivateTemp([string] $Path) {
+    if (-not (Test-PathWithin $Path $maintenanceRoot)) {
+        throw 'BUILD_VENV_TEMP_CONFINEMENT=FAIL'
+    }
+    if (Test-Path -LiteralPath $Path) { throw 'BUILD_VENV_TEMP_COLLISION=FAIL' }
+    $parent = Split-Path $Path -Parent
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+        [void][System.IO.Directory]::CreateDirectory($parent)
+    }
+    Assert-NoReparseComponents $parent
+    [void][System.IO.Directory]::CreateDirectory($Path)
+    Assert-NoReparseComponents $Path
+    return Get-CanonicalPath $Path
+}
+
+function Clear-BuildVenvPrivateTemp([string] $Path) {
+    if (-not (Test-PathWithin $Path $maintenanceRoot)) { return $false }
+    if (-not (Test-Path -LiteralPath $Path)) { return $true }
+    try {
+        Assert-NoReparseComponents $Path
+        foreach ($item in Get-ChildItem -LiteralPath $Path -Force -Recurse -ErrorAction Stop) {
+            if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return $false }
+        }
+        [System.IO.Directory]::Delete($Path, $true)
+        return -not (Test-Path -LiteralPath $Path)
+    } catch { return $false }
+}
+
+function New-BuildVenvProcessStartInfo(
+    [string] $Executable,
+    [string[]] $Arguments,
+    [string] $TempPath
+) {
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $Executable
+    $startInfo.Arguments = (($Arguments | ForEach-Object { ConvertTo-ProcessArgument $_ }) -join ' ')
+    $startInfo.WorkingDirectory = $TempPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    Set-BuildVenvProcessEnvironment $startInfo $TempPath
+    return $startInfo
+}
+
+function Invoke-BuildVenvProcess(
+    [string] $Executable,
+    [string[]] $Arguments,
+    [string] $LogStem,
+    [string] $TempPath,
+    [string] $StandardInput = ''
+) {
+    $stdoutPath = New-PhaseLogPath "$LogStem-stdout"
+    $stderrPath = New-PhaseLogPath "$LogStem-stderr"
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = New-BuildVenvProcessStartInfo $Executable $Arguments $TempPath
+    try {
+        if (-not $process.Start()) { throw "BUILD_VENV_PROCESS_START_FALSE:$LogStem" }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not [string]::IsNullOrEmpty($StandardInput)) { $process.StandardInput.Write($StandardInput) }
+        $process.StandardInput.Close()
+        $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        [System.IO.File]::WriteAllText($stdoutPath, $stdout, [System.Text.UTF8Encoding]::new($false))
+        [System.IO.File]::WriteAllText($stderrPath, $stderr, [System.Text.UTF8Encoding]::new($false))
+        if ($process.ExitCode -ne 0) {
+            throw "PROCESS_EXIT_NONZERO: executable=$Executable; exit=$($process.ExitCode); stdout=$stdoutPath; stderr=$stderrPath"
+        }
+        return [pscustomobject]@{ stdout = $stdout; stderr = $stderr; exit_code = $process.ExitCode }
+    } finally { $process.Dispose() }
+}
+
+function Invoke-BuildVenvStdinJson(
+    [string] $Python,
+    [string] $Source,
+    [string] $TempPath
+) {
+    $result = Invoke-BuildVenvProcess $Python @('-I', '-') 'venv-validate' $TempPath $Source
+    if (-not [string]::IsNullOrWhiteSpace($result.stderr)) {
+        throw 'STAGING_VALIDATION_STDERR=FAIL: see durable validation log.'
+    }
+    try { return $result.stdout.Trim() | ConvertFrom-Json }
+    catch { throw 'STAGING_VALIDATION_JSON=FAIL: Python metadata was not valid JSON.' }
+}
+
+function Assert-StagingVenv([string] $Root, [string] $TempPath) {
+    if (-not (Test-TradingLabInventoryExactPath $Root $stagingVenvPath)) {
+        throw 'STAGING_TARGET_EXACT=FAIL'
+    }
+    Assert-NoReparseComponents $Root
+    $python = Join-Path $Root 'Scripts\python.exe'
+    $metadata = Invoke-BuildVenvStdinJson $python @'
+import importlib.metadata
+import json
+import platform
+import site
+import sys
+import venv
+distributions = []
+for distribution in importlib.metadata.distributions():
+    name = distribution.metadata.get("Name")
+    if name:
+        distributions.append({"name": name, "version": distribution.version})
+print(json.dumps({
+    "architecture": platform.architecture()[0],
+    "base_prefix": sys.base_prefix,
+    "distributions": sorted(distributions, key=lambda item: item["name"].lower()),
+    "executable": sys.executable,
+    "prefix": sys.prefix,
+    "sys_path": sys.path,
+    "user_site_enabled": bool(site.ENABLE_USER_SITE),
+    "venv_import": True,
+    "version": platform.python_version(),
+}, sort_keys=True, separators=(",", ":")))
+'@ $TempPath
+    if ($metadata.version -ne $expectedPythonVersion) { throw 'STAGING_PYTHON_VERSION=FAIL' }
+    if ($metadata.architecture -ne '64bit') { throw 'STAGING_PYTHON_ARCH=FAIL' }
+    if (-not (Test-TradingLabInventoryExactPath $metadata.prefix $Root)) { throw 'STAGING_PREFIX=FAIL' }
+    if (-not (Test-TradingLabInventoryExactPath $metadata.base_prefix $pythonBase)) { throw 'STAGING_BASE_PREFIX=FAIL' }
+    if (-not (Test-TradingLabInventoryExactPath $metadata.executable $python)) { throw 'STAGING_EXECUTABLE=FAIL' }
+    if (-not [bool]$metadata.venv_import) { throw 'STAGING_VENV_IMPORT=FAIL' }
+    if ([bool]$metadata.user_site_enabled) { throw 'STAGING_USER_SITE_ACTIVE=FAIL' }
+    foreach ($path in @($metadata.sys_path)) {
+        if ([string]$path -match '(?i)^C:\\Users\\') { throw 'STAGING_NO_USER_PROFILE_DEPENDENCY=FAIL' }
+    }
+    $cfgPath = Join-Path $Root 'pyvenv.cfg'
+    $cfg = [System.IO.File]::ReadAllText($cfgPath, [System.Text.Encoding]::UTF8)
+    if ($cfg -match '(?i)[a-z]:\\users\\' -or
+        $cfg -notmatch ('(?im)^\s*home\s*=\s*' + [regex]::Escape($pythonBase) + '\s*$')) {
+        throw 'STAGING_PYVENV_CFG=FAIL'
+    }
+    $distributionState = Resolve-TradingLabStagingDistributionState `
+        (Get-LockedWheelManifest) @($metadata.distributions) @('pip')
+    if (-not $distributionState.valid) {
+        throw "STAGING_DISTRIBUTIONS=FAIL: missing=$(@($distributionState.missing_requirements).Count); mismatch=$(@($distributionState.version_mismatches).Count); unexpected=$(@($distributionState.unexpected_distributions).Count); duplicate=$(@($distributionState.duplicate_distributions).Count)"
+    }
+    if (-not $distributionState.metatrader5_metadata) { throw 'STAGING_METATRADER5_METADATA=FAIL' }
+    Assert-TreeNotModifiableByServices $Root
+    $report.post_build_validation = [ordered]@{
+        metadata = $metadata
+        distributions = $distributionState
+        pyvenv_cfg = 'PASS_MACHINE_BASE_NO_USER_PROFILE'
+        service_mutation_rights = 'DENY_PASS'
+    }
+    $report.gates.STAGING_PYTHON_VERSION = 'PASS'
+    $report.gates.STAGING_PYTHON_ARCH = 'PASS'
+    $report.gates.STAGING_PREFIX = 'PASS'
+    $report.gates.STAGING_BASE_PREFIX = 'PASS'
+    $report.gates.STAGING_EXECUTABLE = 'PASS'
+    $report.gates.STAGING_NO_USER_PROFILE_DEPENDENCY = 'PASS'
+    $report.gates.STAGING_LOCK_REQUIREMENTS = $distributionState.expected_requirements
+    $report.gates.STAGING_MISSING_REQUIREMENTS = @($distributionState.missing_requirements).Count
+    $report.gates.STAGING_VERSION_MISMATCHES = @($distributionState.version_mismatches).Count
+    $report.gates.STAGING_UNEXPECTED_DISTRIBUTIONS = @($distributionState.unexpected_distributions).Count
+    $report.gates.STAGING_METATRADER5_METADATA = 'PASS'
+    $report.gates.STAGING_SERVICE_MUTATION_DENY = 'PASS'
+    return $metadata
+}
+
 function Start-LoggedInstaller([string] $Executable, [string[]] $Arguments, [string] $LogPath) {
     $allArguments = @($Arguments) + @('/log', $LogPath)
     $argumentLine = (($allArguments | ForEach-Object { ConvertTo-ProcessArgument $_ }) -join ' ')
@@ -1291,6 +1664,7 @@ function Complete-InstalledMachineRuntime([object] $Inventory) {
     $report.current_run_applied_phase = 'MachineRuntimeAclRecoveryRequested'
     Protect-ExactRuntimeTree $pythonBase $aclPlan
     $report.machine_runtime_acl_modified = $true
+    $report.acl_modified = $true
     $report.acl_applied = $true
     $report.acl_reapplied = $true
     $postApplyAudit = Assert-ExactBaseAcl $pythonBase
@@ -1328,11 +1702,49 @@ function Write-MutationBoundarySummary {
     Write-Output "ACL_REAPPLIED=$($report.acl_reapplied.ToString().ToLowerInvariant())"
     Write-Output "SET_ACL_CALL_COUNT=$($report.set_acl_call_count)"
     Write-Output "installer_executed=$($report.installer_executed.ToString().ToLowerInvariant())"
+    Write-Output "STAGING_VENV_CREATED=$($report.staging_venv_created.ToString().ToLowerInvariant())"
+    Write-Output "STAGING_BUILD_FAILED=$($report.staging_build_failed.ToString().ToLowerInvariant())"
+    Write-Output "STAGING_LEFT_FOR_INSPECTION=$($report.staging_left_for_inspection.ToString().ToLowerInvariant())"
     Write-Output "VENV_REBUILT=$($report.venv_rebuilt.ToString().ToLowerInvariant())"
     Write-Output "VENV_PROMOTED=$($report.venv_promoted.ToString().ToLowerInvariant())"
+    Write-Output "ACTIVE_VENV_MODIFIED=$($report.active_venv_modified.ToString().ToLowerInvariant())"
+    Write-Output "ACTIVE_VENV_DELETED=$($report.active_venv_deleted.ToString().ToLowerInvariant())"
+    Write-Output "ACTIVE_VENV_RENAMED=$($report.active_venv_renamed.ToString().ToLowerInvariant())"
+    Write-Output "ACTIVE_VENV_EXECUTED=$($report.active_venv_executed.ToString().ToLowerInvariant())"
+    Write-Output "MT5_IMPORTED=$($report.mt5_imported.ToString().ToLowerInvariant())"
     Write-Output "MT5_ACCESSED=$($report.mt5_accessed.ToString().ToLowerInvariant())"
+    Write-Output "ORDER_CHECK_CALLED=$($report.order_check_called.ToString().ToLowerInvariant())"
+    Write-Output "ORDER_SEND_CALLED=$($report.order_send_called.ToString().ToLowerInvariant())"
+    Write-Output "ORDER_CHECK=$($report.order_check_called.ToString().ToLowerInvariant())"
+    Write-Output "ORDER_SEND=$($report.order_send_called.ToString().ToLowerInvariant())"
+    Write-Output "ACL_MODIFIED=$($report.acl_modified.ToString().ToLowerInvariant())"
     Write-Output "GATEWAY_STARTED=$($report.gateway_started.ToString().ToLowerInvariant())"
     Write-Output "AUTOMATON_STARTED=$($report.automaton_started.ToString().ToLowerInvariant())"
+}
+
+function Write-BuildVenvPreflightSummary {
+    if ($Phase -ne 'BuildVenv' -or $null -eq $report.build_venv_plan) { return }
+    Write-Output "required_previous_phase=$($report.required_previous_phase)"
+    Write-Output "previous_phase_verified=$($report.previous_phase_verified.ToString().ToLowerInvariant())"
+    Write-Output "previous_phase_report=$($report.previous_phase_report)"
+    Write-Output "previous_phase_report_sha256=$($report.previous_phase_report_sha256)"
+    Write-Output "GATEWAY_PYTHON_BASE_REPORT=$($report.gateway_python_base_report)"
+    Write-Output "GATEWAY_PYTHON_BASE_REPORT_SHA256=$($report.gateway_python_base_report_sha256)"
+    Write-Output "AGENT_PYTHON_BASE_REPORT=$($report.agent_python_base_report)"
+    Write-Output "AGENT_PYTHON_BASE_REPORT_SHA256=$($report.agent_python_base_report_sha256)"
+    Write-Output "RUNTIME_EVIDENCE_MODE=$($report.runtime_verification.evidence_source)"
+    Write-Output "COMPLETED_TARGET_RUNTIME=$($report.inventory_before.completed_target_runtime)"
+    Write-Output "RUNTIME_VERIFICATION=$($report.runtime_verification.status)"
+    Write-Output "PREVALIDATION=$($report.inventory_before.prevalidation)"
+    Write-Output "WHEELHOUSE_EXPECTED_REQUIREMENTS=$($report.wheelhouse_validation.expected_requirements)"
+    Write-Output "WHEELHOUSE_ARTIFACT_COUNT=$($report.wheelhouse_validation.artifact_count)"
+    Write-Output "WHEELHOUSE_MISSING_REQUIREMENTS=$(@($report.wheelhouse_validation.missing_requirements).Count)"
+    Write-Output "WHEELHOUSE_CORRUPT_ARTIFACTS=$(@($report.wheelhouse_validation.corrupt_artifacts).Count)"
+    Write-Output "WHEELHOUSE_SOURCE_DISTRIBUTIONS=$(@($report.wheelhouse_validation.source_distributions).Count)"
+    Write-Output "WHEELHOUSE_UNEXPECTED_ARTIFACTS=$(@($report.wheelhouse_validation.unexpected_artifacts).Count)"
+    Write-Output "WHEELHOUSE_DUPLICATE_REQUIREMENTS=$(@($report.wheelhouse_validation.duplicate_requirements).Count)"
+    Write-Output "build_venv_plan=$($report.build_venv_plan | ConvertTo-Json -Depth 8 -Compress)"
+    Write-Output "post_build_validation_plan=$($report.post_build_validation_plan | ConvertTo-Json -Depth 8 -Compress)"
 }
 
 function Write-UninstallPreflightSummary {
@@ -1581,6 +1993,7 @@ try {
             $report.acl_apply_requested = $true
             Protect-ExactRuntimeTree $pythonBase $aclPlan
             $report.machine_runtime_acl_modified = $true
+            $report.acl_modified = $true
             $report.acl_applied = $true
             $freshAclAudit = Assert-ExactBaseAcl $pythonBase
             Set-MachineRuntimePassGates $metadata
@@ -1595,34 +2008,92 @@ try {
             Complete-InstalledMachineRuntime $inventory
         }
         'BuildVenv' {
+            if ([string]::IsNullOrWhiteSpace($GatewayPythonBaseRunId) -or
+                [string]::IsNullOrWhiteSpace($AgentPythonBaseRunId)) {
+                throw 'PYTHON_BASE_RUNTIME_RUN_IDS_REQUIRED=FAIL: supply both explicit UUIDs.'
+            }
+            $report.must_not_execute_installer = $true
+            $report.must_not_call_set_acl = $true
+            $report.gates.MUST_NOT_EXECUTE_INSTALLER = 'true'
+            $report.gates.INSTALLER_REEXECUTED = 'false'
+            $report.gates.MUST_NOT_CALL_SET_ACL = 'true'
+            $report.gates.SET_ACL_CALL_COUNT = 0
+
+            $previousEvidence = Get-VerifiedResumeMachineRuntimeEvidence
+            $report.required_previous_phase = 'ResumeMachineRuntime'
+            $report.previous_phase_verified = $true
+            $report.previous_phase_report = $previousEvidence.path
+            $report.previous_phase_report_sha256 = $previousEvidence.sha256
+            $report.gates.PREVIOUS_PHASE_RESUME_MACHINE_RUNTIME = 'PASS'
+
+            $gatewayEvidence = Get-VerifiedPythonBaseRuntimeEvidence `
+                'AutomatonGateway' $GatewayPythonBaseRunId $gatewaySid
+            $report.gateway_python_base_run_id = $gatewayEvidence.record.run_id
+            $report.gateway_python_base_report = $gatewayEvidence.path
+            $report.gateway_python_base_report_sha256 = $gatewayEvidence.sha256
+            $report.gates.GATEWAY_PYTHON_BASE_RUNTIME_EVIDENCE = 'PASS'
+            $agentEvidence = Get-VerifiedPythonBaseRuntimeEvidence `
+                'AutomatonAgent' $AgentPythonBaseRunId $agentSid
+            $report.agent_python_base_run_id = $agentEvidence.record.run_id
+            $report.agent_python_base_report = $agentEvidence.path
+            $report.agent_python_base_report_sha256 = $agentEvidence.sha256
+            $report.gates.AGENT_PYTHON_BASE_RUNTIME_EVIDENCE = 'PASS'
+
             Assert-FinalVerifiedMachineRuntimeInventory $inventory
             Assert-MachineInstallationInventory $inventory
-            [void](Assert-BasePython $basePython)
-            [void](Assert-Wheelhouse $wheelhousePath)
+            $report.runtime_verification = $inventory.runtime_verification
+            $report.gates.COMPLETED_TARGET_RUNTIME = 'PRESENT_VERIFIED'
+            $report.gates.RUNTIME_VERIFICATION = 'VERIFIED'
+            $report.gates.PREVALIDATION = 'PASS'
+            $report.gates.RUNTIME_EVIDENCE_MODE = 'LIVE_READ_ONLY'
+            $baseMetadata = Assert-BasePython $basePython
+            Set-MachineRuntimePassGates $baseMetadata
+            $baseAcl = Assert-ExactBaseAcl $pythonBase
+            Set-MachineRuntimeAclPassGates $baseAcl
+
+            $wheelhouseState = Assert-Wheelhouse $wheelhousePath
+            Set-WheelhousePassGates $wheelhouseState
             if (Test-Path -LiteralPath $stagingVenvPath) {
-                [void](Assert-Venv $stagingVenvPath)
+                throw 'STAGING_VENV_ABSENT=FAIL: existing staging requires separate human inspection/removal authorization.'
+            }
+            $report.gates.STAGING_VENV_ABSENT = 'PASS'
+            $report.build_venv_plan = New-BuildVenvPlan
+            Assert-BuildVenvPlan $report.build_venv_plan
+            $report.post_build_validation_plan = New-PostBuildValidationPlan
+            if (-not $Apply) { break }
+            if (-not $report.previous_phase_verified -or
+                $report.required_previous_phase -ne 'ResumeMachineRuntime') {
+                throw 'PREVIOUS_PHASE_RESUME_MACHINE_RUNTIME=FAIL: BuildVenv Apply lacks durable authorization evidence.'
+            }
+            Initialize-PhaseStorage
+            $tempPath = Initialize-BuildVenvPrivateTemp $report.build_venv_plan.temp_path
+            try {
+                $report.current_run_applied_phase = 'BuildVenvRequested'
+                $createStep = $report.build_venv_plan.steps[0]
+                [void](Invoke-BuildVenvProcess $createStep.executable `
+                    @($createStep.arguments) 'venv-create' $tempPath)
+                $report.staging_venv_created = Test-Path -LiteralPath $stagingVenvPath -PathType Container
+                if (-not $report.staging_venv_created) { throw 'STAGING_VENV_CREATED=FAIL' }
+                $installStep = $report.build_venv_plan.steps[1]
+                [void](Invoke-BuildVenvProcess $installStep.executable `
+                    @($installStep.arguments) 'venv-install' $tempPath)
+                [void](Assert-StagingVenv $stagingVenvPath $tempPath)
+                $report.current_run_applied_phase = 'BuildVenv'
+                $report.venv_rebuilt = $true
+                $report.mt5_package_installed = $true
                 $report.gates.VENV_BASE_OUTSIDE_USER_PROFILE = 'PASS'
                 $report.gates.VENV_LOCK_MATCH = 'PASS'
                 $report.gates.META_TRADER5_PACKAGE_PRESENT = 'PASS'
-                if ($Apply) { Initialize-PhaseStorage; $report.current_run_applied_phase = 'BuildVenvAlreadyComplete' }
-                break
+            } catch {
+                $report.staging_build_failed = $true
+                $report.staging_left_for_inspection = Test-Path -LiteralPath $stagingVenvPath
+                $report.staging_venv_created = $report.staging_left_for_inspection
+                throw
+            } finally {
+                if (-not (Clear-BuildVenvPrivateTemp $tempPath)) {
+                    Write-Warning 'BuildVenv private TEMP cleanup failed; staging was not promoted or removed.'
+                }
             }
-            if (-not $Apply) { break }
-            Initialize-PhaseStorage
-            $report.current_run_applied_phase = 'BuildVenvRequested'
-            Invoke-LoggedProcess $basePython @('-I', '-m', 'venv', $stagingVenvPath) 'venv-create'
-            $stagingPython = Join-Path $stagingVenvPath 'Scripts\python.exe'
-            Invoke-LoggedProcess $stagingPython @(
-                '-I', '-m', 'pip', 'install', '--disable-pip-version-check', '--no-input',
-                '--no-index', '--find-links', $wheelhousePath, '--only-binary=:all:',
-                '--require-hashes', '-r', $lockPath
-            ) 'venv-install'
-            [void](Assert-Venv $stagingVenvPath)
-            $report.current_run_applied_phase = 'BuildVenv'
-            $report.venv_rebuilt = $true
-            $report.gates.VENV_BASE_OUTSIDE_USER_PROFILE = 'PASS'
-            $report.gates.VENV_LOCK_MATCH = 'PASS'
-            $report.gates.META_TRADER5_PACKAGE_PRESENT = 'PASS'
         }
         'PromoteVenv' {
             Assert-MachineInstallationInventory $inventory
@@ -1687,6 +2158,7 @@ try {
         Write-Gates
         Write-UninstallPreflightSummary
         Write-InstallMachineRuntimePreflightSummary
+        Write-BuildVenvPreflightSummary
         Write-Output "PYTHON_RECOVERY_PHASE=$Phase"
         Write-Output "MUST_NOT_EXECUTE_INSTALLER=$($report.must_not_execute_installer.ToString().ToLowerInvariant())"
         Write-Output "INSTALLER_REEXECUTED=$($report.installer_reexecuted.ToString().ToLowerInvariant())"
@@ -1697,6 +2169,7 @@ try {
     $report.status = 'PASS'
     Write-Report
     Write-Gates
+    Write-BuildVenvPreflightSummary
     Write-Output "PYTHON_RECOVERY_PHASE=$Phase"
     Write-Output "MUST_NOT_EXECUTE_INSTALLER=$($report.must_not_execute_installer.ToString().ToLowerInvariant())"
     Write-Output "INSTALLER_REEXECUTED=$($report.installer_reexecuted.ToString().ToLowerInvariant())"

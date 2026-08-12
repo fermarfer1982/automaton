@@ -41,6 +41,7 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn('"scripts/Collect-RuntimeAclResults.ps1"', source)
         self.assertIn('"scripts/Install-TradingLabPythonRuntime.ps1"', source)
         self.assertIn('"scripts/TradingLabPythonInventory.ps1"', source)
+        self.assertIn('"scripts/TradingLabBuildVenvGate.ps1"', source)
         self.assertIn('"scripts/Initialize-GatewayPythonEnvironment.ps1"', source)
         self.assertIn('"scripts/Resolve-TradingLabNode.ps1"', source)
         self.assertIn('"docs/SECURITY_INVARIANTS.md"', source)
@@ -273,6 +274,7 @@ class SourceBoundaryTests(unittest.TestCase):
                 "Collect-RuntimeAclResults.ps1",
                 "Install-TradingLabPythonRuntime.ps1",
                 "TradingLabPythonInventory.ps1",
+                "TradingLabBuildVenvGate.ps1",
                 "TradingLabPythonAclPlan.ps1",
                 "TradingLabFileSystemRights.ps1",
                 "Initialize-GatewayPythonEnvironment.ps1",
@@ -297,7 +299,7 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn("C:\\Program Files\\AutomatonPython\\3.14.5", installer)
         self.assertIn("Assert-OutsideUserProfiles", installer)
         self.assertIn(
-            "Invoke-LoggedProcess $basePython @('-I', '-m', 'venv', $stagingVenvPath)",
+            "Invoke-BuildVenvProcess $createStep.executable",
             installer,
         )
         self.assertIn("SAME_VERSION_TRADITIONAL_INSTALL_PRESENT=FAIL", installer)
@@ -372,8 +374,36 @@ class SourceBoundaryTests(unittest.TestCase):
         build = installer[build_start:build_end]
         self.assertLess(
             build.index("Assert-FinalVerifiedMachineRuntimeInventory $inventory"),
-            build.index("Invoke-LoggedProcess $basePython"),
+            build.index("Invoke-BuildVenvProcess $createStep.executable"),
         )
+        self.assertIn("$report.required_previous_phase = 'ResumeMachineRuntime'", build)
+        self.assertIn("Get-VerifiedPythonBaseRuntimeEvidence", build)
+        self.assertIn("STAGING_VENV_ABSENT=FAIL", build)
+        self.assertNotIn("Set-Acl", build)
+        self.assertNotIn("import MetaTrader5", build)
+        build_gate = (ROOT / "scripts" / "TradingLabBuildVenvGate.ps1").read_text(
+            encoding="utf-8"
+        )
+        for required in (
+            "PYTHON_BASE_ONLY",
+            "BUILD_STAGING_VENV_OFFLINE_HASH_LOCKED",
+            "--no-index",
+            "--require-hashes",
+            "--only-binary=:all:",
+            "PIP_CONFIG_FILE",
+            "PYTHONNOUSERSITE",
+        ):
+            self.assertIn(required, build_gate)
+        for forbidden in (
+            "import MetaTrader5",
+            ".initialize(",
+            ".login(",
+            ".order_check(",
+            ".order_send(",
+            "https://",
+            "Set-Acl",
+        ):
+            self.assertNotIn(forbidden, build_gate)
         self.assertIn("Assert-PythonManagerPreserved", installer)
         self.assertNotIn("WriteAllText((Join-Path $Root 'pyvenv.cfg')", installer)
         setup = service_files[0].read_text(encoding="utf-8")

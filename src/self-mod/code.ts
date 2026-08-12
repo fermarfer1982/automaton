@@ -108,6 +108,7 @@ const PROTECTED_FILES: readonly string[] = Object.freeze([
   "scripts/Collect-RuntimeAclResults.ps1",
   "scripts/Install-TradingLabPythonRuntime.ps1",
   "scripts/TradingLabPythonInventory.ps1",
+  "scripts/TradingLabBuildVenvGate.ps1",
   "scripts/Initialize-GatewayPythonEnvironment.ps1",
   "scripts/Resolve-TradingLabNode.ps1",
   "scripts/setup.ps1",
