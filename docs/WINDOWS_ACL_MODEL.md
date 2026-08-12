@@ -1,10 +1,11 @@
 # Modelo ACL Windows del laboratorio
 
-Este documento describe el ACL **propuesto** por
-`scripts\Initialize-TradingLabAcl.ps1`. Hasta ejecutar manualmente el script
-con `-Apply`, estas garantías no son efectivas. En particular, el workspace
-actual hereda `Authenticated Users: Modify`; no debe iniciarse Automaton ni el
-Gateway bajo sus identidades dedicadas mientras esa exposición exista.
+Este documento describe el ACL aplicado manualmente mediante
+`scripts\Apply-TradingLabAclGate.ps1`. El reporte administrativo de aplicación
+confirma `ACL_PREVALIDATION=PASS`, `ACL_APPLY=PASS` y `ACL_APPLIED=true`. La
+efectividad bajo los tokens restringidos permanece pendiente hasta completar
+el gate runtime descrito al final de este documento. Automaton y Gateway deben
+permanecer detenidos hasta entonces.
 
 ## Convenciones
 
@@ -88,7 +89,7 @@ la apertura Python solicita `WriteData`, el Gateway debe permanecer detenido;
 no se ampliarán permisos automáticamente. La alternativa requerirá revisión
 humana (por ejemplo, un escritor de auditoría separado en un milestone futuro).
 
-## Matriz real pendiente tras `-Apply`
+## Matriz runtime pendiente tras `-Apply`
 
 | Identidad | Operación | Resultado requerido |
 |---|---|---|
@@ -107,6 +108,30 @@ humana (por ejemplo, un escritor de auditoría separado en un milestone futuro).
 | Gateway | append security log / truncar-borrar-reemplazar | ALLOW / DENY |
 | Gateway | leer o escribir estado Agent | DENY |
 | Administrator elevado | mantenimiento y recuperación | ALLOW |
+
+## Gate runtime manual
+
+Los scripts `Test-AgentRuntimeAcl.ps1` y `Test-GatewayRuntimeAcl.ps1` abortan
+antes de cualquier acceso si el SID efectivo no coincide exactamente con la
+identidad prevista o si reciben un token administrativo. No aceptan ni
+almacenan contraseñas. Un mismo UUID público vincula ambos reportes y la
+recopilación administrativa final.
+
+Los canarios mutables se limitan al estado privado del Agent y a los dominios
+`operational`, `research` y `audit\sqlite` del Gateway. El journal y el log de
+seguridad reciben un único append identificable y durable; esos eventos no se
+eliminan. Las comprobaciones de overwrite, truncate, delete, rename, replace y
+change-ACL sobre ficheros protegidos abren un handle solicitando el derecho
+NTFS correspondiente, pero nunca ejecutan la mutación si el derecho resulta
+inesperadamente concedido. Esa situación produce `CRITICAL_FAIL` y detiene el
+test Gateway.
+
+`Collect-RuntimeAclResults.ps1` debe ejecutarse después desde una consola
+elevada. Verifica el SID y UUID de ambos reportes, que no existan campos de
+secretos, el prefijo byte a byte mediante tamaño y SHA-256, el sufijo canario
+exacto, la cadena hash completa del journal y `TRADING_MODE=OBSERVE_ONLY`.
+Ninguno de estos scripts importa MetaTrader5, inicia el laboratorio, usa red,
+modifica ACL/grupos o habilita trading.
 
 Las claves LLM se configurarán más adelante solo para `AutomatonAgent`, en un
 almacén de credenciales o entorno de usuario protegido, nunca en workspace,

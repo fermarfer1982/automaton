@@ -1,0 +1,281 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+    [string] $RunId
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version 2.0
+
+$expectedSid = 'S-1-5-21-568964486-193631783-1609210587-1006'
+$effectiveIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$effectiveSid = $effectiveIdentity.User.Value
+if ($effectiveSid -ne $expectedSid) {
+    throw "Wrong runtime identity. Expected SID $expectedSid; received $effectiveSid. No tests were run."
+}
+$principal = [System.Security.Principal.WindowsPrincipal]::new($effectiveIdentity)
+if ($principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'AutomatonAgent runtime ACL tests refuse an administrative token.'
+}
+
+if (-not ('Automaton.RuntimeAcl.AgentNativeMethods' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace Automaton.RuntimeAcl {
+    public static class AgentNativeMethods {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern SafeFileHandle CreateFile(
+            string fileName,
+            uint desiredAccess,
+            uint shareMode,
+            IntPtr securityAttributes,
+            uint creationDisposition,
+            uint flagsAndAttributes,
+            IntPtr templateFile
+        );
+    }
+}
+'@
+}
+
+$FILE_LIST_DIRECTORY = [uint32]1
+$FILE_WRITE_DATA = [uint32]2
+$FILE_ADD_FILE = [uint32]2
+$FILE_DELETE_CHILD = [uint32]64
+$DELETE = [uint32]65536
+$WRITE_DAC = [uint32]262144
+$OPEN_EXISTING = [uint32]3
+$FILE_ATTRIBUTE_NORMAL = [uint32]128
+$FILE_FLAG_BACKUP_SEMANTICS = [uint32]33554432
+$SHARE_ALL = [uint32]7
+
+$workspace = 'C:\automaton'
+$labRoot = 'C:\ProgramData\AutomatonMT5Lab'
+$configPath = Join-Path $labRoot 'control\trading.yaml'
+$controlPath = Join-Path $labRoot 'control'
+$demoAuthorizationPath = Join-Path $controlPath 'demo-authorization'
+$demoAuthorizationFile = Join-Path $demoAuthorizationPath 'authorization.json'
+$killSwitchPath = Join-Path $controlPath 'STOP_TRADING'
+$ipcKeyPath = Join-Path $labRoot 'ipc\automaton.key'
+$operationalPath = Join-Path $labRoot 'operational'
+$researchPath = Join-Path $labRoot 'research'
+$auditSqlitePath = Join-Path $labRoot 'audit\sqlite'
+$auditJournalPath = Join-Path $labRoot 'audit\journal\audit.jsonl'
+$securityLogPath = Join-Path $labRoot 'logs\security\security.log'
+$agentStatePath = 'C:\Users\AutomatonAgent\.automaton'
+$normalizedRunId = $RunId.ToLowerInvariant()
+$reportPath = Join-Path $agentStatePath "acl-runtime-results\agent-$normalizedRunId.json"
+$tests = [ordered]@{}
+$unexpectedProtectedAccess = $false
+
+function Add-TestResult(
+    [string] $Name,
+    [string] $Expected,
+    [string] $Observed,
+    [string] $Evidence
+) {
+    $script:tests[$Name] = [ordered]@{
+        expected = $Expected
+        observed = $Observed
+        passed = ($Expected -eq $Observed)
+        evidence = $Evidence
+    }
+    if ($Expected -ne $Observed -and $Observed -eq 'ALLOW') {
+        $script:unexpectedProtectedAccess = $true
+    }
+}
+
+function Invoke-NativeAccessProbe(
+    [string] $Path,
+    [uint32] $DesiredAccess,
+    [bool] $Directory
+) {
+    $flags = if ($Directory) { $FILE_FLAG_BACKUP_SEMANTICS } else { $FILE_ATTRIBUTE_NORMAL }
+    $handle = [Automaton.RuntimeAcl.AgentNativeMethods]::CreateFile(
+        $Path, $DesiredAccess, $SHARE_ALL, [IntPtr]::Zero,
+        $OPEN_EXISTING, $flags, [IntPtr]::Zero
+    )
+    if ($handle.IsInvalid) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        $handle.Dispose()
+        return [pscustomobject]@{ Allowed = $false; ErrorCode = $errorCode }
+    }
+    $handle.Dispose()
+    return [pscustomobject]@{ Allowed = $true; ErrorCode = 0 }
+}
+
+function Add-DeniedRightTest(
+    [string] $Name,
+    [string] $Path,
+    [uint32] $Right,
+    [bool] $Directory
+) {
+    $probe = Invoke-NativeAccessProbe $Path $Right $Directory
+    if ($probe.Allowed) {
+        Add-TestResult $Name 'DENY' 'ALLOW' 'PROTECTED_RIGHT_GRANTED_NO_MUTATION_PERFORMED'
+    } elseif ($probe.ErrorCode -eq 5) {
+        Add-TestResult $Name 'DENY' 'DENY' 'WIN32_ACCESS_DENIED'
+    } else {
+        Add-TestResult $Name 'DENY' 'ERROR' "WIN32_ERROR_$($probe.ErrorCode)"
+    }
+}
+
+function Add-AllowedFileReadTest(
+    [string] $Name,
+    [string] $Path,
+    [bool] $RequireNonEmpty
+) {
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+        )
+        $valid = (-not $RequireNonEmpty) -or ($stream.Length -gt 0)
+        if ($valid) {
+            Add-TestResult $Name 'ALLOW' 'ALLOW' 'READ_SUCCEEDED_CONTENT_NOT_REPORTED'
+        } else {
+            Add-TestResult $Name 'ALLOW' 'ERROR' 'READ_SUCCEEDED_BUT_FILE_EMPTY'
+        }
+    } catch [System.UnauthorizedAccessException] {
+        Add-TestResult $Name 'ALLOW' 'DENY' 'WIN32_ACCESS_DENIED'
+    } catch {
+        Add-TestResult $Name 'ALLOW' 'ERROR' $_.Exception.GetType().Name
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
+
+function Add-DeniedCanaryCreateTest([string] $Name, [string] $Path) {
+    $stream = $null
+    $created = $false
+    try {
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
+        $created = $true
+        Add-TestResult $Name 'DENY' 'ALLOW' 'TEST_CANARY_CREATION_UNEXPECTEDLY_ALLOWED'
+    } catch [System.UnauthorizedAccessException] {
+        Add-TestResult $Name 'DENY' 'DENY' 'WIN32_ACCESS_DENIED'
+    } catch {
+        Add-TestResult $Name 'DENY' 'ERROR' $_.Exception.GetType().Name
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        if ($created) {
+            try { [System.IO.File]::Delete($Path) } catch { $script:unexpectedProtectedAccess = $true }
+        }
+    }
+}
+
+function Add-AgentStateCanaryTest([string] $Path) {
+    $canaryPath = Join-Path $Path "acl-runtime-$normalizedRunId.canary"
+    $expected = "AUTOMATON_AGENT_RUNTIME_ACL_CANARY:$normalizedRunId"
+    try {
+        [System.IO.Directory]::CreateDirectory($Path) | Out-Null
+        [System.IO.File]::WriteAllText(
+            $canaryPath, $expected, [System.Text.UTF8Encoding]::new($false)
+        )
+        $actual = [System.IO.File]::ReadAllText($canaryPath, [System.Text.Encoding]::UTF8)
+        if ($actual -ne $expected) { throw 'CANARY_ROUNDTRIP_MISMATCH' }
+        [System.IO.File]::Delete($canaryPath)
+        if ([System.IO.File]::Exists($canaryPath)) { throw 'CANARY_DELETE_FAILED' }
+        Add-TestResult 'STATE_CREATE_WRITE_READ_DELETE' 'ALLOW' 'ALLOW' 'CANARY_ROUNDTRIP_AND_CLEANUP_SUCCEEDED'
+    } catch [System.UnauthorizedAccessException] {
+        Add-TestResult 'STATE_CREATE_WRITE_READ_DELETE' 'ALLOW' 'DENY' 'WIN32_ACCESS_DENIED'
+    } catch {
+        Add-TestResult 'STATE_CREATE_WRITE_READ_DELETE' 'ALLOW' 'ERROR' $_.Exception.GetType().Name
+        try { if ([System.IO.File]::Exists($canaryPath)) { [System.IO.File]::Delete($canaryPath) } } catch {}
+    }
+}
+
+function Write-ExclusiveJsonReport([string] $Path, [object] $Value) {
+    $parent = [System.IO.Path]::GetDirectoryName($Path)
+    [System.IO.Directory]::CreateDirectory($parent) | Out-Null
+    $json = $Value | ConvertTo-Json -Depth 8
+    $stream = [System.IO.File]::Open(
+        $Path,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::Read
+    )
+    try {
+        $writer = [System.IO.StreamWriter]::new($stream, [System.Text.UTF8Encoding]::new($false))
+        try { $writer.Write($json); $writer.Flush() } finally { $writer.Dispose() }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+Add-TestResult 'IDENTITY' $expectedSid $effectiveSid 'EFFECTIVE_WINDOWS_TOKEN_SID'
+Add-AllowedFileReadTest 'WORKSPACE_READ' (Join-Path $workspace 'package.json') $true
+Add-DeniedCanaryCreateTest 'WORKSPACE_CREATE' (Join-Path $workspace ".acl-runtime-$normalizedRunId.canary")
+Add-DeniedRightTest 'WORKSPACE_MODIFY_CODE' (Join-Path $workspace 'package.json') $FILE_WRITE_DATA $false
+Add-DeniedRightTest 'WORKSPACE_DELETE_CODE' (Join-Path $workspace 'package.json') $DELETE $false
+
+Add-DeniedRightTest 'CONFIG_READ' $configPath $FILE_LIST_DIRECTORY $false
+Add-AllowedFileReadTest 'IPC_READ' $ipcKeyPath $true
+Add-DeniedRightTest 'IPC_WRITE' $ipcKeyPath $FILE_WRITE_DATA $false
+Add-DeniedRightTest 'IPC_TRUNCATE' $ipcKeyPath $FILE_WRITE_DATA $false
+Add-DeniedRightTest 'IPC_DELETE' $ipcKeyPath $DELETE $false
+Add-DeniedRightTest 'IPC_CHANGE_ACL' $ipcKeyPath $WRITE_DAC $false
+
+Add-DeniedRightTest 'OPERATIONAL_ACCESS' $operationalPath $FILE_LIST_DIRECTORY $true
+Add-DeniedRightTest 'RESEARCH_ACCESS' $researchPath $FILE_LIST_DIRECTORY $true
+Add-DeniedRightTest 'AUDIT_SQLITE_ACCESS' $auditSqlitePath $FILE_LIST_DIRECTORY $true
+Add-DeniedRightTest 'AUDIT_JOURNAL_ACCESS' $auditJournalPath $FILE_LIST_DIRECTORY $false
+Add-DeniedRightTest 'SECURITY_LOG_ACCESS' $securityLogPath $FILE_LIST_DIRECTORY $false
+Add-AgentStateCanaryTest $agentStatePath
+
+Add-DeniedRightTest 'DEMO_AUTH_CREATE' $demoAuthorizationPath $FILE_ADD_FILE $true
+if ([System.IO.File]::Exists($demoAuthorizationFile)) {
+    Add-DeniedRightTest 'DEMO_AUTH_MODIFY' $demoAuthorizationFile $FILE_WRITE_DATA $false
+    Add-DeniedRightTest 'DEMO_AUTH_DELETE' $demoAuthorizationFile $DELETE $false
+} else {
+    Add-DeniedRightTest 'DEMO_AUTH_MODIFY' $demoAuthorizationPath $FILE_ADD_FILE $true
+    Add-DeniedRightTest 'DEMO_AUTH_DELETE' $demoAuthorizationPath $FILE_DELETE_CHILD $true
+}
+
+Add-DeniedRightTest 'KILL_SWITCH_CREATE' $controlPath $FILE_ADD_FILE $true
+if ([System.IO.File]::Exists($killSwitchPath)) {
+    Add-DeniedRightTest 'KILL_SWITCH_MODIFY' $killSwitchPath $FILE_WRITE_DATA $false
+    Add-DeniedRightTest 'KILL_SWITCH_DELETE' $killSwitchPath $DELETE $false
+} else {
+    Add-DeniedRightTest 'KILL_SWITCH_MODIFY' $controlPath $FILE_ADD_FILE $true
+    Add-DeniedRightTest 'KILL_SWITCH_DELETE' $controlPath $FILE_DELETE_CHILD $true
+}
+
+$allPassed = -not $unexpectedProtectedAccess
+foreach ($test in $tests.Values) {
+    if (-not $test.passed) { $allPassed = $false }
+}
+$report = [ordered]@{
+    schema_version = 1
+    role = 'AutomatonAgent'
+    run_id = $normalizedRunId
+    effective_sid = $effectiveSid
+    status = if ($allPassed) { 'PASS' } else { 'FAIL' }
+    completed_at_utc = [DateTime]::UtcNow.ToString('o')
+    tests = $tests
+    boundaries = [ordered]@{
+        mt5_accessed = $false
+        automaton_started = $false
+        gateway_started = $false
+        order_check_executed = $false
+        order_send_executed = $false
+        demo_execution_enabled = $false
+        trading_mode_changed = $false
+    }
+}
+Write-ExclusiveJsonReport $reportPath $report
+Write-Output "AGENT_RUNTIME_ACL_STATUS=$($report.status)"
+Write-Output "AGENT_RUNTIME_ACL_REPORT=$reportPath"
+if (-not $allPassed) { exit 1 }
