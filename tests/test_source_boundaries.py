@@ -39,6 +39,7 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn('"scripts/Test-GatewayRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Collect-RuntimeAclResults.ps1"', source)
         self.assertIn('"scripts/Install-TradingLabPythonRuntime.ps1"', source)
+        self.assertIn('"scripts/TradingLabPythonInventory.ps1"', source)
         self.assertIn('"scripts/Initialize-GatewayPythonEnvironment.ps1"', source)
         self.assertIn('"scripts/Resolve-TradingLabNode.ps1"', source)
         self.assertIn('"docs/SECURITY_INVARIANTS.md"', source)
@@ -262,6 +263,7 @@ class SourceBoundaryTests(unittest.TestCase):
                 "Test-GatewayRuntimeAcl.ps1",
                 "Collect-RuntimeAclResults.ps1",
                 "Install-TradingLabPythonRuntime.ps1",
+                "TradingLabPythonInventory.ps1",
                 "Initialize-GatewayPythonEnvironment.ps1",
             )
         ]
@@ -283,7 +285,12 @@ class SourceBoundaryTests(unittest.TestCase):
         )
         self.assertIn("C:\\Program Files\\AutomatonPython\\3.14.5", installer)
         self.assertIn("Assert-OutsideUserProfiles", installer)
-        self.assertIn("& $basePython -I -m venv $stagingPath", installer)
+        self.assertIn(
+            "Invoke-LoggedProcess $basePython @('-I', '-m', 'venv', $stagingVenvPath)",
+            installer,
+        )
+        self.assertIn("SAME_VERSION_TRADITIONAL_INSTALL_PRESENT=FAIL", installer)
+        self.assertIn("INVENTORY_APPLY_FORBIDDEN", installer)
         self.assertNotIn("WriteAllText((Join-Path $Root 'pyvenv.cfg')", installer)
         setup = service_files[0].read_text(encoding="utf-8")
         self.assertIn(
