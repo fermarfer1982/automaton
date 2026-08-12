@@ -50,6 +50,21 @@ autoriza trading; solo indica que esas dos señales humanas opcionales no han
 sido afirmadas. Si un administrador las crea posteriormente, debe reaplicar o
 validar su ACL exacta antes de iniciar el Gateway.
 
+La preparación es reanudable: `trading.yaml` preexistente debe coincidir byte a
+byte con la plantilla OBSERVE_ONLY inválida y una key IPC preexistente debe ser
+Base64URL válido que decodifique exactamente a 32 bytes. Ninguno se sobrescribe
+ni regenera. Una key nueva usa `RandomNumberGenerator.Create().GetBytes()` y
+`FileMode.CreateNew`, compatible con Windows PowerShell 5.1; su valor nunca se
+incluye en consola, reporte o logs. El reporte solo conserva creación/reuso y
+longitud codificada.
+
+Antes de la primera modificación de security descriptors, el gate persiste
+`ACL_APPLY=IN_PROGRESS`. Cada `Set-Acl` completado se añade a un journal de
+progreso administrativo. Un error posterior produce `PARTIAL` y enumera las
+rutas afectadas; no existe rollback automático. Un error anterior conserva
+`NOT_RUN`, y un intento que entra en apply pero no completa ninguna ACE queda
+`FAIL`.
+
 ## Límites de confianza
 
 `audit\sqlite` no es inmutable. SQLite WAL necesita crear y modificar el DB,

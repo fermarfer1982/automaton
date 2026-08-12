@@ -5,10 +5,12 @@ param(
     [string] $LabRoot = 'C:\ProgramData\AutomatonMT5Lab',
     [Parameter(Mandatory = $true)] [string] $AutomatonStateDir,
     [string] $WorkspaceRoot = 'C:\automaton',
+    [string] $ProgressPath,
     [switch] $Apply
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'TradingLabAclBootstrap.ps1')
 
 function Get-CanonicalPath([string] $Value) {
     if (-not [System.IO.Path]::IsPathRooted($Value)) {
@@ -285,27 +287,8 @@ foreach ($protectedSourceDirectory in $protectedSourceDirectories) {
     }
 }
 
-foreach ($directory in @(
-    $root, $control, $demoAuthorization, $ipc, $operational, $research,
-    $audit, $auditSqlite, $auditJournal, $logs, $gatewayLogs, $securityLogs, $state
-)) {
-    if (-not (Test-Path -LiteralPath $directory)) {
-        New-Item -ItemType Directory -Path $directory | Out-Null
-    }
-}
-
-if (-not (Test-Path -LiteralPath $apiKeyFile -PathType Leaf)) {
-    $bytes = [byte[]]::new(32)
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-    $apiKey = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
-    [System.IO.File]::WriteAllText($apiKeyFile, $apiKey, [System.Text.Encoding]::ASCII)
-}
-$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-foreach ($appendFile in @($auditJournalFile, $securityLogFile)) {
-    if (-not (Test-Path -LiteralPath $appendFile -PathType Leaf)) {
-        [System.IO.File]::WriteAllText($appendFile, '', $utf8NoBom)
-    }
-}
+$bootstrapTemplate = Join-Path $workspace 'config\trading.bootstrap-observe-only.yaml'
+$preparedState = Initialize-TradingLabBootstrapState $root $state $bootstrapTemplate
 
 function New-AccessRule(
     [System.Security.Principal.SecurityIdentifier] $Sid,
@@ -345,6 +328,17 @@ function Set-ExactAcl(
         $security.AddAccessRule((New-AccessRule $Principals[$index] $Rights[$index] $Directory $RuntimeRulesPropagate))
     }
     Set-Acl -LiteralPath $Path -AclObject $security
+    if ($ProgressPath) {
+        $progressRecord = [pscustomobject]@{
+            path = $Path
+            applied_at_utc = [DateTime]::UtcNow.ToString('o')
+        }
+        [System.IO.File]::AppendAllText(
+            $ProgressPath,
+            (($progressRecord | ConvertTo-Json -Compress) + [Environment]::NewLine),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+    }
 }
 
 function Set-ExactTreeAcl(

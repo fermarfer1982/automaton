@@ -36,18 +36,37 @@ $report = [ordered]@{
     trading_mode = 'OBSERVE_ONLY'
     account_configured = $false
     paths_created = @()
+    prepared_state_verified = $false
+    ipc_secret_created = $false
+    ipc_secret_reused = $false
+    ipc_secret_length = $null
+    security_descriptors_applied = @()
     acl_snapshots = @()
     checks = [ordered]@{}
     tests = [ordered]@{}
     warnings = @()
     error = $null
 }
+. (Join-Path $PSScriptRoot 'TradingLabAclBootstrap.ps1')
+$progressPath = $ReportPath + '.acl-progress.jsonl'
 
 function Get-CanonicalPath([string] $Value) {
     if (-not [System.IO.Path]::IsPathRooted($Value)) {
         throw "Path must be absolute: $Value"
     }
     return [System.IO.Path]::GetFullPath($Value).TrimEnd('\')
+}
+
+function Write-GateReport {
+    $reportDirectory = Split-Path -Parent $ReportPath
+    if (-not (Test-Path -LiteralPath $reportDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $reportDirectory | Out-Null
+    }
+    [System.IO.File]::WriteAllText(
+        $ReportPath,
+        ($report | ConvertTo-Json -Depth 12),
+        [System.Text.UTF8Encoding]::new($false)
+    )
 }
 
 function Resolve-OwnerSid([string] $Owner) {
@@ -197,49 +216,47 @@ try {
     }
 
     $template = Join-Path $workspace 'config\trading.bootstrap-observe-only.yaml'
-    $templateText = [System.IO.File]::ReadAllText($template, [System.Text.Encoding]::UTF8)
-    foreach ($required in @(
-        'trading_mode: OBSERVE_ONLY', 'authorized_account: 0',
-        'authorized_server: CHANGE_ME', "gateway_windows_identity: '$gatewaySid'",
-        "automaton_windows_identity: '$agentSid'"
-    )) {
-        if (-not $templateText.Contains($required)) {
-            throw "Bootstrap config lacks exact fail-closed value: $required"
-        }
+    $configPath = Join-Path $labRoot 'control\trading.yaml'
+    # This validates an existing config/key before creating any new path.
+    if (Test-Path -LiteralPath $configPath) {
+        [void](Assert-ExactBootstrapConfig $configPath $template)
     }
-    if ($templateText -match '(?im)^\s*(password|api_key|token|secret)\s*:') {
-        throw 'Bootstrap config contains a forbidden credential field.'
+    $existingSecretPath = Join-Path $labRoot 'ipc\automaton.key'
+    if (Test-Path -LiteralPath $existingSecretPath) {
+        [void](Assert-ValidIpcSecret $existingSecretPath)
     }
-
-    $control = Join-Path $labRoot 'control'
-    $configPath = Join-Path $control 'trading.yaml'
-    foreach ($directory in @($labRoot, $control)) {
-        if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
-            New-Item -ItemType Directory -Path $directory | Out-Null
-            $report.paths_created += $directory
-        }
-    }
-    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
-        Copy-Item -LiteralPath $template -Destination $configPath
-        $report.paths_created += $configPath
-    } elseif ([System.IO.File]::ReadAllText($configPath) -ne $templateText) {
-        throw 'Existing trading.yaml differs from the reviewed OBSERVE_ONLY bootstrap template.'
-    }
-
     $report.acl_prevalidation = 'PASS'
+    Write-GateReport
+
+    $prepared = Initialize-TradingLabBootstrapState $labRoot $agentState $template
+    $report.paths_created = @($prepared.created_paths)
+    $report.prepared_state_verified = $true
+    $report.ipc_secret_created = [bool]$prepared.ipc_secret_created
+    $report.ipc_secret_reused = [bool]$prepared.ipc_secret_reused
+    $report.ipc_secret_length = [int]$prepared.ipc_secret_length
+    Write-GateReport
+
     $aclScript = Join-Path $workspace 'scripts\Initialize-TradingLabAcl.ps1'
+    if (Test-Path -LiteralPath $progressPath) {
+        Remove-Item -LiteralPath $progressPath -Force
+    }
+    $report.acl_apply = 'IN_PROGRESS'
+    Write-GateReport
     & $aclScript `
         -GatewayIdentity $gatewaySid `
         -AutomatonIdentity $agentSid `
         -AutomatonStateDir $agentState `
         -WorkspaceRoot $workspace `
         -LabRoot $labRoot `
+        -ProgressPath $progressPath `
         -Apply | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "Initialize-TradingLabAcl.ps1 failed with exit code $LASTEXITCODE."
     }
     $report.acl_apply = 'PASS'
     $report.acl_applied = $true
+    $report.security_descriptors_applied = @(Read-AclProgressFile $progressPath)
+    Write-GateReport
 
     $targets = [ordered]@{
         workspace = $workspace
@@ -391,18 +408,15 @@ try {
     }
     $report.completed_at_utc = [DateTime]::UtcNow.ToString('o')
 } catch {
+    $report.security_descriptors_applied = @(Read-AclProgressFile $progressPath)
+    $report.acl_apply = Resolve-AclApplyFailureStatus `
+        $report.acl_apply `
+        @($report.security_descriptors_applied).Count
+    $report.acl_applied = $report.acl_apply -eq 'PASS'
     $report.error = $_.Exception.Message
     $report.completed_at_utc = [DateTime]::UtcNow.ToString('o')
 } finally {
-    $reportDirectory = Split-Path -Parent $ReportPath
-    if (-not (Test-Path -LiteralPath $reportDirectory -PathType Container)) {
-        New-Item -ItemType Directory -Path $reportDirectory | Out-Null
-    }
-    [System.IO.File]::WriteAllText(
-        $ReportPath,
-        ($report | ConvertTo-Json -Depth 12),
-        [System.Text.UTF8Encoding]::new($false)
-    )
+    Write-GateReport
 }
 
 if ($null -ne $report.error) { exit 1 }

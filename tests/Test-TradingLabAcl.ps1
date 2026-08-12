@@ -38,6 +38,20 @@ foreach ($requiredApply in @(
         throw "ACL apply gate lacks required boundary: $requiredApply"
     }
 }
+if ($applySource.Contains('RandomNumberGenerator]::Fill')) {
+    throw 'ACL apply boundary reintroduced a Windows PowerShell 5.1-incompatible RNG API.'
+}
+foreach ($transactional in @(
+    "acl_apply = 'IN_PROGRESS'",
+    'Resolve-AclApplyFailureStatus',
+    'security_descriptors_applied',
+    '-ProgressPath $progressPath',
+    'Write-GateReport'
+)) {
+    if (-not $applySource.Contains($transactional)) {
+        throw "ACL apply gate lacks transactional reporting: $transactional"
+    }
+}
 foreach ($required in @(
     "Join-Path `$root 'operational'",
     "Join-Path `$root 'research'",
@@ -71,7 +85,8 @@ if ($source.Contains('WriteAllText($killSwitchFile') -or $source.Contains('Write
 $dryRunIndex = $source.IndexOf('if (-not $Apply)')
 if ($dryRunIndex -lt 0) { throw 'ACL script has no explicit dry-run exit.' }
 foreach ($mutation in @('New-Item -ItemType Directory', 'WriteAllText', 'Set-Acl -LiteralPath')) {
-    if ($source.IndexOf($mutation) -lt $dryRunIndex) {
+    $mutationIndex = $source.IndexOf($mutation)
+    if ($mutationIndex -ge 0 -and $mutationIndex -lt $dryRunIndex) {
         throw "ACL dry-run can reach mutation before its exit: $mutation"
     }
 }

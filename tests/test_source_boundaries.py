@@ -32,6 +32,8 @@ class SourceBoundaryTests(unittest.TestCase):
             self.assertIn(protected, source)
         self.assertIn('"conway/inference.ts"', source)
         self.assertIn('"scripts/Initialize-TradingLabAcl.ps1"', source)
+        self.assertIn('"scripts/Apply-TradingLabAclGate.ps1"', source)
+        self.assertIn('"scripts/TradingLabAclBootstrap.ps1"', source)
         self.assertIn('"scripts/New-TradingLabUsers.ps1"', source)
         self.assertIn('"scripts/Resolve-TradingLabNode.ps1"', source)
         self.assertIn('"docs/SECURITY_INVARIANTS.md"', source)
@@ -218,8 +220,7 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertNotIn("WriteAllText($killSwitchFile", source)
         self.assertNotIn("WriteAllText($demoAuthorizationFile", source)
         dry_run_exit = source.index("if (-not $Apply)")
-        self.assertLess(dry_run_exit, source.index("New-Item -ItemType Directory"))
-        self.assertLess(dry_run_exit, source.index("WriteAllText"))
+        self.assertLess(dry_run_exit, source.index("Initialize-TradingLabBootstrapState"))
         self.assertLess(dry_run_exit, source.index("Set-Acl -LiteralPath"))
 
     def test_agent_trading_integration_has_no_direct_programdata_or_mt5_access(self) -> None:
