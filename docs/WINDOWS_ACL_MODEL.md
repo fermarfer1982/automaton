@@ -117,6 +117,14 @@ identidad prevista o si reciben un token administrativo. No aceptan ni
 almacenan contraseñas. Un mismo UUID público vincula ambos reportes y la
 recopilación administrativa final.
 
+Antes de `Add-Type`, cada harness sustituye `TEMP` y `TMP` solo para su proceso:
+el Agent usa `.automaton\runtime-tmp\<RunId>` y el Gateway
+`operational\runtime-tmp\<RunId>`. La ruta debe ser descendiente canónica del
+dominio ya autorizado, nueva para ese RunId, escribible y libre de reparse
+points. Un canario confirma escritura y borrado. El directorio del RunId se
+elimina al terminar; un fallo de limpieza queda registrado y hace fallar el
+reporte. No se usa ni se modifica `C:\Windows\TEMP`.
+
 Los canarios mutables se limitan al estado privado del Agent y a los dominios
 `operational`, `research` y `audit\sqlite` del Gateway. El journal y el log de
 seguridad reciben un único append identificable y durable; esos eventos no se

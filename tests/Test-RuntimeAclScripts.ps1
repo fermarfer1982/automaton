@@ -46,6 +46,12 @@ Assert-True `
     ($gateway.Contains('S-1-5-21-568964486-193631783-1609210587-1007')) `
     'Gateway script is not bound to the exact authorized SID.'
 foreach ($source in @($agent, $gateway)) {
+    $identityIndex = $source.IndexOf('if ($effectiveSid -ne $expectedSid)')
+    $tempInitializationIndex = $source.LastIndexOf('Initialize-PrivateRuntimeTemp ')
+    $addTypeIndex = $source.IndexOf('Add-Type -TypeDefinition')
+    Assert-True `
+        ($identityIndex -ge 0 -and $tempInitializationIndex -gt $identityIndex -and $addTypeIndex -gt $tempInitializationIndex) `
+        'SID validation and private TEMP initialization must precede Add-Type.'
     Assert-True `
         ($source.Contains("mt5_accessed = `$false")) `
         'Runtime boundary report must record mt5_accessed=false.'
@@ -70,7 +76,30 @@ foreach ($source in @($agent, $gateway)) {
     Assert-True `
         (-not $source.Contains('[System.IO.FileMode]::Create,')) `
         'Runtime scripts must never invoke destructive create/overwrite mode.'
+    foreach ($required in @(
+        'Assert-PathConfined', 'Assert-DirectoryNotReparsePoint',
+        '[System.IO.FileAttributes]::ReparsePoint', '$env:TEMP =',
+        '$env:TMP = $env:TEMP', '[System.IO.Path]::GetTempPath()',
+        "'.runtime-temp-write.canary'", 'Clear-PrivateRuntimeTemp',
+        "'RUNTIME_TEMP_PRIVATE'", "'RUNTIME_TEMP_CLEANUP'",
+        'Runtime TEMP already exists for this RunId'
+    )) {
+        Assert-True ($source.Contains($required)) "Private runtime TEMP guard is missing: $required"
+    }
+    Assert-True `
+        ($source.IndexOf('C:\Windows\TEMP', [System.StringComparison]::OrdinalIgnoreCase) -lt 0) `
+        'Runtime harness must never reference Windows TEMP.'
+    Assert-True `
+        ($source.Contains('standard File APIs cannot request WRITE_DAC or DELETE_CHILD')) `
+        'The fine-grained native access probe must document why Add-Type remains necessary.'
 }
+
+Assert-True `
+    ($agent.Contains("`$runtimeTempBase = Join-Path `$agentStatePath 'runtime-tmp'")) `
+    'Agent private TEMP must stay inside authorized Agent state.'
+Assert-True `
+    ($gateway.Contains("`$runtimeTempBase = Join-Path `$operationalPath 'runtime-tmp'")) `
+    'Gateway private TEMP must stay inside its authorized operational domain.'
 
 foreach ($required in @(
     'WORKSPACE_READ', 'WORKSPACE_CREATE', 'WORKSPACE_MODIFY_CODE', 'WORKSPACE_DELETE_CODE',
@@ -78,7 +107,8 @@ foreach ($required in @(
     'OPERATIONAL_ACCESS', 'RESEARCH_ACCESS', 'AUDIT_SQLITE_ACCESS', 'AUDIT_JOURNAL_ACCESS',
     'SECURITY_LOG_ACCESS', 'STATE_CREATE_WRITE_READ_DELETE',
     'DEMO_AUTH_CREATE', 'DEMO_AUTH_MODIFY', 'DEMO_AUTH_DELETE',
-    'KILL_SWITCH_CREATE', 'KILL_SWITCH_MODIFY', 'KILL_SWITCH_DELETE'
+    'KILL_SWITCH_CREATE', 'KILL_SWITCH_MODIFY', 'KILL_SWITCH_DELETE',
+    'RUNTIME_TEMP_PRIVATE', 'RUNTIME_TEMP_CLEANUP'
 )) {
     Assert-True ($agent.Contains("'$required'")) "Agent runtime test missing case: $required"
 }
@@ -98,7 +128,8 @@ foreach ($required in @(
     'JOURNAL_CREATE_OVERWRITE', 'JOURNAL_DELETE', 'JOURNAL_RENAME', 'JOURNAL_REPLACE', 'JOURNAL_CHANGE_ACL',
     'SECURITY_APPEND', 'SECURITY_OVERWRITE', 'SECURITY_TRUNCATE', 'SECURITY_DELETE', 'SECURITY_RENAME', 'SECURITY_REPLACE',
     'AGENT_STATE_READ', 'AGENT_STATE_WRITE', 'DEMO_AUTH_READ', 'DEMO_AUTH_CREATE', 'DEMO_AUTH_MODIFY', 'DEMO_AUTH_DELETE',
-    'KILL_SWITCH_DETECT', 'KILL_SWITCH_CREATE', 'KILL_SWITCH_MODIFY', 'KILL_SWITCH_DELETE'
+    'KILL_SWITCH_DETECT', 'KILL_SWITCH_CREATE', 'KILL_SWITCH_MODIFY', 'KILL_SWITCH_DELETE',
+    'RUNTIME_TEMP_PRIVATE', 'RUNTIME_TEMP_CLEANUP'
 )) {
     Assert-True ($gateway.Contains("'$required'")) "Gateway runtime test missing case: $required"
 }
@@ -147,4 +178,9 @@ Assert-True `
     critical_fail_stop = 'PASS'
     administrative_prefix_validation = 'PASS'
     observe_only_boundary = 'PASS'
+    AGENT_RUNTIME_TEMP_PRIVATE = 'PASS'
+    GATEWAY_RUNTIME_TEMP_PRIVATE = 'PASS'
+    WINDOWS_TEMP_NOT_USED = 'PASS'
+    TEMP_PATH_CONFINED = 'PASS'
+    REPARSE_POINT_FAIL_CLOSED = 'PASS'
 } | ConvertTo-Json

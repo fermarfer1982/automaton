@@ -19,6 +19,112 @@ if ($principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administ
     throw 'AutomatonAgent runtime ACL tests refuse an administrative token.'
 }
 
+$normalizedRunId = $RunId.ToLowerInvariant()
+$agentStatePath = 'C:\Users\AutomatonAgent\.automaton'
+$runtimeTempBase = Join-Path $agentStatePath 'runtime-tmp'
+$runtimeTempPath = Join-Path $runtimeTempBase $normalizedRunId
+$runtimeTempCleanupAttempted = $false
+$runtimeTempCleanupSucceeded = $false
+$scriptExitCode = 0
+
+function Get-CanonicalDirectoryPath([string] $Path) {
+    return [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+}
+
+function Assert-PathConfined([string] $Path, [string] $AuthorizedRoot) {
+    $candidate = Get-CanonicalDirectoryPath $Path
+    $root = Get-CanonicalDirectoryPath $AuthorizedRoot
+    if (-not $candidate.StartsWith(
+        $root + '\', [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "Runtime TEMP escapes its authorized root: $candidate"
+    }
+}
+
+function Assert-DirectoryNotReparsePoint([string] $Path) {
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer) {
+        throw "Runtime TEMP component is not a directory: $Path"
+    }
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "Runtime TEMP component is a reparse point: $Path"
+    }
+}
+
+function Initialize-PrivateRuntimeTemp(
+    [string] $AuthorizedRoot,
+    [string] $TempBase,
+    [string] $TempPath
+) {
+    $createdRunTemp = $false
+    try {
+        Assert-PathConfined $TempBase $AuthorizedRoot
+        Assert-PathConfined $TempPath $AuthorizedRoot
+        Assert-DirectoryNotReparsePoint $AuthorizedRoot
+        if ([System.IO.Directory]::Exists($TempBase)) {
+            Assert-DirectoryNotReparsePoint $TempBase
+        } else {
+            [System.IO.Directory]::CreateDirectory($TempBase) | Out-Null
+            Assert-DirectoryNotReparsePoint $TempBase
+        }
+        if ([System.IO.Directory]::Exists($TempPath) -or [System.IO.File]::Exists($TempPath)) {
+            throw 'Runtime TEMP already exists for this RunId. Inspect it and use a new RunId.'
+        }
+        [System.IO.Directory]::CreateDirectory($TempPath) | Out-Null
+        $createdRunTemp = $true
+        Assert-DirectoryNotReparsePoint $TempPath
+        $env:TEMP = Get-CanonicalDirectoryPath $TempPath
+        $env:TMP = $env:TEMP
+        if ((Get-CanonicalDirectoryPath ([System.IO.Path]::GetTempPath())) -ne $env:TEMP) {
+            throw 'The process did not adopt the confined runtime TEMP.'
+        }
+        $canaryPath = Join-Path $TempPath '.runtime-temp-write.canary'
+        $stream = [System.IO.File]::Open(
+            $canaryPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
+        try { $stream.WriteByte(1); $stream.Flush() } finally { $stream.Dispose() }
+        [System.IO.File]::Delete($canaryPath)
+        if ([System.IO.File]::Exists($canaryPath)) {
+            throw 'Runtime TEMP write canary cleanup failed.'
+        }
+    } catch {
+        if ($createdRunTemp) {
+            $cleanupSucceeded = Clear-PrivateRuntimeTemp $AuthorizedRoot $TempPath
+            if (-not $cleanupSucceeded) {
+                Write-Warning 'Runtime TEMP cleanup failed during initialization.'
+            }
+        }
+        throw
+    }
+}
+
+function Clear-PrivateRuntimeTemp([string] $AuthorizedRoot, [string] $TempPath) {
+    try {
+        Assert-PathConfined $TempPath $AuthorizedRoot
+        if (-not [System.IO.Directory]::Exists($TempPath)) { return $true }
+        Assert-DirectoryNotReparsePoint $AuthorizedRoot
+        Assert-DirectoryNotReparsePoint (Split-Path $TempPath -Parent)
+        Assert-DirectoryNotReparsePoint $TempPath
+        foreach ($item in Get-ChildItem -LiteralPath $TempPath -Force -Recurse -ErrorAction Stop) {
+            if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                throw "Refusing to clean a runtime TEMP containing a reparse point: $($item.FullName)"
+            }
+        }
+        [System.IO.Directory]::Delete($TempPath, $true)
+        return -not [System.IO.Directory]::Exists($TempPath)
+    } catch {
+        return $false
+    }
+}
+
+Initialize-PrivateRuntimeTemp $agentStatePath $runtimeTempBase $runtimeTempPath
+
+try {
+# Add-Type is retained to request exact NTFS rights without performing a
+# destructive mutation; standard File APIs cannot request WRITE_DAC or DELETE_CHILD.
 if (-not ('Automaton.RuntimeAcl.AgentNativeMethods' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -66,8 +172,6 @@ $researchPath = Join-Path $labRoot 'research'
 $auditSqlitePath = Join-Path $labRoot 'audit\sqlite'
 $auditJournalPath = Join-Path $labRoot 'audit\journal\audit.jsonl'
 $securityLogPath = Join-Path $labRoot 'logs\security\security.log'
-$agentStatePath = 'C:\Users\AutomatonAgent\.automaton'
-$normalizedRunId = $RunId.ToLowerInvariant()
 $reportPath = Join-Path $agentStatePath "acl-runtime-results\agent-$normalizedRunId.json"
 $tests = [ordered]@{}
 $unexpectedProtectedAccess = $false
@@ -88,6 +192,8 @@ function Add-TestResult(
         $script:unexpectedProtectedAccess = $true
     }
 }
+
+Add-TestResult 'RUNTIME_TEMP_PRIVATE' 'ALLOW' 'ALLOW' 'TEMP_AND_TMP_CONFINED_WRITABLE_NON_REPARSE'
 
 function Invoke-NativeAccessProbe(
     [string] $Path,
@@ -253,6 +359,13 @@ if ([System.IO.File]::Exists($killSwitchPath)) {
     Add-DeniedRightTest 'KILL_SWITCH_DELETE' $controlPath $FILE_DELETE_CHILD $true
 }
 
+$runtimeTempCleanupAttempted = $true
+$runtimeTempCleanupSucceeded = Clear-PrivateRuntimeTemp $agentStatePath $runtimeTempPath
+Add-TestResult `
+    'RUNTIME_TEMP_CLEANUP' 'ALLOW' `
+    $(if ($runtimeTempCleanupSucceeded) { 'ALLOW' } else { 'ERROR' }) `
+    $(if ($runtimeTempCleanupSucceeded) { 'RUN_SCOPED_TEMP_REMOVED' } else { 'RUN_SCOPED_TEMP_CLEANUP_FAILED' })
+
 $allPassed = -not $unexpectedProtectedAccess
 foreach ($test in $tests.Values) {
     if (-not $test.passed) { $allPassed = $false }
@@ -278,4 +391,13 @@ $report = [ordered]@{
 Write-ExclusiveJsonReport $reportPath $report
 Write-Output "AGENT_RUNTIME_ACL_STATUS=$($report.status)"
 Write-Output "AGENT_RUNTIME_ACL_REPORT=$reportPath"
-if (-not $allPassed) { exit 1 }
+if (-not $allPassed) { $scriptExitCode = 1 }
+} finally {
+    if (-not $runtimeTempCleanupAttempted) {
+        $runtimeTempCleanupSucceeded = Clear-PrivateRuntimeTemp $agentStatePath $runtimeTempPath
+        if (-not $runtimeTempCleanupSucceeded) {
+            Write-Warning 'Runtime TEMP cleanup failed after an early harness error.'
+        }
+    }
+}
+if ($scriptExitCode -ne 0) { exit $scriptExitCode }
