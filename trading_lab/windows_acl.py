@@ -140,6 +140,7 @@ def _targets(config_path: Path, config: SecurityConfig, include_automaton_state:
         "scripts/status.ps1", "scripts/stop.ps1", "scripts/test_gateway.ps1",
         "scripts/enable_demo_trading.ps1", "scripts/disable_trading.ps1",
         "scripts/emergency_stop.ps1", "scripts/New-TradingLabUsers.ps1",
+        "scripts/Apply-TradingLabAclGate.ps1",
         "config/trading.security.example.json",
         "config/trading.example.yaml", "requirements-mt5.txt",
         "requirements-gateway-win-py314.lock",

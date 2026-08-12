@@ -27,6 +27,7 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn('"trading"', source)
         self.assertIn('"trading.security.json"', source)
         self.assertIn('"trading.example.yaml"', source)
+        self.assertIn('"trading.bootstrap-observe-only.yaml"', source)
         for protected in ('"index.ts"', '"agent/loop.ts"', '"config.ts"', '"identity/wallet.ts"'):
             self.assertIn(protected, source)
         self.assertIn('"conway/inference.ts"', source)
@@ -214,6 +215,8 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn("$protectedSourceDirectories", source)
         self.assertIn("Protected source tree contains a reparse point", source)
         self.assertNotIn("gateway_writable_data", source)
+        self.assertNotIn("WriteAllText($killSwitchFile", source)
+        self.assertNotIn("WriteAllText($demoAuthorizationFile", source)
         dry_run_exit = source.index("if (-not $Apply)")
         self.assertLess(dry_run_exit, source.index("New-Item -ItemType Directory"))
         self.assertLess(dry_run_exit, source.index("WriteAllText"))

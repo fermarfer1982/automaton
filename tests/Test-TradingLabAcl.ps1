@@ -10,6 +10,34 @@ if ($errors.Count -ne 0) {
 }
 
 $source = [System.IO.File]::ReadAllText($scriptPath)
+$applyGatePath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\Apply-TradingLabAclGate.ps1'
+$applyTokens = $null
+$applyErrors = $null
+[void][System.Management.Automation.Language.Parser]::ParseFile(
+    $applyGatePath, [ref]$applyTokens, [ref]$applyErrors
+)
+if ($applyErrors.Count -ne 0) {
+    throw "ACL apply gate has PowerShell AST errors: $($applyErrors -join '; ')"
+}
+$applySource = [System.IO.File]::ReadAllText($applyGatePath)
+foreach ($forbidden in @('Start-Process -Credential', 'runas.exe', '.order_send(', '.order_check(', 'import MetaTrader5')) {
+    if ($applySource.Contains($forbidden)) {
+        throw "ACL apply gate contains forbidden runtime action: $forbidden"
+    }
+}
+foreach ($requiredApply in @(
+    '#Requires -RunAsAdministrator',
+    'S-1-5-21-568964486-193631783-1609210587-1006',
+    'S-1-5-21-568964486-193631783-1609210587-1007',
+    'trading.bootstrap-observe-only.yaml',
+    '-Apply | Out-Null',
+    "service_identities_executed = `$false",
+    "mt5_accessed = `$false"
+)) {
+    if (-not $applySource.Contains($requiredApply)) {
+        throw "ACL apply gate lacks required boundary: $requiredApply"
+    }
+}
 foreach ($required in @(
     "Join-Path `$root 'operational'",
     "Join-Path `$root 'research'",
@@ -35,6 +63,9 @@ foreach ($required in @(
 }
 if ($source.Contains("gateway_writable_data") -or $source.Contains("Join-Path `$root 'data'")) {
     throw 'ACL source reintroduced a globally writable data domain.'
+}
+if ($source.Contains('WriteAllText($killSwitchFile') -or $source.Contains('WriteAllText($demoAuthorizationFile')) {
+    throw 'ACL bootstrap must not assert the presence-based kill switch or DEMO authorization.'
 }
 
 $dryRunIndex = $source.IndexOf('if (-not $Apply)')

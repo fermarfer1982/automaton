@@ -24,9 +24,9 @@ Gateway bajo sus identidades dedicadas mientras esa exposición exista.
 | raíz `AutomatonMT5Lab` | RX | RX | solo raíz |
 | `control` | RX | ninguna | solo directorio |
 | `control\trading.yaml` | R | ninguna | fichero |
-| `control\STOP_TRADING` | R | ninguna | fichero |
+| `control\STOP_TRADING` | R si existe | ninguna | fichero humano opcional |
 | `control\demo-authorization` | RX | ninguna | solo directorio |
-| `...\authorization.json` | R | ninguna | fichero |
+| `...\authorization.json` | R si existe | ninguna | fichero humano opcional |
 | `ipc` | RX | RX | solo directorio |
 | `ipc\automaton.key` | R | R | fichero; sin execute |
 | `operational` | M | ninguna | contenedores y objetos |
@@ -45,6 +45,10 @@ El ACL exacto de cada fila añade además `SYSTEM: FullControl` y
 `BUILTIN\Administrators: FullControl`, ambos `Allow`. No se concede ninguna ACE
 a `Authenticated Users`, `Everyone`, `BUILTIN\Users` ni al SID humano. El
 mantenimiento requiere una consola elevada y se apoya en Administrators/SYSTEM.
+El bootstrap no crea `STOP_TRADING` ni `authorization.json`: su ausencia no
+autoriza trading; solo indica que esas dos señales humanas opcionales no han
+sido afirmadas. Si un administrador las crea posteriormente, debe reaplicar o
+validar su ACL exacta antes de iniciar el Gateway.
 
 ## Límites de confianza
 

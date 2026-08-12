@@ -1,0 +1,38 @@
+schema_version: 1
+trading_mode: OBSERVE_ONLY
+authorized_account: 0
+authorized_server: CHANGE_ME
+authorized_account_name: null
+allowed_symbol: XAUUSD
+magic_number: 26081101
+mt5_terminal_path: 'C:\Program Files\MetaTrader 5\terminal64.exe'
+audit_path: 'C:\ProgramData\AutomatonMT5Lab\audit\journal\audit.jsonl'
+audit_db_path: 'C:\ProgramData\AutomatonMT5Lab\audit\sqlite\audit.db'
+research_db_path: 'C:\ProgramData\AutomatonMT5Lab\research\research.db'
+api_key_path: 'C:\ProgramData\AutomatonMT5Lab\ipc\automaton.key'
+gateway_lock_path: 'C:\ProgramData\AutomatonMT5Lab\operational\gateway.lock'
+log_dir: 'C:\ProgramData\AutomatonMT5Lab\logs\gateway'
+security_log_dir: 'C:\ProgramData\AutomatonMT5Lab\logs\security'
+demo_authorization_path: 'C:\ProgramData\AutomatonMT5Lab\control\demo-authorization\authorization.json'
+kill_switch_path: 'C:\ProgramData\AutomatonMT5Lab\control\STOP_TRADING'
+automaton_state_dir: 'C:\Users\AutomatonAgent\.automaton'
+gateway_windows_identity: 'S-1-5-21-568964486-193631783-1609210587-1007'
+automaton_windows_identity: 'S-1-5-21-568964486-193631783-1609210587-1006'
+risk:
+  max_risk_per_trade_fraction: 0.0025
+  max_risk_per_trade_amount: 10.0
+  max_volume: 0.01
+  max_spread_points: 30.0
+  max_open_positions: 1
+  max_symbol_exposure_lots: 0.01
+  max_simultaneous_risk_fraction: 0.0025
+  max_simultaneous_risk_amount: 10.0
+  max_daily_loss_fraction: 0.01
+  max_daily_loss_amount: 30.0
+  max_daily_drawdown_fraction: 0.01
+  max_daily_drawdown_amount: 30.0
+  min_stop_distance_points: 20
+  duplicate_window_seconds: 300
+  cooldown_seconds: 300
+  max_tick_age_seconds: 5.0
+  max_deviation_points: 10

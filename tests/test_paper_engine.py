@@ -89,7 +89,10 @@ class PaperEngineTests(unittest.TestCase):
         self.assertLess(closed[0].pnl, 0)
         self.assertLess(closed[0].r_multiple, -1.0)
         self.assertLessEqual(closed[0].mae_r, closed[0].r_multiple)
-        self.assertAlmostEqual(closed[0].pnl, self.store.paper_daily_realized_pnl())
+        self.assertAlmostEqual(
+            closed[0].pnl,
+            self.store.paper_daily_realized_pnl(self.opened_at.date()),
+        )
 
 
 if __name__ == "__main__":

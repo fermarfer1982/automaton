@@ -233,9 +233,9 @@ $plan = [pscustomobject]@{
     sqlite_immutable = $false
     append_acl_claim = 'risk reduction only; negative runtime tests required after ACL application'
     precreated_by_administrator = @(
-        $apiKeyFile, $killSwitchFile, $demoAuthorizationFile,
-        $auditJournalFile, $securityLogFile
+        $apiKeyFile, $auditJournalFile, $securityLogFile
     )
+    optional_human_asserted_files = @($killSwitchFile, $demoAuthorizationFile)
     acl_proposals = $aclProposals
 }
 $plan | ConvertTo-Json -Depth 8
@@ -299,12 +299,6 @@ if (-not (Test-Path -LiteralPath $apiKeyFile -PathType Leaf)) {
     [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
     $apiKey = [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
     [System.IO.File]::WriteAllText($apiKeyFile, $apiKey, [System.Text.Encoding]::ASCII)
-}
-if (-not (Test-Path -LiteralPath $killSwitchFile -PathType Leaf)) {
-    [System.IO.File]::WriteAllText($killSwitchFile, "HALT`n", [System.Text.Encoding]::ASCII)
-}
-if (-not (Test-Path -LiteralPath $demoAuthorizationFile -PathType Leaf)) {
-    [System.IO.File]::WriteAllText($demoAuthorizationFile, "DISABLED`n", [System.Text.Encoding]::ASCII)
 }
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 foreach ($appendFile in @($auditJournalFile, $securityLogFile)) {
@@ -391,9 +385,13 @@ foreach ($protectedRootFile in @(
 }
 Set-ExactAcl $control @($gatewaySid) @($readExecute) $true $false
 Set-ExactAcl $configFile @($gatewaySid) @($read) $false $false
-Set-ExactAcl $killSwitchFile @($gatewaySid) @($read) $false $false
+if (Test-Path -LiteralPath $killSwitchFile -PathType Leaf) {
+    Set-ExactAcl $killSwitchFile @($gatewaySid) @($read) $false $false
+}
 Set-ExactAcl $demoAuthorization @($gatewaySid) @($readExecute) $true $false
-Set-ExactAcl $demoAuthorizationFile @($gatewaySid) @($read) $false $false
+if (Test-Path -LiteralPath $demoAuthorizationFile -PathType Leaf) {
+    Set-ExactAcl $demoAuthorizationFile @($gatewaySid) @($read) $false $false
+}
 Set-ExactAcl $ipc @($gatewaySid, $automatonSid) @($readExecute, $readExecute) $true $false
 Set-ExactAcl $apiKeyFile @($gatewaySid, $automatonSid) @($read, $read) $false $false
 Set-ExactTreeAcl $operational @($gatewaySid) @($modify)
