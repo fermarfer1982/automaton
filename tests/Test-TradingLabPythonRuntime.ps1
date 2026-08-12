@@ -165,7 +165,12 @@ foreach ($required in @(
     'traditional_bundle_registration_scope', 'traditional_runtime_payload_scope',
     'machine_runtime_target_present', 'machine_runtime_msi_components',
     'EXPECTED_INSTALLED_TARGET_RUNTIME', 'CONFLICTING_PREEXISTING_RUNTIME',
-    'target_probe', 'TARGET_LAYOUT_INCOMPLETE'
+    'target_probe', 'TARGET_LAYOUT_INCOMPLETE',
+    'Invoke-TradingLabPythonRuntimeValidationMetadata',
+    'Resolve-TradingLabRuntimeVerificationState',
+    'ConvertTo-TradingLabVerifiedPythonInventory',
+    'PRESENT_VERIFIED', 'LIVE_READ_ONLY',
+    'filesystem_modified', 'acl_modified', 'reports_written'
 )) {
     Assert-True ($inventorySource.Contains($required)) "Python inventory lacks invariant: $required"
 }
@@ -186,6 +191,17 @@ Assert-True ($aclGateSource.Contains('Test-TradingLabFileSystemRightsMutation'))
 $inventoryApply = $installer.IndexOf('INVENTORY_APPLY_FORBIDDEN')
 $phaseSwitch = $installer.IndexOf('switch ($Phase)')
 Assert-True ($inventoryApply -ge 0 -and $inventoryApply -lt $phaseSwitch) 'Inventory must reject -Apply before phase dispatch.'
+$inventoryPhaseStart = $installer.IndexOf("if (`$Phase -eq 'Inventory')")
+$inventoryPhaseEnd = $installer.IndexOf('Assert-ExactServiceIdentity', $inventoryPhaseStart)
+Assert-True ($inventoryPhaseStart -ge 0 -and $inventoryPhaseEnd -gt $inventoryPhaseStart) 'Inventory read-only phase boundary is absent.'
+$inventoryPhaseBlock = $installer.Substring($inventoryPhaseStart, $inventoryPhaseEnd - $inventoryPhaseStart)
+foreach ($forbiddenInventoryMutation in @(
+    'Set-Acl', 'SetOwner', 'Start-LoggedInstaller', 'Invoke-LoggedProcess',
+    'Remove-Item', 'Move-Item', 'New-Item', 'Write-Report', 'Initialize-PhaseStorage'
+)) {
+    Assert-True (-not $inventoryPhaseBlock.Contains($forbiddenInventoryMutation)) "Inventory phase contains forbidden mutation: $forbiddenInventoryMutation"
+}
+Assert-True ($installer.Contains("if (`$Phase -in @('Inventory', 'BuildVenv'))")) 'Inventory and BuildVenv must obtain the same live read-only verification snapshot.'
 Assert-True ($installer.IndexOf('Assert-InstallMachinePreconditions $inventory') -lt $installer.IndexOf('Start-LoggedInstaller $plan.executable')) 'Current runtime state must block install execution.'
 Assert-True ($installer.IndexOf('$report.previous_phase_verified = $true') -lt $installer.IndexOf("Start-LoggedInstaller `$bundleExecutable")) 'Durable previous-phase verification must precede supported uninstall.'
 Assert-True ($installer.IndexOf('Assert-PythonManagerPreserved $inventory $plan') -lt $installer.IndexOf("Start-LoggedInstaller `$bundleExecutable")) 'Manager preservation proof must precede supported uninstall.'
@@ -248,6 +264,11 @@ Assert-True ($inventorySource.Contains('RedirectStandardInput = $true')) 'Python
 Assert-True ($inventorySource.Contains('$process.StandardInput.Write($Source)')) 'Python source must be written verbatim to stdin.'
 Assert-True (-not $inventorySource.Contains("-I -c")) 'Python metadata must not use fragile -c quoting.'
 Assert-True ($inventorySource.Contains("separators=(',', ':')")) 'Metadata JSON quoting regression is not covered.'
+$buildStart = $installer.IndexOf("'BuildVenv' {")
+$buildEnd = $installer.IndexOf("'PromoteVenv' {", $buildStart)
+$buildBlock = $installer.Substring($buildStart, $buildEnd - $buildStart)
+Assert-True ($buildBlock.IndexOf('Assert-FinalVerifiedMachineRuntimeInventory $inventory') -ge 0) 'BuildVenv must require the final verified Inventory state.'
+Assert-True ($buildBlock.IndexOf('Assert-FinalVerifiedMachineRuntimeInventory $inventory') -lt $buildBlock.IndexOf('Invoke-LoggedProcess $basePython')) 'BuildVenv verification must precede venv creation.'
 
 . $inventoryPath
 . $aclPlanPath
@@ -438,6 +459,9 @@ $cleanAuditItems = @(
 $cleanAudit = Test-AclAuditFixture $cleanAuditItems
 Assert-True ($cleanAudit.valid -and $cleanAudit.recursive_findings -eq 0 -and $cleanAudit.reparse_points -eq 0) 'Exact recursive ACL audit must pass with zero findings.'
 Assert-True ($cleanAudit.unexpected_principals -eq 0 -and $cleanAudit.gateway_mutation_intersection -eq 0) 'Exact recursive ACL audit masks/principals regressed.'
+Assert-True ($cleanAudit.owner_administrators -and $cleanAudit.inheritance_protected) 'Exact audit must expose owner/inheritance evidence.'
+Assert-True ($cleanAudit.system_full_control -and $cleanAudit.administrators_full_control) 'Exact audit must expose administrative FullControl evidence.'
+Assert-True ($cleanAudit.gateway_read_execute -and $cleanAudit.agent_allow_aces -eq 0 -and $cleanAudit.deny_aces -eq 0) 'Exact audit must expose Gateway/Agent/Deny evidence.'
 foreach ($unsafeGatewayRight in @(
     [System.Security.AccessControl.FileSystemRights]::Modify,
     [System.Security.AccessControl.FileSystemRights]::FullControl,
@@ -447,14 +471,17 @@ foreach ($unsafeGatewayRight in @(
 )) {
     $case = Copy-AclAuditFixture $cleanAuditItems
     ($case[0].rules | Where-Object { $_.sid -eq $aclGatewaySid }).rights = [int64]$unsafeGatewayRight
-    Assert-True (-not (Test-AclAuditFixture $case).valid) "Unsafe Gateway audit rights must fail closed: $unsafeGatewayRight"
+    $unsafeAudit = Test-AclAuditFixture $case
+    Assert-True (-not $unsafeAudit.valid -and -not $unsafeAudit.gateway_read_execute -and $unsafeAudit.gateway_mutation_intersection -ne 0) "Unsafe Gateway audit rights must fail closed: $unsafeGatewayRight"
 }
 $agentAuditCase = Copy-AclAuditFixture $cleanAuditItems
 $agentAuditCase[0].rules = @($agentAuditCase[0].rules) + @([pscustomobject]@{ sid = $aclAgentSid; rights = 1L; type = 'Allow'; inherited = $false })
-Assert-True (-not (Test-AclAuditFixture $agentAuditCase).valid) 'Agent Allow in recursive audit must fail closed.'
+$agentAudit = Test-AclAuditFixture $agentAuditCase
+Assert-True (-not $agentAudit.valid -and $agentAudit.agent_allow_aces -eq 1) 'Agent Allow in recursive audit must fail closed.'
 $denyAuditCase = Copy-AclAuditFixture $cleanAuditItems
 $denyAuditCase[0].rules = @($denyAuditCase[0].rules) + @([pscustomobject]@{ sid = $aclAgentSid; rights = 1L; type = 'Deny'; inherited = $false })
-Assert-True (-not (Test-AclAuditFixture $denyAuditCase).valid) 'Deny ACE in recursive audit must fail closed.'
+$denyAudit = Test-AclAuditFixture $denyAuditCase
+Assert-True (-not $denyAudit.valid -and $denyAudit.deny_aces -eq 1) 'Deny ACE in recursive audit must fail closed.'
 $unexpectedAuditCase = Copy-AclAuditFixture $cleanAuditItems
 $unexpectedAuditCase[0].rules = @($unexpectedAuditCase[0].rules) + @([pscustomobject]@{ sid = 'S-1-5-11'; rights = 2L; type = 'Allow'; inherited = $false })
 $unexpectedAudit = Test-AclAuditFixture $unexpectedAuditCase
@@ -769,6 +796,86 @@ Assert-True ($complete.same_version_traditional_install_present -eq 'EXPECTED_IN
 Assert-True ($complete.prevalidation -eq 'TARGET_RUNTIME_ALREADY_INSTALLED_VALIDATION_PENDING') 'Installed runtime must enter validation-pending recovery.'
 Assert-True ($complete.completed_target_runtime -eq 'PRESENT_UNVERIFIED') 'Complete layout must still require execution validation.'
 
+function New-RuntimeVerificationInventory([object] $State) {
+    [ordered]@{
+        target_layout = [pscustomobject]@{
+            root = 'C:\Program Files\AutomatonPython\3.14.5'
+            complete_layout = $true
+        }
+        target_probe = [pscustomobject]@{
+            functional = $true
+            metadata = [pscustomobject]@{
+                version = '3.14.5'; architecture = '64bit'
+                executable = 'C:\Program Files\AutomatonPython\3.14.5\python.exe'
+                base_prefix = 'C:\Program Files\AutomatonPython\3.14.5'
+                prefix = 'C:\Program Files\AutomatonPython\3.14.5'
+                sys_import = $true; stdlib_import = $true
+                stdlib_path = 'C:\Program Files\AutomatonPython\3.14.5\Lib\os.py'
+                venv_import = $true; pip_import = $true
+                pip_path = 'C:\Program Files\AutomatonPython\3.14.5\Lib\site-packages\pip\__init__.py'
+                sys_path = @('C:\Program Files\AutomatonPython\3.14.5\Lib')
+            }
+        }
+        state = $State
+        runtime_verification = $null
+    }
+}
+
+function New-ExactRuntimeAclAudit {
+    [pscustomobject]@{
+        valid = $true; scanned_items = 20; recursive_findings = 0
+        unexpected_principals = 0; reparse_points = 0
+        owner_administrators = $true; inheritance_protected = $true
+        system_full_control = $true; administrators_full_control = $true
+        gateway_read_execute = $true; gateway_mutation_intersection = 0
+        agent_allow_aces = 0; deny_aces = 0
+    }
+}
+
+$pendingInventory = New-RuntimeVerificationInventory $complete.PSObject.Copy()
+$pendingVerification = Resolve-TradingLabRuntimeVerificationState `
+    $pendingInventory $null 'C:\Program Files\AutomatonPython\3.14.5' '3.14.5' 'C:\Users'
+Assert-True (-not $pendingVerification.verified) 'Installed runtime without ACL evidence must remain unverified.'
+Assert-True ($pendingVerification.completed_target_runtime -eq 'PRESENT_UNVERIFIED') 'ACL-pending runtime must remain PRESENT_UNVERIFIED.'
+Assert-True ($pendingVerification.prevalidation -eq 'TARGET_RUNTIME_ALREADY_INSTALLED_VALIDATION_PENDING') 'ACL-pending runtime must remain validation-pending.'
+
+$verifiedInventory = New-RuntimeVerificationInventory $complete.PSObject.Copy()
+$verifiedInventory = ConvertTo-TradingLabVerifiedPythonInventory `
+    $verifiedInventory (New-ExactRuntimeAclAudit) 'C:\Program Files\AutomatonPython\3.14.5' '3.14.5' 'C:\Users'
+Assert-True $verifiedInventory.runtime_verification.verified 'Complete live runtime and exact ACL must verify.'
+Assert-True ($verifiedInventory.state.completed_target_runtime -eq 'PRESENT_VERIFIED') 'Verified runtime must be PRESENT_VERIFIED.'
+Assert-True ($verifiedInventory.state.prevalidation -eq 'PASS') 'Verified runtime prevalidation must be PASS.'
+
+$modifyAcl = New-ExactRuntimeAclAudit
+$modifyAcl.valid = $false; $modifyAcl.gateway_read_execute = $false; $modifyAcl.gateway_mutation_intersection = 65814
+$modifyResult = Resolve-TradingLabRuntimeVerificationState `
+    (New-RuntimeVerificationInventory $complete.PSObject.Copy()) $modifyAcl `
+    'C:\Program Files\AutomatonPython\3.14.5' '3.14.5' 'C:\Users'
+Assert-True (-not $modifyResult.verified -and 'ACL_GATEWAY_MUTATION_RIGHTS_ZERO' -in $modifyResult.failures) 'Gateway Modify must never produce PRESENT_VERIFIED.'
+
+$agentAcl = New-ExactRuntimeAclAudit
+$agentAcl.valid = $false; $agentAcl.agent_allow_aces = 1
+$agentResult = Resolve-TradingLabRuntimeVerificationState `
+    (New-RuntimeVerificationInventory $complete.PSObject.Copy()) $agentAcl `
+    'C:\Program Files\AutomatonPython\3.14.5' '3.14.5' 'C:\Users'
+Assert-True (-not $agentResult.verified -and 'ACL_AGENT_ACCESS_ABSENT' -in $agentResult.failures) 'Agent Allow must never produce PRESENT_VERIFIED.'
+
+$unexpectedMsiStateForVerification = $complete.PSObject.Copy()
+$unexpectedMsiStateForVerification.unexpected_machine_msi_components = 1
+$unexpectedMsiStateForVerification.machine_runtime_msi_valid = $false
+$unexpectedMsiStateForVerification.prevalidation = 'FAIL'
+$unexpectedMsiResult = Resolve-TradingLabRuntimeVerificationState `
+    (New-RuntimeVerificationInventory $unexpectedMsiStateForVerification) (New-ExactRuntimeAclAudit) `
+    'C:\Program Files\AutomatonPython\3.14.5' '3.14.5' 'C:\Users'
+Assert-True (-not $unexpectedMsiResult.verified -and $unexpectedMsiResult.prevalidation -eq 'FAIL') 'Unexpected MSI must fail closed instead of becoming verified.'
+
+$reparseAcl = New-ExactRuntimeAclAudit
+$reparseAcl.valid = $false; $reparseAcl.reparse_points = 1
+$reparseResult = Resolve-TradingLabRuntimeVerificationState `
+    (New-RuntimeVerificationInventory $complete.PSObject.Copy()) $reparseAcl `
+    'C:\Program Files\AutomatonPython\3.14.5' '3.14.5' 'C:\Users'
+Assert-True (-not $reparseResult.verified -and 'ACL_REPARSE_POINTS_ZERO' -in $reparseResult.failures) 'A runtime reparse point must never produce PRESENT_VERIFIED.'
+
 $unexpectedMachineMsi = @($machineMsiExact) + @([pscustomobject]@{
     product_code = '{FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF}'
     display_name = 'Python 3.14.5 Unexpected (64-bit)'
@@ -798,6 +905,14 @@ foreach ($gate in @(
 [pscustomobject]@{
     POWERSHELL_AST = 'PASS'
     PYTHON_INVENTORY_CLASSIFICATION = 'PASS'
+    INVENTORY_INSTALLED_ACL_PENDING = 'PASS'
+    INVENTORY_RUNTIME_VERIFIED = 'PASS'
+    INVENTORY_GATEWAY_MODIFY_NOT_VERIFIED = 'PASS'
+    INVENTORY_AGENT_ALLOW_NOT_VERIFIED = 'PASS'
+    INVENTORY_UNEXPECTED_MSI_NOT_VERIFIED = 'PASS'
+    INVENTORY_REPARSE_NOT_VERIFIED = 'PASS'
+    INVENTORY_READ_ONLY = 'PASS'
+    BUILD_VENV_REQUIRES_VERIFIED_RUNTIME = 'PASS'
     SAME_VERSION_TRADITIONAL_FAIL_CLOSED = 'PASS'
     PYTHON_MANAGER_RUNTIME_DISTINCT = 'PASS'
     PARTIAL_TARGET_RUNTIME_DETECTED = 'PASS'

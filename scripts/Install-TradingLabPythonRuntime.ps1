@@ -1161,6 +1161,52 @@ function Get-MachineRuntimeAclState {
     }
 }
 
+function Get-ReadOnlyVerifiedMachineRuntimeInventory([object] $Inventory) {
+    $aclAudit = $null
+    try {
+        if ($Inventory.target_layout.complete_layout) {
+            $aclAudit = Get-MachineRuntimeAclAudit $pythonBase
+        }
+    } catch {
+        $reparseFailure = $_.Exception.Message -match 'REPARSE_POINT'
+        $aclAudit = [pscustomobject]@{
+            valid = $false
+            scanned_items = 0
+            recursive_findings = 1
+            findings = @('ACL_AUDIT_INFRASTRUCTURE_ERROR:' + $_.Exception.GetType().Name)
+            unexpected_principals = 0
+            reparse_points = if ($reparseFailure) { 1 } else { 0 }
+            owner_administrators = $false
+            inheritance_protected = $false
+            system_full_control = $false
+            administrators_full_control = $false
+            gateway_read_execute = $false
+            agent_allow_aces = 0
+            deny_aces = 0
+            gateway_mutation_intersection = $null
+            error_type = $_.Exception.GetType().Name
+            error_code = if ($reparseFailure) { 'REPARSE_POINT_FAIL_CLOSED' } else { 'ACL_AUDIT_INFRASTRUCTURE_ERROR' }
+        }
+    }
+    return ConvertTo-TradingLabVerifiedPythonInventory `
+        $Inventory $aclAudit $pythonBase $expectedPythonVersion (Join-Path $env:SystemDrive 'Users')
+}
+
+function Assert-FinalVerifiedMachineRuntimeInventory([object] $Inventory) {
+    if (
+        $Inventory.state.completed_target_runtime -ne 'PRESENT_VERIFIED' -or
+        $Inventory.state.prevalidation -ne 'PASS' -or
+        $null -eq $Inventory.runtime_verification -or
+        -not $Inventory.runtime_verification.verified -or
+        $Inventory.runtime_verification.evidence_source -ne 'LIVE_READ_ONLY'
+    ) {
+        $failures = if ($null -ne $Inventory.runtime_verification) {
+            @($Inventory.runtime_verification.failures) -join ','
+        } else { 'RUNTIME_VERIFICATION_ABSENT' }
+        throw "FINAL_MACHINE_RUNTIME_VERIFICATION=FAIL: $failures"
+    }
+}
+
 function Set-MachineRuntimeAclPassGates([object] $Audit) {
     if ($null -eq $Audit -or -not $Audit.valid) {
         throw 'PYTHON_RUNTIME_ACL=FAIL: recursive audit did not pass.'
@@ -1228,6 +1274,10 @@ function Complete-InstalledMachineRuntime([object] $Inventory) {
         $report.gates.MUST_NOT_CALL_SET_ACL = 'true'
         $report.gates.ACL_REAPPLIED = 'false'
         Set-MachineRuntimeAclPassGates $aclState.audit
+        $Inventory = ConvertTo-TradingLabVerifiedPythonInventory `
+            $Inventory $aclState.audit $pythonBase $expectedPythonVersion (Join-Path $env:SystemDrive 'Users')
+        Assert-FinalVerifiedMachineRuntimeInventory $Inventory
+        $report.inventory_after = $Inventory.state
         if ($Apply) {
             Initialize-PhaseStorage
             $report.current_run_applied_phase = 'MachineRuntimeValidationRecovered'
@@ -1246,6 +1296,10 @@ function Complete-InstalledMachineRuntime([object] $Inventory) {
     $postApplyAudit = Assert-ExactBaseAcl $pythonBase
     $report.current_run_applied_phase = 'MachineRuntimeAclRecovered'
     Set-MachineRuntimeAclPassGates $postApplyAudit
+    $Inventory = ConvertTo-TradingLabVerifiedPythonInventory `
+        $Inventory $postApplyAudit $pythonBase $expectedPythonVersion (Join-Path $env:SystemDrive 'Users')
+    Assert-FinalVerifiedMachineRuntimeInventory $Inventory
+    $report.inventory_after = $Inventory.state
 }
 
 function Write-Report {
@@ -1343,6 +1397,9 @@ try {
     $report.gates.DECLARATIVE_HASH_LOCK = 'PASS'
 
     $inventory = Get-TradingLabPythonInventory
+    if ($Phase -in @('Inventory', 'BuildVenv')) {
+        $inventory = Get-ReadOnlyVerifiedMachineRuntimeInventory $inventory
+    }
     $report.inventory_before = $inventory.state
     if ($Phase -eq 'Inventory') {
         if ($Apply) { throw 'INVENTORY_APPLY_FORBIDDEN: select one explicit recovery phase.' }
@@ -1359,6 +1416,9 @@ try {
         Write-Output "MIXED_PYTHONCORE_REGISTRATION=$($inventory.state.mixed_pythoncore_registration)"
         Write-Output "TRADITIONAL_MSI_COMPONENTS=$($inventory.state.traditional_msi_components)"
         Write-Output "SAME_VERSION_TRADITIONAL_INSTALL_PRESENT=$($inventory.state.same_version_traditional_install_present)"
+        Write-Output "COMPLETED_TARGET_RUNTIME=$($inventory.state.completed_target_runtime)"
+        Write-Output "RUNTIME_VERIFICATION=$($inventory.runtime_verification.status)"
+        Write-Output "RUNTIME_VERIFICATION_FAILURES=$(@($inventory.runtime_verification.failures) -join ',')"
         Write-Output "PREVALIDATION=$($inventory.state.prevalidation)"
         if ($inventory.state.prevalidation -ne 'PASS') { exit 2 }
         exit 0
@@ -1525,12 +1585,17 @@ try {
             $freshAclAudit = Assert-ExactBaseAcl $pythonBase
             Set-MachineRuntimePassGates $metadata
             Set-MachineRuntimeAclPassGates $freshAclAudit
+            $after = ConvertTo-TradingLabVerifiedPythonInventory `
+                $after $freshAclAudit $pythonBase $expectedPythonVersion (Join-Path $env:SystemDrive 'Users')
+            Assert-FinalVerifiedMachineRuntimeInventory $after
+            $report.inventory_after = $after.state
             $report.gates.INSTALLER_REEXECUTED = 'false'
         }
         'ResumeMachineRuntime' {
             Complete-InstalledMachineRuntime $inventory
         }
         'BuildVenv' {
+            Assert-FinalVerifiedMachineRuntimeInventory $inventory
             Assert-MachineInstallationInventory $inventory
             [void](Assert-BasePython $basePython)
             [void](Assert-Wheelhouse $wheelhousePath)

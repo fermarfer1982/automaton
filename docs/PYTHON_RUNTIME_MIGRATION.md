@@ -90,8 +90,11 @@ ejecución humana explícita:
    aplicar exclusivamente la ACL del árbol del runtime con un `-Apply`
    separado. Nunca instala, desinstala, construye un venv ni toca otros
    dominios ACL.
-5. `BuildVenv`: crea exactamente `C:\automaton\.venv.new` con el Python
-   machine-wide e instala offline desde el wheelhouse y el lock.
+5. `BuildVenv`: exige primero un inventario live read-only con
+   `completed_target_runtime=PRESENT_VERIFIED` y `prevalidation=PASS`; solo
+   entonces puede crear exactamente `C:\automaton\.venv.new` con el Python
+   machine-wide e instalar offline desde el wheelhouse y el lock. La mera
+   existencia de `python.exe` nunca satisface esta precondición.
 6. `PromoteVenv`: valida de nuevo `.venv.new`, mueve el venv activo a un backup
    administrativo y solo entonces promueve el staging. Si la validación
    posterior falla, conserva el resultado fallido y restaura el venv anterior.
@@ -212,6 +215,16 @@ points. El estado pasa a
 sin volver a invocar `Set-Acl`. Cualquier diferencia o enlace inesperado falla
 cerrado.
 
+El inventario separa el descubrimiento base de la verificación final. Un layout
+completo con payload/MSI correctos continúa como `PRESENT_UNVERIFIED` y
+`TARGET_RUNTIME_ALREADY_INSTALLED_VALIDATION_PENDING` hasta que un snapshot
+`LIVE_READ_ONLY` demuestre conjuntamente Python 3.14.5 x64 funcional, rutas
+exactas, stdlib/venv/pip, cuatro MSI machine-wide sin extras y la ACL recursiva
+exacta. Solo entonces normaliza el estado en memoria a
+`PRESENT_VERIFIED`/`PASS`. Inventory no escribe reportes, registro, archivos ni
+ACL; cualquier evidencia ausente, ACE incompatible o reparse point conserva el
+estado pendiente o el fallo previo.
+
 ## Procedimiento humano elevado para el estado actual
 
 No ejecutar Automaton ni Gateway durante la recuperación. Mantener
@@ -221,7 +234,8 @@ administrativo que posee la entrada HKCU tradicional:
 ```powershell
 Set-Location C:\automaton
 
-# 1. Inventario read-only. En el estado actual, exit code 2 es esperado.
+# 1. Inventario read-only. Un runtime final validado devuelve
+# COMPLETED_TARGET_RUNTIME=PRESENT_VERIFIED y PREVALIDATION=PASS.
 .\scripts\Install-TradingLabPythonRuntime.ps1 -Phase Inventory
 
 # 2. Preparar primero una copia offline íntegra de todos los wheels.

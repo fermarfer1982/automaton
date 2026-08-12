@@ -166,6 +166,14 @@ function Test-TradingLabRuntimeAclAudit(
     $findings = [System.Collections.Generic.List[string]]::new()
     $unexpectedPrincipals = 0
     $reparsePoints = 0
+    $ownerMismatches = 0
+    $inheritanceMismatches = 0
+    $systemRightsMismatches = 0
+    $administratorsRightsMismatches = 0
+    $gatewayRightsMismatches = 0
+    $gatewayMutationIntersection = 0L
+    $agentAllowAces = 0
+    $denyAces = 0
     $canonicalTarget = [System.IO.Path]::GetFullPath($ExpectedTarget).TrimEnd('\')
     if (@($Items).Count -eq 0) { $findings.Add('ACL_AUDIT_EMPTY') }
 
@@ -184,9 +192,11 @@ function Test-TradingLabRuntimeAclAudit(
             $findings.Add("ACL_AUDIT_REPARSE_POINT:$path")
         }
         if ((Get-TradingLabAclPlanProperty $item 'owner_sid') -ne $AdministratorsSid) {
+            $ownerMismatches++
             $findings.Add("ACL_AUDIT_OWNER_NOT_ADMINISTRATORS:$path")
         }
         if (-not [bool](Get-TradingLabAclPlanProperty $item 'inheritance_protected')) {
+            $inheritanceMismatches++
             $findings.Add("ACL_AUDIT_INHERITANCE_NOT_PROTECTED:$path")
         }
 
@@ -196,6 +206,7 @@ function Test-TradingLabRuntimeAclAudit(
             $type = [string](Get-TradingLabAclPlanProperty $rule 'type')
             $rights = [int64](Get-TradingLabAclPlanProperty $rule 'rights')
             if ($type -eq 'Deny') {
+                $denyAces++
                 $findings.Add("ACL_AUDIT_DENY_ACE:$path`:$sid")
                 continue
             }
@@ -215,19 +226,28 @@ function Test-TradingLabRuntimeAclAudit(
         }
 
         if ($rightsBySid.ContainsKey($AgentSid)) {
+            $agentAllowAces++
             $findings.Add("ACL_AUDIT_AGENT_ALLOW:$path")
         }
         if (-not $rightsBySid.ContainsKey($SystemSid) -or $rightsBySid[$SystemSid] -ne $FullControlValue) {
+            $systemRightsMismatches++
             $findings.Add("ACL_AUDIT_SYSTEM_NOT_FULLCONTROL:$path")
         }
         if (-not $rightsBySid.ContainsKey($AdministratorsSid) -or $rightsBySid[$AdministratorsSid] -ne $FullControlValue) {
+            $administratorsRightsMismatches++
             $findings.Add("ACL_AUDIT_ADMINISTRATORS_NOT_FULLCONTROL:$path")
         }
         if (-not $rightsBySid.ContainsKey($GatewaySid)) {
+            $gatewayRightsMismatches++
             $findings.Add("ACL_AUDIT_GATEWAY_MISSING:$path")
-        } elseif ($rightsBySid[$GatewaySid] -ne $GatewayReadExecuteValue -or
-            (Test-TradingLabFileSystemRightsMutation $rightsBySid[$GatewaySid])) {
-            $findings.Add("ACL_AUDIT_GATEWAY_RIGHTS_UNSAFE:$path")
+        } else {
+            $gatewayMutationIntersection = $gatewayMutationIntersection -bor `
+                (Get-TradingLabMutationRightsIntersection $rightsBySid[$GatewaySid])
+            if ($rightsBySid[$GatewaySid] -ne $GatewayReadExecuteValue -or
+                (Test-TradingLabFileSystemRightsMutation $rightsBySid[$GatewaySid])) {
+                $gatewayRightsMismatches++
+                $findings.Add("ACL_AUDIT_GATEWAY_RIGHTS_UNSAFE:$path")
+            }
         }
         if ($rightsBySid.Count -ne 3) {
             $findings.Add("ACL_AUDIT_ALLOW_PRINCIPAL_COUNT:$path`:$($rightsBySid.Count)")
@@ -242,10 +262,17 @@ function Test-TradingLabRuntimeAclAudit(
         findings = @($findings)
         unexpected_principals = $unexpectedPrincipals
         reparse_points = $reparsePoints
+        owner_administrators = $ownerMismatches -eq 0
+        inheritance_protected = $inheritanceMismatches -eq 0
+        system_full_control = $systemRightsMismatches -eq 0
+        administrators_full_control = $administratorsRightsMismatches -eq 0
+        gateway_read_execute = $gatewayRightsMismatches -eq 0
+        agent_allow_aces = $agentAllowAces
+        deny_aces = $denyAces
         gateway_rights = $GatewayReadExecuteValue
         gateway_rights_hex = '0x' + $GatewayReadExecuteValue.ToString('X')
         prohibited_mutation_mask = $gatewayClassification.prohibited_mutation_mask
         prohibited_mutation_mask_hex = $gatewayClassification.prohibited_mutation_mask_hex
-        gateway_mutation_intersection = $gatewayClassification.mutation_intersection
+        gateway_mutation_intersection = $gatewayMutationIntersection
     }
 }

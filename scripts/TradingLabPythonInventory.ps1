@@ -19,6 +19,10 @@ function Get-TradingLabRegistryDefaultValue([string] $Path) {
 
 function Get-TradingLabProperty([object] $InputObject, [string] $Name) {
     if ($null -eq $InputObject) { return $null }
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        if ($InputObject.Contains($Name)) { return $InputObject[$Name] }
+        return $null
+    }
     $property = $InputObject.PSObject.Properties[$Name]
     if ($null -eq $property) { return $null }
     return $property.Value
@@ -640,6 +644,143 @@ print(json.dumps({
     return Invoke-TradingLabPythonStdinJson $Python $source
 }
 
+function Invoke-TradingLabPythonRuntimeValidationMetadata([string] $Python) {
+    $source = @'
+import json
+import os
+import pip
+import platform
+import sys
+import venv
+print(json.dumps({
+    "architecture": platform.architecture()[0],
+    "base_prefix": sys.base_prefix,
+    "executable": sys.executable,
+    "pip_import": True,
+    "pip_path": pip.__file__,
+    "prefix": sys.prefix,
+    "stdlib_import": True,
+    "stdlib_path": os.__file__,
+    "sys_import": True,
+    "sys_path": sys.path,
+    "venv_import": True,
+    "version": platform.python_version(),
+}, sort_keys=True, separators=(',', ':')))
+'@
+    return Invoke-TradingLabPythonStdinJson $Python $source
+}
+
+function Test-TradingLabInventoryExactPath([string] $Path, [string] $Expected) {
+    try {
+        if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Expected)) { return $false }
+        return [System.IO.Path]::GetFullPath($Path).TrimEnd('\').Equals(
+            [System.IO.Path]::GetFullPath($Expected).TrimEnd('\'),
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    } catch { return $false }
+}
+
+function Test-TradingLabInventoryPathWithin([string] $Path, [string] $Root) {
+    try {
+        if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Root)) { return $false }
+        $candidate = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+        $canonicalRoot = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
+        return $candidate.Equals($canonicalRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $candidate.StartsWith($canonicalRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)
+    } catch { return $false }
+}
+
+function Resolve-TradingLabRuntimeVerificationState(
+    [object] $Inventory,
+    [object] $AclAudit,
+    [string] $ExpectedTarget = $script:TradingLabPythonTarget,
+    [string] $ExpectedVersion = $script:TradingLabPythonVersion,
+    [string] $UsersRoot = 'C:\Users'
+) {
+    $failures = [System.Collections.Generic.List[string]]::new()
+    $state = Get-TradingLabProperty $Inventory 'state'
+    $layout = Get-TradingLabProperty $Inventory 'target_layout'
+    $probe = Get-TradingLabProperty $Inventory 'target_probe'
+    $metadata = Get-TradingLabProperty $probe 'metadata'
+
+    $checks = @(
+        [pscustomobject]@{ name = 'TARGET_LAYOUT_EXACT'; pass = Test-TradingLabInventoryExactPath (Get-TradingLabProperty $layout 'root') $ExpectedTarget },
+        [pscustomobject]@{ name = 'TARGET_LAYOUT_COMPLETE'; pass = [bool](Get-TradingLabProperty $layout 'complete_layout') },
+        [pscustomobject]@{ name = 'TARGET_PROBE_FUNCTIONAL'; pass = [bool](Get-TradingLabProperty $probe 'functional') },
+        [pscustomobject]@{ name = 'PYTHON_VERSION_EXACT'; pass = (Get-TradingLabProperty $metadata 'version') -eq $ExpectedVersion },
+        [pscustomobject]@{ name = 'PYTHON_ARCH_X64'; pass = (Get-TradingLabProperty $metadata 'architecture') -eq '64bit' },
+        [pscustomobject]@{ name = 'PYTHON_EXECUTABLE_TARGET'; pass = Test-TradingLabInventoryExactPath (Get-TradingLabProperty $metadata 'executable') (Join-Path $ExpectedTarget 'python.exe') },
+        [pscustomobject]@{ name = 'PYTHON_BASE_PREFIX_TARGET'; pass = Test-TradingLabInventoryExactPath (Get-TradingLabProperty $metadata 'base_prefix') $ExpectedTarget },
+        [pscustomobject]@{ name = 'PYTHON_PREFIX_TARGET'; pass = Test-TradingLabInventoryExactPath (Get-TradingLabProperty $metadata 'prefix') $ExpectedTarget },
+        [pscustomobject]@{ name = 'PYTHON_SYS_IMPORT'; pass = [bool](Get-TradingLabProperty $metadata 'sys_import') },
+        [pscustomobject]@{ name = 'PYTHON_STDLIB_IMPORT'; pass = [bool](Get-TradingLabProperty $metadata 'stdlib_import') },
+        [pscustomobject]@{ name = 'PYTHON_STDLIB_TARGET'; pass = Test-TradingLabInventoryPathWithin (Get-TradingLabProperty $metadata 'stdlib_path') $ExpectedTarget },
+        [pscustomobject]@{ name = 'PYTHON_VENV_IMPORT'; pass = [bool](Get-TradingLabProperty $metadata 'venv_import') },
+        [pscustomobject]@{ name = 'PYTHON_PIP_IMPORT'; pass = [bool](Get-TradingLabProperty $metadata 'pip_import') },
+        [pscustomobject]@{ name = 'PYTHON_PIP_TARGET'; pass = Test-TradingLabInventoryPathWithin (Get-TradingLabProperty $metadata 'pip_path') $ExpectedTarget },
+        [pscustomobject]@{ name = 'RUNTIME_PAYLOAD_MACHINE'; pass = (Get-TradingLabProperty $state 'traditional_runtime_payload_scope') -eq 'MACHINE' },
+        [pscustomobject]@{ name = 'TRADITIONAL_USER_RUNTIME_ABSENT'; pass = (Get-TradingLabProperty $state 'traditional_user_runtime') -eq 'ABSENT' },
+        [pscustomobject]@{ name = 'TRADITIONAL_MACHINE_RUNTIME_PRESENT'; pass = (Get-TradingLabProperty $state 'traditional_machine_runtime') -eq 'PRESENT' },
+        [pscustomobject]@{ name = 'MACHINE_RUNTIME_TARGET_PRESENT'; pass = [bool](Get-TradingLabProperty $state 'machine_runtime_target_present') },
+        [pscustomobject]@{ name = 'EXPECTED_MACHINE_MSI_COMPONENTS'; pass = (Get-TradingLabProperty $state 'machine_runtime_msi_components') -eq 4 -and (Get-TradingLabProperty $state 'expected_machine_msi_components') -eq 4 },
+        [pscustomobject]@{ name = 'UNEXPECTED_MACHINE_MSI_COMPONENTS_ZERO'; pass = (Get-TradingLabProperty $state 'unexpected_machine_msi_components') -eq 0 },
+        [pscustomobject]@{ name = 'MACHINE_RUNTIME_MSI_VALID'; pass = [bool](Get-TradingLabProperty $state 'machine_runtime_msi_valid') },
+        [pscustomobject]@{ name = 'PARTIAL_TARGET_ABSENT'; pass = (Get-TradingLabProperty $state 'partial_target_runtime') -eq 'ABSENT' },
+        [pscustomobject]@{ name = 'MIXED_PYTHONCORE_ABSENT'; pass = (Get-TradingLabProperty $state 'mixed_pythoncore_registration') -eq 'ABSENT' },
+        [pscustomobject]@{ name = 'EXPECTED_INSTALLED_TARGET_RUNTIME'; pass = (Get-TradingLabProperty $state 'same_version_traditional_install_present') -eq 'EXPECTED_INSTALLED_TARGET_RUNTIME' },
+        [pscustomobject]@{ name = 'ACL_RUNTIME_VALID'; pass = [bool](Get-TradingLabProperty $AclAudit 'valid') },
+        [pscustomobject]@{ name = 'ACL_OWNER_ADMINISTRATORS'; pass = [bool](Get-TradingLabProperty $AclAudit 'owner_administrators') },
+        [pscustomobject]@{ name = 'ACL_INHERITANCE_PROTECTED'; pass = [bool](Get-TradingLabProperty $AclAudit 'inheritance_protected') },
+        [pscustomobject]@{ name = 'ACL_SYSTEM_FULLCONTROL'; pass = [bool](Get-TradingLabProperty $AclAudit 'system_full_control') },
+        [pscustomobject]@{ name = 'ACL_ADMINISTRATORS_FULLCONTROL'; pass = [bool](Get-TradingLabProperty $AclAudit 'administrators_full_control') },
+        [pscustomobject]@{ name = 'ACL_GATEWAY_READ_EXECUTE'; pass = [bool](Get-TradingLabProperty $AclAudit 'gateway_read_execute') },
+        [pscustomobject]@{ name = 'ACL_GATEWAY_MUTATION_RIGHTS_ZERO'; pass = (Get-TradingLabProperty $AclAudit 'gateway_mutation_intersection') -eq 0 },
+        [pscustomobject]@{ name = 'ACL_AGENT_ACCESS_ABSENT'; pass = (Get-TradingLabProperty $AclAudit 'agent_allow_aces') -eq 0 },
+        [pscustomobject]@{ name = 'ACL_DENY_ACES_ZERO'; pass = (Get-TradingLabProperty $AclAudit 'deny_aces') -eq 0 },
+        [pscustomobject]@{ name = 'ACL_UNEXPECTED_PRINCIPALS_ZERO'; pass = (Get-TradingLabProperty $AclAudit 'unexpected_principals') -eq 0 },
+        [pscustomobject]@{ name = 'ACL_RECURSIVE_FINDINGS_ZERO'; pass = (Get-TradingLabProperty $AclAudit 'recursive_findings') -eq 0 },
+        [pscustomobject]@{ name = 'ACL_REPARSE_POINTS_ZERO'; pass = (Get-TradingLabProperty $AclAudit 'reparse_points') -eq 0 }
+    )
+    foreach ($check in $checks) {
+        if (-not $check.pass) { $failures.Add($check.name) }
+    }
+    foreach ($path in @((Get-TradingLabProperty $metadata 'sys_path'))) {
+        if ([string]::IsNullOrWhiteSpace([string]$path)) { continue }
+        if (Test-TradingLabInventoryPathWithin ([string]$path) $UsersRoot) {
+            $failures.Add('PYTHON_SYS_PATH_USER_PROFILE')
+            break
+        }
+    }
+
+    $verified = $failures.Count -eq 0
+    $existingCompletedState = Get-TradingLabProperty $state 'completed_target_runtime'
+    $existingPrevalidation = Get-TradingLabProperty $state 'prevalidation'
+    return [pscustomobject]@{
+        evidence_source = 'LIVE_READ_ONLY'
+        verified = $verified
+        status = if ($verified) { 'VERIFIED' } elseif ($existingPrevalidation -eq 'FAIL') { 'FAIL' } else { 'VALIDATION_PENDING' }
+        completed_target_runtime = if ($verified) { 'PRESENT_VERIFIED' } else { $existingCompletedState }
+        prevalidation = if ($verified) { 'PASS' } else { $existingPrevalidation }
+        failures = @($failures)
+        checked_conditions = $checks.Count + 1
+    }
+}
+
+function ConvertTo-TradingLabVerifiedPythonInventory(
+    [object] $Inventory,
+    [object] $AclAudit,
+    [string] $ExpectedTarget = $script:TradingLabPythonTarget,
+    [string] $ExpectedVersion = $script:TradingLabPythonVersion,
+    [string] $UsersRoot = 'C:\Users'
+) {
+    $verification = Resolve-TradingLabRuntimeVerificationState `
+        $Inventory $AclAudit $ExpectedTarget $ExpectedVersion $UsersRoot
+    $Inventory.state.completed_target_runtime = $verification.completed_target_runtime
+    $Inventory.state.prevalidation = $verification.prevalidation
+    $Inventory['runtime_verification'] = $verification
+    return $Inventory
+}
+
 function Get-TradingLabVenvState([string] $Root) {
     $python = Join-Path $Root 'Scripts\python.exe'
     $cfgPath = Join-Path $Root 'pyvenv.cfg'
@@ -756,7 +897,7 @@ function Get-TradingLabPythonInventory {
     }
     $targetLayout = Get-TradingLabPythonLayout $script:TradingLabPythonTarget
     $targetProbe = if ($targetLayout.complete_layout) {
-        Invoke-TradingLabPythonMetadata (Join-Path $script:TradingLabPythonTarget 'python.exe')
+        Invoke-TradingLabPythonRuntimeValidationMetadata (Join-Path $script:TradingLabPythonTarget 'python.exe')
     } else {
         [pscustomobject]@{ attempted = $false; functional = $false; error = 'TARGET_LAYOUT_INCOMPLETE'; metadata = $null }
     }
@@ -776,12 +917,18 @@ function Get-TradingLabPythonInventory {
         msi_products = $msiProducts
         target_layout = $targetLayout
         target_probe = $targetProbe
+        runtime_verification = $null
         active_venv = $venvState
         state = $state
         boundaries = [ordered]@{
             registry_modified = $false
+            filesystem_modified = $false
+            acl_modified = $false
+            reports_written = $false
             installer_executed = $false
             python_uninstalled = $false
+            venv_rebuilt = $false
+            venv_promoted = $false
             mt5_accessed = $false
             gateway_started = $false
             automaton_started = $false

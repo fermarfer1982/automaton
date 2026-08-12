@@ -331,8 +331,40 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn("$startInfo.Arguments = '-I -'", inventory)
         self.assertIn("RedirectStandardInput = $true", inventory)
         self.assertIn("$process.StandardInput.Write($Source)", inventory)
+        self.assertIn("Invoke-TradingLabPythonRuntimeValidationMetadata", inventory)
+        self.assertIn("Resolve-TradingLabRuntimeVerificationState", inventory)
+        self.assertIn("ConvertTo-TradingLabVerifiedPythonInventory", inventory)
+        self.assertIn("PRESENT_VERIFIED", inventory)
+        self.assertIn("LIVE_READ_ONLY", inventory)
+        self.assertIn("filesystem_modified = $false", inventory)
+        self.assertIn("acl_modified = $false", inventory)
+        self.assertIn("reports_written = $false", inventory)
         self.assertNotIn("-I -c", installer + inventory)
         self.assertNotIn("Invoke-Expression", installer + inventory)
+        self.assertIn("if ($Phase -in @('Inventory', 'BuildVenv'))", installer)
+        self.assertIn("Get-ReadOnlyVerifiedMachineRuntimeInventory", installer)
+        self.assertIn("Assert-FinalVerifiedMachineRuntimeInventory", installer)
+        inventory_start = installer.index("if ($Phase -eq 'Inventory')")
+        inventory_end = installer.index("Assert-ExactServiceIdentity", inventory_start)
+        inventory_phase = installer[inventory_start:inventory_end]
+        for mutation in (
+            "Set-Acl",
+            "SetOwner",
+            "Start-LoggedInstaller",
+            "Invoke-LoggedProcess",
+            "Remove-Item",
+            "Move-Item",
+            "Initialize-PhaseStorage",
+            "Write-Report",
+        ):
+            self.assertNotIn(mutation, inventory_phase)
+        build_start = installer.index("'BuildVenv' {")
+        build_end = installer.index("'PromoteVenv' {", build_start)
+        build = installer[build_start:build_end]
+        self.assertLess(
+            build.index("Assert-FinalVerifiedMachineRuntimeInventory $inventory"),
+            build.index("Invoke-LoggedProcess $basePython"),
+        )
         self.assertIn("Assert-PythonManagerPreserved", installer)
         self.assertNotIn("WriteAllText((Join-Path $Root 'pyvenv.cfg')", installer)
         setup = service_files[0].read_text(encoding="utf-8")
