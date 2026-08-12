@@ -140,6 +140,14 @@ $clean = Resolve-Synthetic @($manager) @() @() $true $false $false $true
 Assert-True ($clean.same_version_traditional_install_present -eq 'PASS') 'Clean traditional registration state must pass.'
 Assert-True ($clean.python_manager_runtime -eq 'FUNCTIONAL') 'Manager must survive traditional cleanup.'
 
+$mixedCore = [pscustomobject]@{
+    managed_by_python_manager = $true
+    executable_path = 'C:\Program Files\AutomatonPython\3.14.5\python.exe'
+}
+$mixedOnly = Resolve-Synthetic @($manager) @() @($mixedCore) $true $false $false $true
+Assert-True ($mixedOnly.mixed_pythoncore_registration -eq 'PRESENT') 'Mixed PythonCore registration was not detected.'
+Assert-True ($mixedOnly.prevalidation -eq 'FAIL') 'Mixed PythonCore registration must fail prevalidation alone.'
+
 $machine = [pscustomobject]@{ kind = 'TRADITIONAL_BUNDLE'; scope = 'HKLM' }
 $complete = Resolve-Synthetic @($manager, $machine) @([pscustomobject]@{}) @() $true $true $true $false
 Assert-True ($complete.traditional_machine_runtime -eq 'PRESENT') 'Machine traditional runtime was not distinguished.'

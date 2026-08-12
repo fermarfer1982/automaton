@@ -123,7 +123,8 @@ autorizar un gate de recuperación adicional basado en evidencia.
 
 Solo si el inventario posterior muestra simultáneamente
 `SAME_VERSION_TRADITIONAL_INSTALL_PRESENT=PASS` y
-`PARTIAL_TARGET_RUNTIME=ABSENT`, continuar:
+`PARTIAL_TARGET_RUNTIME=ABSENT` y
+`MIXED_PYTHONCORE_REGISTRATION=ABSENT`, continuar:
 
 ```powershell
 $Installer = 'C:\ProgramData\AutomatonMT5Lab\maintenance\python-3.14.5-amd64.exe'

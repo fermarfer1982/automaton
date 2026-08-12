@@ -592,6 +592,8 @@ try {
         Write-Output "TRADITIONAL_MACHINE_RUNTIME=$($inventory.state.traditional_machine_runtime)"
         Write-Output "PARTIAL_TARGET_RUNTIME=$($inventory.state.partial_target_runtime)"
         Write-Output "BROKEN_ACTIVE_VENV=$($inventory.state.broken_active_venv)"
+        Write-Output "MIXED_PYTHONCORE_REGISTRATION=$($inventory.state.mixed_pythoncore_registration)"
+        Write-Output "TRADITIONAL_MSI_COMPONENTS=$($inventory.state.traditional_msi_components)"
         Write-Output "SAME_VERSION_TRADITIONAL_INSTALL_PRESENT=$($inventory.state.same_version_traditional_install_present)"
         Write-Output "PREVALIDATION=$($inventory.state.prevalidation)"
         if ($inventory.state.prevalidation -ne 'PASS') { exit 2 }

@@ -230,7 +230,11 @@ function Resolve-TradingLabPythonInventoryState(
         broken_active_venv = if ($VenvState.broken) { 'PRESENT' } else { 'ABSENT' }
         mixed_pythoncore_registration = if ($mixedPythonCore) { 'PRESENT' } else { 'ABSENT' }
         same_version_traditional_install_present = if ($sameVersionTraditional) { 'FAIL' } else { 'PASS' }
-        prevalidation = if ($sameVersionTraditional -or ($TargetLayout.exists -and -not $TargetLayout.complete_layout)) { 'FAIL' } else { 'PASS' }
+        prevalidation = if (
+            $sameVersionTraditional -or
+            ($TargetLayout.exists -and -not $TargetLayout.complete_layout) -or
+            $mixedPythonCore
+        ) { 'FAIL' } else { 'PASS' }
     }
 }
 
