@@ -2,7 +2,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
-    [string] $RunId
+    [string] $RunId,
+    [switch] $PythonBaseOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,6 +21,16 @@ if ($principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administ
 }
 
 $normalizedRunId = $RunId.ToLowerInvariant()
+if ($PythonBaseOnly) {
+    . (Join-Path $PSScriptRoot 'Test-PythonBaseOnlyRuntimeAcl.ps1')
+    $baseOnlyResult = Invoke-TradingLabPythonBaseOnlyRuntimeAcl `
+        -Role 'AutomatonAgent' -RunId $normalizedRunId `
+        -EffectiveSid $effectiveSid -AdministrativeToken $principal.IsInRole(
+            [System.Security.Principal.WindowsBuiltInRole]::Administrator
+        )
+    if ($baseOnlyResult.exit_code -ne 0) { exit $baseOnlyResult.exit_code }
+    return
+}
 $agentStatePath = 'C:\Users\AutomatonAgent\.automaton'
 $runtimeTempBase = Join-Path $agentStatePath 'runtime-tmp'
 $runtimeTempPath = Join-Path $runtimeTempBase $normalizedRunId

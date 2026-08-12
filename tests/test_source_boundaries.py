@@ -37,6 +37,7 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn('"scripts/New-TradingLabUsers.ps1"', source)
         self.assertIn('"scripts/Test-AgentRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Test-GatewayRuntimeAcl.ps1"', source)
+        self.assertIn('"scripts/Test-PythonBaseOnlyRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Collect-RuntimeAclResults.ps1"', source)
         self.assertIn('"scripts/Install-TradingLabPythonRuntime.ps1"', source)
         self.assertIn('"scripts/TradingLabPythonInventory.ps1"', source)
@@ -232,13 +233,20 @@ class SourceBoundaryTests(unittest.TestCase):
 
     def test_runtime_acl_python_probes_compile_and_preserve_diagnostics(self) -> None:
         gateway = (ROOT / "scripts" / "Test-GatewayRuntimeAcl.ps1").read_text(encoding="utf-8")
+        base_only = (ROOT / "scripts" / "Test-PythonBaseOnlyRuntimeAcl.ps1").read_text(
+            encoding="utf-8"
+        )
         collector = (ROOT / "scripts" / "Collect-RuntimeAclResults.ps1").read_text(encoding="utf-8")
         pattern = re.compile(r"\$(?:\w+Source|source)\s*=\s*@'\n(.*?)\n'@", re.DOTALL)
         gateway_blocks = pattern.findall(gateway)
+        base_only_blocks = pattern.findall(base_only)
         collector_blocks = pattern.findall(collector)
         self.assertEqual(6, len(gateway_blocks))
+        self.assertEqual(1, len(base_only_blocks))
         self.assertEqual(1, len(collector_blocks))
-        for index, block in enumerate([*gateway_blocks, *collector_blocks], start=1):
+        for index, block in enumerate(
+            [*gateway_blocks, *base_only_blocks, *collector_blocks], start=1
+        ):
             compile(block, f"<runtime-acl-inline-{index}>", "exec")
         self.assertNotIn("2>&1", gateway)
         self.assertIn("[System.Diagnostics.ProcessStartInfo]::new()", gateway)
@@ -261,6 +269,7 @@ class SourceBoundaryTests(unittest.TestCase):
                 "enable_demo_trading.ps1",
                 "disable_trading.ps1",
                 "Test-GatewayRuntimeAcl.ps1",
+                "Test-PythonBaseOnlyRuntimeAcl.ps1",
                 "Collect-RuntimeAclResults.ps1",
                 "Install-TradingLabPythonRuntime.ps1",
                 "TradingLabPythonInventory.ps1",

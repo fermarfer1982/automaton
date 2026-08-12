@@ -5,8 +5,9 @@ $ErrorActionPreference = 'Stop'
 $workspace = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $agentPath = Join-Path $workspace 'scripts\Test-AgentRuntimeAcl.ps1'
 $gatewayPath = Join-Path $workspace 'scripts\Test-GatewayRuntimeAcl.ps1'
+$pythonBaseOnlyPath = Join-Path $workspace 'scripts\Test-PythonBaseOnlyRuntimeAcl.ps1'
 $collectorPath = Join-Path $workspace 'scripts\Collect-RuntimeAclResults.ps1'
-$paths = @($agentPath, $gatewayPath, $collectorPath)
+$paths = @($agentPath, $gatewayPath, $pythonBaseOnlyPath, $collectorPath)
 
 function Assert-True([bool] $Condition, [string] $Message) {
     if (-not $Condition) { throw $Message }
@@ -37,6 +38,7 @@ foreach ($path in $paths) {
 
 $agent = $sources[$agentPath]
 $gateway = $sources[$gatewayPath]
+$pythonBaseOnly = $sources[$pythonBaseOnlyPath]
 $collector = $sources[$collectorPath]
 
 Assert-True `
@@ -45,6 +47,24 @@ Assert-True `
 Assert-True `
     ($gateway.Contains('S-1-5-21-568964486-193631783-1609210587-1007')) `
     'Gateway script is not bound to the exact authorized SID.'
+Assert-True ($agent.Contains('[switch] $PythonBaseOnly')) 'Agent harness lacks the isolated PythonBaseOnly switch.'
+Assert-True ($gateway.Contains('[switch] $PythonBaseOnly')) 'Gateway harness lacks the isolated PythonBaseOnly switch.'
+foreach ($entry in @(
+    [pscustomobject]@{ Source = $gateway; DefaultMarker = "`$labRoot = 'C:\ProgramData\AutomatonMT5Lab'"; Role = 'AutomatonGateway' },
+    [pscustomobject]@{ Source = $agent; DefaultMarker = "`$agentStatePath = 'C:\Users\AutomatonAgent\.automaton'"; Role = 'AutomatonAgent' }
+)) {
+    $branchStart = $entry.Source.IndexOf('if ($PythonBaseOnly)')
+    $defaultStart = $entry.Source.IndexOf($entry.DefaultMarker)
+    Assert-True ($branchStart -ge 0 -and $defaultStart -gt $branchStart) "$($entry.Role) PythonBaseOnly branch must precede the default harness."
+    $branch = $entry.Source.Substring($branchStart, $defaultStart - $branchStart)
+    Assert-True ($branch.Contains("-Role '$($entry.Role)'")) "$($entry.Role) PythonBaseOnly branch uses the wrong role."
+    Assert-True ($branch.Contains(". (Join-Path `$PSScriptRoot 'Test-PythonBaseOnlyRuntimeAcl.ps1')")) "$($entry.Role) PythonBaseOnly helper boundary is absent."
+    Assert-True ($branch.Contains('return')) "$($entry.Role) PythonBaseOnly mode must return before the default harness."
+    Assert-True (-not $branch.Contains('C:\automaton\.venv')) "$($entry.Role) PythonBaseOnly branch references the active venv."
+    Assert-True (-not $branch.Contains('.venv.new')) "$($entry.Role) PythonBaseOnly branch references the staging venv."
+}
+Assert-True ($gateway.Contains("`$pythonExe = Join-Path `$workspace '.venv\Scripts\python.exe'")) 'Default Gateway harness no longer preserves its existing venv behavior.'
+Assert-True ($agent.Contains("Add-AgentStateCanaryTest `$agentStatePath")) 'Default Agent harness no longer preserves its existing behavior.'
 foreach ($source in @($agent, $gateway)) {
     $identityIndex = $source.IndexOf('if ($effectiveSid -ne $expectedSid)')
     $tempInitializationIndex = $source.LastIndexOf('Initialize-PrivateRuntimeTemp ')
@@ -200,6 +220,64 @@ Assert-True `
     ($gateway.Contains("trading_mode\s*:\s*OBSERVE_ONLY")) `
     'Gateway runtime test must fail closed unless config remains OBSERVE_ONLY.'
 
+foreach ($forbiddenBaseOnly in @(
+    'C:\automaton\.venv', '.venv.new', 'MetaTrader5', 'FastAPI', 'numpy',
+    '.order_check(', '.order_send(', 'sqlite3', 'audit.jsonl', 'security.log',
+    'demo-authorization', 'STOP_TRADING', 'trading.yaml', 'Start-Service',
+    'Start-Process', 'Set-Acl', 'SetAccessRule', 'SetOwner', 'takeown', 'icacls'
+)) {
+    Assert-True (-not $pythonBaseOnly.Contains($forbiddenBaseOnly)) "PythonBaseOnly isolation violation: $forbiddenBaseOnly"
+}
+foreach ($requiredBaseOnly in @(
+    "`$script:PythonBaseOnlyRoot = 'C:\Program Files\AutomatonPython\3.14.5'",
+    "`$script:PythonBaseOnlyExecutable = 'C:\Program Files\AutomatonPython\3.14.5\python.exe'",
+    'Test-PythonBaseOnlyIdentity', 'Test-PythonBaseOnlyExactPath',
+    'Test-PythonBaseOnlyReparseAttributes', 'Assert-PythonBaseOnlyConfinedPath',
+    'PYTHON_BASE_REPARSE_POINT_FAIL_CLOSED', 'Resolve-PythonBaseOnlyAccessExpectation',
+    '[System.Diagnostics.ProcessStartInfo]::new()',
+    "`$startInfo.Arguments = '-I -'", 'RedirectStandardInput = $true',
+    '$process.StandardInput.Write($Source)',
+    'import json', 'import struct', 'import sys', 'import venv',
+    'MACHINE_PYTHON_READ', 'MACHINE_PYTHON_ENUMERATE', 'MACHINE_PYTHON_EXECUTE',
+    'MACHINE_PYTHON_CREATE_DENY', 'MACHINE_PYTHON_WRITE_DENY',
+    'MACHINE_PYTHON_APPEND_DENY', 'MACHINE_PYTHON_TRUNCATE_DENY',
+    'MACHINE_PYTHON_RENAME_DENY', 'MACHINE_PYTHON_DELETE_DENY',
+    'MACHINE_PYTHON_WRITE_ATTRIBUTES_DENY', 'MACHINE_PYTHON_CHANGE_ACL_DENY',
+    'MACHINE_PYTHON_TAKE_OWNERSHIP_DENY', 'DIRECTORY_ENUMERATION_DENY',
+    'PYTHON_EXE_READ_DENY', 'PYTHON_DLL_READ_DENY', 'STDLIB_READ_DENY',
+    'PYTHON_EXECUTE_DENY', 'CREATE_DENY', 'WRITE_DENY', 'DELETE_DENY',
+    'CHANGE_ACL_DENY', 'TAKE_OWNERSHIP_DENY', 'CRITICAL_UNEXPECTED_ALLOW',
+    "mode = 'PYTHON_BASE_ONLY'", "trading_mode = 'OBSERVE_ONLY'",
+    'build_venv = $false', 'mt5_accessed = $false',
+    'order_check_called = $false', 'order_send_called = $false',
+    'gateway_started = $false', 'automaton_started = $false',
+    'venv_accessed = $false', 'venv_new_accessed = $false',
+    'acl_modified = $false', 'filesystem_runtime_modified ='
+)) {
+    Assert-True ($pythonBaseOnly.Contains($requiredBaseOnly)) "PythonBaseOnly invariant missing: $requiredBaseOnly"
+}
+Assert-True ($pythonBaseOnly.Contains('acl-runtime-results')) 'PythonBaseOnly report is not confined to the authorized result domain.'
+Assert-True ($pythonBaseOnly.Contains('[System.IO.FileMode]::CreateNew')) 'PythonBaseOnly reports/canaries must be collision-resistant.'
+Assert-True ($pythonBaseOnly.Contains('public static extern bool CreateDirectory(')) 'PythonBaseOnly directory canaries must use atomic Win32 creation.'
+Assert-True ($pythonBaseOnly.Contains('if ($Context.critical_unexpected_allow) { return }')) 'PythonBaseOnly must stop immediately after a critical unexpected allow.'
+Assert-True (-not $pythonBaseOnly.Contains('[System.IO.FileMode]::Truncate')) 'PythonBaseOnly must not truncate protected runtime files.'
+Assert-True (-not $pythonBaseOnly.Contains('[System.IO.FileMode]::OpenOrCreate')) 'PythonBaseOnly must not open protected runtime files for mutation.'
+
+. $pythonBaseOnlyPath
+$gatewayExecution = Resolve-PythonBaseOnlyAccessExpectation $true 0 $true
+Assert-True $gatewayExecution.passed 'Gateway expected Python execution success must pass.'
+$gatewayMutationAllowed = Resolve-PythonBaseOnlyAccessExpectation $true 0 $false
+Assert-True (-not $gatewayMutationAllowed.passed -and $gatewayMutationAllowed.critical) 'Gateway mutation success must be critical.'
+$agentReadAllowed = Resolve-PythonBaseOnlyAccessExpectation $true 0 $false
+Assert-True (-not $agentReadAllowed.passed -and $agentReadAllowed.critical) 'Agent read success must be critical.'
+$agentExecuteAllowed = Resolve-PythonBaseOnlyAccessExpectation $true 0 $false
+Assert-True (-not $agentExecuteAllowed.passed -and $agentExecuteAllowed.critical) 'Agent execute success must be critical.'
+$agentAccessDenied = Resolve-PythonBaseOnlyAccessExpectation $false 5 $false
+Assert-True $agentAccessDenied.passed 'Agent AccessDenied must satisfy an expected-denied test.'
+Assert-True (-not (Test-PythonBaseOnlyIdentity 'S-1-5-21-wrong' $script:PythonBaseOnlyAgentSid)) 'Wrong effective SID must fail closed.'
+Assert-True (-not (Test-PythonBaseOnlyExactPath 'C:\Program Files\OtherPython' $script:PythonBaseOnlyRoot)) 'A different Python path must fail closed.'
+Assert-True (-not (Test-PythonBaseOnlyReparseAttributes ([System.IO.FileAttributes]::Directory -bor [System.IO.FileAttributes]::ReparsePoint))) 'A reparse point must fail closed.'
+
 Assert-True ($collector.Contains('#Requires -RunAsAdministrator')) 'Collector must require elevation.'
 foreach ($required in @(
     'before_sha256', 'append_sha256', 'PREFIX_OR_SUFFIX_HASH_MISMATCH',
@@ -242,4 +320,16 @@ Assert-True `
     PYTHON_BASE_MACHINE_WIDE_STATIC = 'PASS'
     PYTHON_BASE_OUTSIDE_USER_PROFILE_STATIC = 'PASS'
     PYTHON_GATEWAY_MODIFY_PROBES = 'PASS'
+    PYTHON_BASE_ONLY_DEFAULT_GATEWAY_UNCHANGED = 'PASS'
+    PYTHON_BASE_ONLY_DEFAULT_AGENT_UNCHANGED = 'PASS'
+    PYTHON_BASE_ONLY_VENV_ISOLATED = 'PASS'
+    PYTHON_BASE_ONLY_NO_MT5_OR_ORDERS = 'PASS'
+    PYTHON_BASE_ONLY_GATEWAY_EXECUTION_EXPECTED = 'PASS'
+    PYTHON_BASE_ONLY_GATEWAY_MUTATION_FAIL_CLOSED = 'PASS'
+    PYTHON_BASE_ONLY_AGENT_READ_EXECUTE_FAIL_CLOSED = 'PASS'
+    PYTHON_BASE_ONLY_AGENT_ACCESS_DENIED_PASS = 'PASS'
+    PYTHON_BASE_ONLY_IDENTITY_PATH_REPARSE_FAIL_CLOSED = 'PASS'
+    PYTHON_BASE_ONLY_NO_ACL_OR_SERVICE_MUTATION = 'PASS'
+    PYTHON_BASE_ONLY_CRITICAL_FAIL_STOP = 'PASS'
+    PYTHON_BASE_ONLY_ATOMIC_DIRECTORY_CANARY = 'PASS'
 } | ConvertTo-Json

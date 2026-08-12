@@ -164,6 +164,29 @@ exacto, la cadena hash completa del journal y `TRADING_MODE=OBSERVE_ONLY`.
 Ninguno de estos scripts importa MetaTrader5, inicia el laboratorio, usa red,
 modifica ACL/grupos o habilita trading.
 
+### Gate aislado del Python base
+
+Antes de reconstruir el venv, ambos harnesses admiten el modo opt-in
+`-PythonBaseOnly`. El modo normal permanece sin cambios. Esta variante retorna
+antes de cualquier referencia a `.venv`, `.venv.new`, configuración, SQLite,
+journals, autorización DEMO o kill switch, y valida exclusivamente la identidad
+efectiva y `C:\Program Files\AutomatonPython\3.14.5`.
+
+Gateway debe poder enumerar, leer y ejecutar el intérprete exacto con
+`ProcessStartInfo` y `python.exe -I -`, enviando por stdin un probe que solo usa
+stdlib. Todos los derechos de creación o mutación se solicitan mediante canarios
+únicos o handles no destructivos y deben resultar denegados. Agent debe recibir
+`AccessDenied` al enumerar, leer, ejecutar o solicitar cualquier derecho de
+mutación. Un Allow inesperado se clasifica como `CRITICAL_UNEXPECTED_ALLOW`.
+
+Los temporales privados y el JSON se limitan a
+`operational\acl-runtime-results` para Gateway y
+`.automaton\acl-runtime-results` para Agent. El reporte fija
+`mode=PYTHON_BASE_ONLY`, `TRADING_MODE=OBSERVE_ONLY` y confirma que no se accedió
+al venv, no se inició ningún proceso del laboratorio, no se llamó a MT5 ni se
+modificaron ACL. La ejecución bajo las identidades reales sigue siendo un gate
+humano separado; las suites estáticas no usan `runas`.
+
 Las claves LLM se configurarán más adelante solo para `AutomatonAgent`, en un
 almacén de credenciales o entorno de usuario protegido, nunca en workspace,
 ProgramData, auditoría, logs o memoria del Gateway. Las credenciales MT5
