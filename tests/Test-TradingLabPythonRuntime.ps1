@@ -2,6 +2,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $installerPath = Join-Path $root 'scripts\Install-TradingLabPythonRuntime.ps1'
 $inventoryPath = Join-Path $root 'scripts\TradingLabPythonInventory.ps1'
+$aclPlanPath = Join-Path $root 'scripts\TradingLabPythonAclPlan.ps1'
 $setupPath = Join-Path $root 'scripts\setup.ps1'
 $gatewayPath = Join-Path $root 'scripts\Test-GatewayRuntimeAcl.ps1'
 $collectorPath = Join-Path $root 'scripts\Collect-RuntimeAclResults.ps1'
@@ -13,7 +14,7 @@ function Assert-True([bool] $Condition, [string] $Message) {
 }
 
 foreach ($path in @(
-    $installerPath, $inventoryPath, $setupPath, $gatewayPath, $collectorPath,
+    $installerPath, $inventoryPath, $aclPlanPath, $setupPath, $gatewayPath, $collectorPath,
     $gatewayEnvironmentPath, $gatewayStartPath
 )) {
     $tokens = $null
@@ -26,6 +27,7 @@ foreach ($path in @(
 
 $installer = [System.IO.File]::ReadAllText($installerPath)
 $inventorySource = [System.IO.File]::ReadAllText($inventoryPath)
+$aclPlanSource = [System.IO.File]::ReadAllText($aclPlanPath)
 $setup = [System.IO.File]::ReadAllText($setupPath)
 $gateway = [System.IO.File]::ReadAllText($gatewayPath)
 $collector = [System.IO.File]::ReadAllText($collectorPath)
@@ -108,6 +110,16 @@ foreach ($required in @(
     'INSTALLED_RUNTIME_EVIDENCE', 'INSTALLER_RESULT_EVIDENCE',
     'EXPECTED_MACHINE_MSI_COMPONENTS', 'UNEXPECTED_MACHINE_MSI_COMPONENTS',
     'MachineRuntimeAclRecoveryRequested', 'MachineRuntimeAclRecovered',
+    'New-MachineRuntimeAclPlan', 'Set-MachineRuntimeAclPlanGates',
+    'ACL_TARGET_ONLY', 'ACL_OWNER_ADMINISTRATORS_PLANNED',
+    'ACL_INHERITANCE_PROTECTED_PLANNED', 'SYSTEM_FULLCONTROL_PLANNED',
+    'ADMINISTRATORS_FULLCONTROL_PLANNED', 'GATEWAY_READ_EXECUTE_PLANNED',
+    'GATEWAY_WRITE_ABSENT_PLANNED', 'GATEWAY_MODIFY_ABSENT_PLANNED',
+    'GATEWAY_DELETE_ABSENT_PLANNED', 'GATEWAY_CHANGE_PERMISSIONS_ABSENT_PLANNED',
+    'GATEWAY_TAKE_OWNERSHIP_ABSENT_PLANNED', 'AGENT_ACCESS_ABSENT_PLANNED',
+    'AUTHENTICATED_USERS_MODIFY_ABSENT_PLANNED', 'USERS_MODIFY_ABSENT_PLANNED',
+    'DENY_ACES_PLANNED', 'ACL_OTHER_DOMAINS_MODIFIED',
+    'machine_runtime_acl_modified', 'acl_apply_requested', 'acl_applied', 'acl_plan',
     'VENV_BASE_OUTSIDE_USER_PROFILE', 'VENV_LOCK_MATCH',
     'META_TRADER5_PACKAGE_PRESENT',
     "trading_mode\s*:\s*OBSERVE_ONLY",
@@ -152,7 +164,7 @@ foreach ($forbidden in @(
     'import MetaTrader5', '.initialize(', '.login(', '.symbol_select(', '.order_check(', '.order_send(',
     'Start-Service', 'New-LocalUser', 'Add-LocalGroupMember', 'Invoke-Expression'
 )) {
-    Assert-True (-not ($installer + $inventorySource).Contains($forbidden)) "Python recovery gate contains forbidden action: $forbidden"
+    Assert-True (-not ($installer + $inventorySource + $aclPlanSource).Contains($forbidden)) "Python recovery gate contains forbidden action: $forbidden"
 }
 
 $inventoryApply = $installer.IndexOf('INVENTORY_APPLY_FORBIDDEN')
@@ -197,6 +209,19 @@ Assert-True ($resumeBlock.Contains('Complete-InstalledMachineRuntime $inventory'
 foreach ($forbiddenResumeAction in @('Start-LoggedInstaller', 'Invoke-LoggedProcess', 'Move-Item', '.venv.new')) {
     Assert-True (-not $resumeBlock.Contains($forbiddenResumeAction)) "Resume phase contains forbidden action: $forbiddenResumeAction"
 }
+$completeStart = $installer.IndexOf('function Complete-InstalledMachineRuntime')
+$completeEnd = $installer.IndexOf('function Write-Report', $completeStart)
+Assert-True ($completeStart -ge 0 -and $completeEnd -gt $completeStart) 'Shared machine-runtime completion boundary is absent.'
+$completeBlock = $installer.Substring($completeStart, $completeEnd - $completeStart)
+$dryRunReturn = $completeBlock.IndexOf('if (-not $Apply) { return }')
+$aclMutationCall = $completeBlock.IndexOf('Protect-ExactRuntimeTree $pythonBase $aclPlan')
+Assert-True ($dryRunReturn -ge 0 -and $aclMutationCall -gt $dryRunReturn) 'Dry-run must return before the only machine runtime ACL mutation call.'
+Assert-True (-not $completeBlock.Substring(0, $dryRunReturn).Contains('Set-Acl')) 'Dry-run path must never call Set-Acl.'
+Assert-True (-not $completeBlock.Substring(0, $dryRunReturn).Contains('.SetOwner(')) 'Dry-run path must never modify owner.'
+Assert-True ($installer.Contains('Assert-ExactRuntimeTarget $Root')) 'ACL application must validate the exact runtime target.'
+Assert-True ($installer.Contains('[System.IO.Directory]::EnumerateFileSystemEntries')) 'ACL tree walk must avoid following reparse points recursively.'
+Assert-True ($installer.IndexOf('Assert-InMemoryRuntimeSecurity $directorySecurity $Plan') -lt $installer.IndexOf('Set-Acl -LiteralPath $item.FullName')) 'In-memory directory ACL validation must precede filesystem mutation.'
+Assert-True ($installer.IndexOf('Assert-InMemoryRuntimeSecurity $fileSecurity $Plan') -lt $installer.IndexOf('Set-Acl -LiteralPath $item.FullName')) 'In-memory file ACL validation must precede filesystem mutation.'
 Assert-True ($inventorySource.Contains("`$startInfo.Arguments = '-I -'")) 'Python metadata must execute stdin source with python -.'
 Assert-True ($inventorySource.Contains('RedirectStandardInput = $true')) 'Python stdin must be redirected explicitly.'
 Assert-True ($inventorySource.Contains('$process.StandardInput.Write($Source)')) 'Python source must be written verbatim to stdin.'
@@ -204,9 +229,109 @@ Assert-True (-not $inventorySource.Contains("-I -c")) 'Python metadata must not 
 Assert-True ($inventorySource.Contains("separators=(',', ':')")) 'Metadata JSON quoting regression is not covered.'
 
 . $inventoryPath
+. $aclPlanPath
 Assert-True ((Resolve-TradingLabInstallerExit 0) -eq 'SUCCESS') 'Installer exit 0 classification regressed.'
 Assert-True ((Resolve-TradingLabInstallerExit 1603) -eq 'INSTALLER_MAINTENANCE_COLLISION') 'Bootstrapper 1603 must be classified as a maintenance collision.'
 Assert-True ((Resolve-TradingLabInstallerExit 5) -eq 'INSTALLER_EXIT_NONZERO') 'Unexpected installer exits must fail closed.'
+
+$aclSystemSid = 'S-1-5-18'
+$aclAdministratorsSid = 'S-1-5-32-544'
+$aclGatewaySid = 'S-1-5-21-568964486-193631783-1609210587-1007'
+$aclAgentSid = 'S-1-5-21-568964486-193631783-1609210587-1006'
+$aclAuthenticatedUsersSid = 'S-1-5-11'
+$aclUsersSid = 'S-1-5-32-545'
+$aclFullControl = [int64][System.Security.AccessControl.FileSystemRights]::FullControl
+$aclGatewayRx = [int64](
+    [System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor
+    [System.Security.AccessControl.FileSystemRights]::Synchronize
+)
+function New-ValidAclPlanFixture {
+    [pscustomobject]@{
+        target = 'C:\Program Files\AutomatonPython\3.14.5'
+        owner = 'BUILTIN\Administrators'
+        owner_sid = $aclAdministratorsSid
+        protect_inheritance = $true
+        remove_inherited_aces = $true
+        target_tree_reparse_points = 0
+        validated_tree_item_count = 100
+        entries = @(
+            [pscustomobject]@{ identity = 'NT AUTHORITY\SYSTEM'; sid = $aclSystemSid; rights = 'FullControl'; rights_value = $aclFullControl; type = 'Allow' },
+            [pscustomobject]@{ identity = 'BUILTIN\Administrators'; sid = $aclAdministratorsSid; rights = 'FullControl'; rights_value = $aclFullControl; type = 'Allow' },
+            [pscustomobject]@{ identity = 'LAB\AutomatonGateway'; sid = $aclGatewaySid; rights = 'ReadAndExecute,Synchronize'; rights_value = $aclGatewayRx; type = 'Allow' }
+        )
+        automaton_agent_effective_access = 'NONE'
+        authenticated_users_modify = $false
+        users_modify = $false
+        deny_aces_planned = 0
+        other_domains_modified = $false
+    }
+}
+function Test-AclPlanFixture([object] $Plan) {
+    Test-TradingLabRuntimeAclPlan $Plan 'C:\Program Files\AutomatonPython\3.14.5' `
+        $aclSystemSid $aclAdministratorsSid $aclGatewaySid $aclAgentSid `
+        $aclAuthenticatedUsersSid $aclUsersSid $aclFullControl $aclGatewayRx
+}
+function Copy-AclPlanFixture([object] $Plan) {
+    return ($Plan | ConvertTo-Json -Depth 8 | ConvertFrom-Json)
+}
+
+$validAclPlan = New-ValidAclPlanFixture
+Assert-True (Test-AclPlanFixture $validAclPlan).valid 'The exact three-Allow-ACE runtime ACL plan must pass.'
+$directoryDescriptor = New-TradingLabRuntimeSecurityDescriptor $true $validAclPlan
+$descriptorRules = @($directoryDescriptor.GetAccessRules(
+    $true, $false, [System.Security.Principal.SecurityIdentifier]
+))
+Assert-True ($directoryDescriptor.AreAccessRulesProtected) 'In-memory descriptor inheritance must be protected.'
+Assert-True ($directoryDescriptor.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -eq $aclAdministratorsSid) 'In-memory descriptor owner must be Administrators.'
+Assert-True ($descriptorRules.Count -eq 3) 'In-memory descriptor must contain exactly three ACEs.'
+Assert-True (@($descriptorRules | Where-Object { $_.AccessControlType -ne 'Allow' }).Count -eq 0) 'In-memory descriptor must contain no Deny ACE.'
+Assert-True ([int64](($descriptorRules | Where-Object { $_.IdentityReference.Value -eq $aclGatewaySid }).FileSystemRights) -eq $aclGatewayRx) 'In-memory Gateway descriptor rights must be exact RX plus Synchronize.'
+foreach ($wrongTarget in @(
+    'C:\Program Files\AutomatonPython\3.14.6', 'C:\automaton',
+    'C:\ProgramData\AutomatonMT5Lab', 'C:\Users\AutomatonAgent',
+    'C:\Users\AutomatonGateway'
+)) {
+    $case = Copy-AclPlanFixture $validAclPlan; $case.target = $wrongTarget
+    Assert-True (-not (Test-AclPlanFixture $case).valid) "ACL target must fail closed: $wrongTarget"
+}
+$reparseCase = Copy-AclPlanFixture $validAclPlan; $reparseCase.target_tree_reparse_points = 1
+Assert-True (-not (Test-AclPlanFixture $reparseCase).valid) 'A target reparse point must fail closed.'
+$gatewayModifyCase = Copy-AclPlanFixture $validAclPlan
+($gatewayModifyCase.entries | Where-Object { $_.sid -eq $aclGatewaySid }).rights_value = [int64][System.Security.AccessControl.FileSystemRights]::Modify
+Assert-True (-not (Test-AclPlanFixture $gatewayModifyCase).valid) 'Gateway Modify in the plan must fail closed.'
+$gatewayFullCase = Copy-AclPlanFixture $validAclPlan
+($gatewayFullCase.entries | Where-Object { $_.sid -eq $aclGatewaySid }).rights_value = $aclFullControl
+Assert-True (-not (Test-AclPlanFixture $gatewayFullCase).valid) 'Gateway FullControl in the plan must fail closed.'
+$agentAllowCase = Copy-AclPlanFixture $validAclPlan
+$agentAllowCase.entries = @($agentAllowCase.entries) + @([pscustomobject]@{
+    identity = 'LAB\AutomatonAgent'; sid = $aclAgentSid; rights = 'ReadAndExecute'; rights_value = $aclGatewayRx; type = 'Allow'
+})
+Assert-True (-not (Test-AclPlanFixture $agentAllowCase).valid) 'Any Agent Allow ACE must fail closed.'
+$denyCase = Copy-AclPlanFixture $validAclPlan; $denyCase.deny_aces_planned = 1
+Assert-True (-not (Test-AclPlanFixture $denyCase).valid) 'Any planned Deny ACE must fail closed.'
+$unresolvedIdentityCase = Copy-AclPlanFixture $validAclPlan
+($unresolvedIdentityCase.entries | Where-Object { $_.sid -eq $aclGatewaySid }).identity = ''
+Assert-True (-not (Test-AclPlanFixture $unresolvedIdentityCase).valid) 'An unresolved plan identity must fail closed.'
+$systemWeakCase = Copy-AclPlanFixture $validAclPlan
+($systemWeakCase.entries | Where-Object { $_.sid -eq $aclSystemSid }).rights_value = $aclGatewayRx
+Assert-True (-not (Test-AclPlanFixture $systemWeakCase).valid) 'SYSTEM without exact FullControl must fail closed.'
+$administratorsWeakCase = Copy-AclPlanFixture $validAclPlan
+($administratorsWeakCase.entries | Where-Object { $_.sid -eq $aclAdministratorsSid }).rights_value = $aclGatewayRx
+Assert-True (-not (Test-AclPlanFixture $administratorsWeakCase).valid) 'Administrators without exact FullControl must fail closed.'
+$inheritanceCase = Copy-AclPlanFixture $validAclPlan; $inheritanceCase.protect_inheritance = $false
+Assert-True (-not (Test-AclPlanFixture $inheritanceCase).valid) 'Unprotected inheritance must fail closed.'
+$authenticatedUsersCase = Copy-AclPlanFixture $validAclPlan
+$authenticatedUsersCase.authenticated_users_modify = $true
+$authenticatedUsersCase.entries = @($authenticatedUsersCase.entries) + @([pscustomobject]@{
+    identity = 'NT AUTHORITY\Authenticated Users'; sid = $aclAuthenticatedUsersSid; rights = 'Modify'; rights_value = [int64][System.Security.AccessControl.FileSystemRights]::Modify; type = 'Allow'
+})
+Assert-True (-not (Test-AclPlanFixture $authenticatedUsersCase).valid) 'Authenticated Users Modify must fail closed.'
+$usersCase = Copy-AclPlanFixture $validAclPlan
+$usersCase.users_modify = $true
+$usersCase.entries = @($usersCase.entries) + @([pscustomobject]@{
+    identity = 'BUILTIN\Users'; sid = $aclUsersSid; rights = 'Modify'; rights_value = [int64][System.Security.AccessControl.FileSystemRights]::Modify; type = 'Allow'
+})
+Assert-True (-not (Test-AclPlanFixture $usersCase).valid) 'BUILTIN Users Modify must fail closed.'
 
 $lockedWheelFixture = @(
     [pscustomobject]@{ name = 'MetaTrader5'; version = '5.0.6090'; sha256 = ('a' * 64) },
@@ -576,6 +701,17 @@ foreach ($gate in @(
     UNEXPECTED_MACHINE_MSI_FAIL_CLOSED = 'PASS'
     INCOMPLETE_ACL_STATE_DETECTED = 'PASS'
     ACL_ONLY_RESUME_BOUNDARY = 'PASS'
+    ACL_PLAN_EXACT = 'PASS'
+    ACL_TARGET_OUTSIDE_RUNTIME_FAIL_CLOSED = 'PASS'
+    ACL_REPARSE_TARGET_FAIL_CLOSED = 'PASS'
+    ACL_GATEWAY_PRIVILEGE_ESCALATION_FAIL_CLOSED = 'PASS'
+    ACL_AGENT_ALLOW_FAIL_CLOSED = 'PASS'
+    ACL_DENY_ACE_FAIL_CLOSED = 'PASS'
+    ACL_UNRESOLVED_IDENTITY_FAIL_CLOSED = 'PASS'
+    ACL_SYSTEM_ADMIN_FULLCONTROL_REQUIRED = 'PASS'
+    ACL_INHERITANCE_PROTECTED_REQUIRED = 'PASS'
+    ACL_BROAD_GROUP_MODIFY_FAIL_CLOSED = 'PASS'
+    ACL_DRY_RUN_NO_MUTATION = 'PASS'
     FAILURE_PRESERVES_INSTALLED_RUNTIME = 'PASS'
     VENV_STAGING_AND_ROLLBACK = 'PASS'
     VENV_HASH_LOCK_ONLY = 'PASS'

@@ -51,6 +51,7 @@ $agentSid = 'S-1-5-21-568964486-193631783-1609210587-1006'
 $gatewaySid = 'S-1-5-21-568964486-193631783-1609210587-1007'
 $fullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
 $readExecute = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+$gatewayReadExecute = $readExecute -bor [System.Security.AccessControl.FileSystemRights]::Synchronize
 $modifyMask = [int64][System.Security.AccessControl.FileSystemRights]::Modify
 $runId = [guid]::NewGuid().ToString('D').ToLowerInvariant()
 $reportDirectory = Join-Path $maintenanceRoot 'python-runtime-results'
@@ -85,6 +86,9 @@ $report = [ordered]@{
     gateway_started = $false
     acl_existing_domains_modified = $false
     machine_runtime_acl_modified = $false
+    acl_apply_requested = $false
+    acl_applied = $false
+    acl_plan = $null
     must_not_execute_installer = $false
     recovery_state = $null
     installer_result_log = $null
@@ -103,6 +107,7 @@ $report = [ordered]@{
 }
 
 . (Join-Path $PSScriptRoot 'TradingLabPythonInventory.ps1')
+. (Join-Path $PSScriptRoot 'TradingLabPythonAclPlan.ps1')
 
 function Get-CanonicalPath([string] $Path) {
     if (-not [System.IO.Path]::IsPathRooted($Path)) { throw "Path must be absolute: $Path" }
@@ -193,7 +198,176 @@ function Assert-TreeNotModifiableByServices([string] $Root) {
     }
 }
 
-function New-ExactRuntimeSecurity([bool] $Directory, [bool] $IncludeGateway) {
+function Resolve-ExactIdentityName([string] $Sid) {
+    try {
+        $securityIdentifier = [System.Security.Principal.SecurityIdentifier]::new($Sid)
+        $account = $securityIdentifier.Translate([System.Security.Principal.NTAccount])
+        $roundTrip = $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        if ($roundTrip -ne $Sid) { throw 'SID round-trip mismatch.' }
+        return $account.Value
+    } catch { throw "ACL_IDENTITY_UNRESOLVED=FAIL: $Sid" }
+}
+
+function Assert-ExactRuntimeTarget([string] $Root) {
+    $canonical = Get-CanonicalPath $Root
+    if (-not $canonical.Equals((Get-CanonicalPath $pythonBase), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "ACL_TARGET_ONLY=FAIL: $canonical"
+    }
+    if (-not (Test-Path -LiteralPath $canonical -PathType Container)) {
+        throw 'ACL_TARGET_ONLY=FAIL: exact runtime target is absent.'
+    }
+    Assert-NoReparseComponents $canonical
+    return $canonical
+}
+
+function Get-ExactRuntimeTreeSnapshot([string] $Root) {
+    $canonicalRoot = Assert-ExactRuntimeTarget $Root
+    $snapshot = [System.Collections.Generic.List[object]]::new()
+    $pending = [System.Collections.Generic.Queue[string]]::new()
+    $pending.Enqueue($canonicalRoot)
+    while ($pending.Count -gt 0) {
+        $current = $pending.Dequeue()
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw "REPARSE_POINT_FAIL_CLOSED: $($item.FullName)"
+        }
+        $canonicalItem = Get-CanonicalPath $item.FullName
+        if (-not (Test-PathWithin $canonicalItem $canonicalRoot)) {
+            throw "ACL_TARGET_CONFINEMENT=FAIL: $canonicalItem"
+        }
+        $snapshot.Add([pscustomobject]@{ path = $canonicalItem; is_directory = [bool]$item.PSIsContainer })
+        if (-not $item.PSIsContainer) { continue }
+        foreach ($childPath in [System.IO.Directory]::EnumerateFileSystemEntries($canonicalItem)) {
+            $child = Get-Item -LiteralPath $childPath -Force -ErrorAction Stop
+            if ($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                throw "REPARSE_POINT_FAIL_CLOSED: $($child.FullName)"
+            }
+            $canonicalChild = Get-CanonicalPath $child.FullName
+            if (-not (Test-PathWithin $canonicalChild $canonicalRoot)) {
+                throw "ACL_TARGET_CONFINEMENT=FAIL: $canonicalChild"
+            }
+            if ($child.PSIsContainer) { $pending.Enqueue($canonicalChild) }
+            else { $snapshot.Add([pscustomobject]@{ path = $canonicalChild; is_directory = $false }) }
+        }
+    }
+    return @($snapshot)
+}
+
+function New-MachineRuntimeAclPlan([string] $Target) {
+    $canonicalTarget = Assert-ExactRuntimeTarget $Target
+    $tree = @(Get-ExactRuntimeTreeSnapshot $canonicalTarget)
+    $systemName = Resolve-ExactIdentityName $systemSid
+    $administratorsName = Resolve-ExactIdentityName $administratorsSid
+    $gatewayName = Resolve-ExactIdentityName $gatewaySid
+    [pscustomobject][ordered]@{
+        target = $canonicalTarget
+        owner = $administratorsName
+        owner_sid = $administratorsSid
+        protect_inheritance = $true
+        remove_inherited_aces = $true
+        target_tree_reparse_points = 0
+        validated_tree_item_count = $tree.Count
+        entries = @(
+            [pscustomobject][ordered]@{ identity = $systemName; sid = $systemSid; rights = 'FullControl'; rights_value = [int64]$fullControl; type = 'Allow' },
+            [pscustomobject][ordered]@{ identity = $administratorsName; sid = $administratorsSid; rights = 'FullControl'; rights_value = [int64]$fullControl; type = 'Allow' },
+            [pscustomobject][ordered]@{ identity = $gatewayName; sid = $gatewaySid; rights = 'ReadAndExecute,Synchronize'; rights_value = [int64]$gatewayReadExecute; type = 'Allow' }
+        )
+        automaton_agent_effective_access = 'NONE'
+        authenticated_users_modify = $false
+        users_modify = $false
+        deny_aces_planned = 0
+        other_domains_modified = $false
+    }
+}
+
+function Assert-MachineRuntimeAclPlan([object] $Plan) {
+    $state = Test-TradingLabRuntimeAclPlan $Plan $pythonBase `
+        $systemSid $administratorsSid $gatewaySid $agentSid `
+        $authenticatedUsersSid $usersSid ([int64]$fullControl) ([int64]$gatewayReadExecute)
+    if (-not $state.valid) { throw "ACL_PLAN=FAIL: $($state.failures -join ';')" }
+}
+
+function Set-MachineRuntimeAclPlanGates([object] $Plan) {
+    Assert-MachineRuntimeAclPlan $Plan
+    $report.acl_plan = $Plan
+    $report.gates.ACL_TARGET_ONLY = 'PASS'
+    $report.gates.ACL_OWNER_ADMINISTRATORS_PLANNED = 'PASS'
+    $report.gates.ACL_INHERITANCE_PROTECTED_PLANNED = 'PASS'
+    $report.gates.SYSTEM_FULLCONTROL_PLANNED = 'PASS'
+    $report.gates.ADMINISTRATORS_FULLCONTROL_PLANNED = 'PASS'
+    $report.gates.GATEWAY_READ_EXECUTE_PLANNED = 'PASS'
+    $report.gates.GATEWAY_WRITE_ABSENT_PLANNED = 'PASS'
+    $report.gates.GATEWAY_MODIFY_ABSENT_PLANNED = 'PASS'
+    $report.gates.GATEWAY_DELETE_ABSENT_PLANNED = 'PASS'
+    $report.gates.GATEWAY_CHANGE_PERMISSIONS_ABSENT_PLANNED = 'PASS'
+    $report.gates.GATEWAY_TAKE_OWNERSHIP_ABSENT_PLANNED = 'PASS'
+    $report.gates.AGENT_ACCESS_ABSENT_PLANNED = 'PASS'
+    $report.gates.AUTHENTICATED_USERS_MODIFY_ABSENT_PLANNED = 'PASS'
+    $report.gates.USERS_MODIFY_ABSENT_PLANNED = 'PASS'
+    $report.gates.DENY_ACES_PLANNED = 0
+    $report.gates.ACL_OTHER_DOMAINS_MODIFIED = 'false'
+}
+
+function New-ExactRuntimeSecurity([bool] $Directory, [object] $Plan) {
+    Assert-MachineRuntimeAclPlan $Plan
+    return New-TradingLabRuntimeSecurityDescriptor $Directory $Plan
+}
+
+function Assert-InMemoryRuntimeSecurity([object] $Security, [object] $Plan) {
+    $entries = @($Security.GetAccessRules(
+        $true, $false, [System.Security.Principal.SecurityIdentifier]
+    ) | ForEach-Object {
+        [pscustomobject]@{
+            identity = $_.IdentityReference.Value
+            sid = $_.IdentityReference.Value
+            rights_value = [int64]$_.FileSystemRights
+            type = $_.AccessControlType.ToString()
+        }
+    })
+    $materialized = [pscustomobject]@{
+        target = $Plan.target
+        owner = $Plan.owner
+        owner_sid = $Security.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        protect_inheritance = [bool]$Security.AreAccessRulesProtected
+        remove_inherited_aces = $true
+        target_tree_reparse_points = 0
+        entries = $entries
+        automaton_agent_effective_access = 'NONE'
+        authenticated_users_modify = $false
+        users_modify = $false
+        deny_aces_planned = @($entries | Where-Object { $_.type -eq 'Deny' }).Count
+        other_domains_modified = $false
+    }
+    Assert-MachineRuntimeAclPlan $materialized
+}
+
+function Protect-ExactRuntimeTree([string] $Root, [object] $Plan) {
+    $canonicalRoot = Assert-ExactRuntimeTarget $Root
+    Assert-MachineRuntimeAclPlan $Plan
+    if (-not (Get-CanonicalPath ([string]$Plan.target)).Equals($canonicalRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'ACL_TARGET_ONLY=FAIL: plan and apply target differ.'
+    }
+
+    # Materialize and validate both descriptors, and snapshot the complete tree,
+    # before the first filesystem ACL mutation.
+    $directorySecurity = New-ExactRuntimeSecurity $true $Plan
+    $fileSecurity = New-ExactRuntimeSecurity $false $Plan
+    Assert-InMemoryRuntimeSecurity $directorySecurity $Plan
+    Assert-InMemoryRuntimeSecurity $fileSecurity $Plan
+    $snapshot = @(Get-ExactRuntimeTreeSnapshot $canonicalRoot)
+
+    foreach ($entry in @($snapshot | Where-Object { $_.path -ne $canonicalRoot })) {
+        $item = Get-Item -LiteralPath $entry.path -Force -ErrorAction Stop
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint -or
+            -not (Test-PathWithin $item.FullName $canonicalRoot)) {
+            throw "ACL_APPLY_TARGET_CHANGED=FAIL: $($item.FullName)"
+        }
+        Set-Acl -LiteralPath $item.FullName -AclObject $(if ($entry.is_directory) { $directorySecurity } else { $fileSecurity })
+    }
+    Set-Acl -LiteralPath $canonicalRoot -AclObject $directorySecurity
+}
+
+function New-AdministrativeMaintenanceSecurity([bool] $Directory) {
     $security = if ($Directory) {
         [System.Security.AccessControl.DirectorySecurity]::new()
     } else { [System.Security.AccessControl.FileSecurity]::new() }
@@ -203,19 +377,9 @@ function New-ExactRuntimeSecurity([bool] $Directory, [bool] $IncludeGateway) {
         [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
             [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
     } else { [System.Security.AccessControl.InheritanceFlags]::None }
-    foreach ($entry in @(
-        [pscustomobject]@{ Sid = $systemSid; Rights = $fullControl },
-        [pscustomobject]@{ Sid = $administratorsSid; Rights = $fullControl }
-    )) {
+    foreach ($sid in @($systemSid, $administratorsSid)) {
         [void]$security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
-            [System.Security.Principal.SecurityIdentifier]::new($entry.Sid), $entry.Rights,
-            $inheritance, [System.Security.AccessControl.PropagationFlags]::None,
-            [System.Security.AccessControl.AccessControlType]::Allow
-        ))
-    }
-    if ($IncludeGateway) {
-        [void]$security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
-            [System.Security.Principal.SecurityIdentifier]::new($gatewaySid), $readExecute,
+            [System.Security.Principal.SecurityIdentifier]::new($sid), $fullControl,
             $inheritance, [System.Security.AccessControl.PropagationFlags]::None,
             [System.Security.AccessControl.AccessControlType]::Allow
         ))
@@ -223,45 +387,43 @@ function New-ExactRuntimeSecurity([bool] $Directory, [bool] $IncludeGateway) {
     return $security
 }
 
-function Protect-ExactRuntimeTree([string] $Root, [bool] $IncludeGateway) {
+function Protect-AdministrativeMaintenanceTree([string] $Root) {
     Assert-NoReparseComponents $Root
     $items = @(Get-ChildItem -LiteralPath $Root -Force -Recurse -ErrorAction Stop)
     foreach ($item in $items) {
         if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-            throw "Runtime tree contains a reparse point: $($item.FullName)"
+            throw "Maintenance tree contains a reparse point: $($item.FullName)"
         }
-        Set-Acl -LiteralPath $item.FullName -AclObject (New-ExactRuntimeSecurity $item.PSIsContainer $IncludeGateway)
+        Set-Acl -LiteralPath $item.FullName -AclObject (New-AdministrativeMaintenanceSecurity $item.PSIsContainer)
     }
-    Set-Acl -LiteralPath $Root -AclObject (New-ExactRuntimeSecurity $true $IncludeGateway)
+    Set-Acl -LiteralPath $Root -AclObject (New-AdministrativeMaintenanceSecurity $true)
 }
 
 function Assert-ExactBaseAcl([string] $Root) {
     $allowedSids = @($systemSid, $administratorsSid, $gatewaySid)
-    foreach ($item in @((Get-Item -LiteralPath $Root -Force)) + @(
-        Get-ChildItem -LiteralPath $Root -Force -Recurse -ErrorAction Stop
-    )) {
-        $acl = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
+    foreach ($item in @(Get-ExactRuntimeTreeSnapshot $Root)) {
+        $acl = Get-Acl -LiteralPath $item.path -ErrorAction Stop
         if ((Resolve-IdentitySid $acl.Owner) -ne $administratorsSid -or -not $acl.AreAccessRulesProtected) {
-            throw "Python runtime owner/inheritance is not exact: $($item.FullName)"
+            throw "Python runtime owner/inheritance is not exact: $($item.path)"
         }
         $rightsBySid = @{}
         foreach ($rule in $acl.Access) {
             $sid = Resolve-IdentitySid $rule.IdentityReference
             if ($rule.AccessControlType -ne 'Allow' -or $sid -notin $allowedSids) {
-                throw "Unexpected Python runtime ACE on $($item.FullName): $sid"
+                throw "Unexpected Python runtime ACE on $($item.path): $sid"
             }
-            if (-not $rightsBySid.ContainsKey($sid)) { $rightsBySid[$sid] = 0L }
-            $rightsBySid[$sid] = $rightsBySid[$sid] -bor [int64]$rule.FileSystemRights
+            if ($rightsBySid.ContainsKey($sid)) { throw "Duplicate Python runtime ACE on $($item.path): $sid" }
+            $rightsBySid[$sid] = [int64]$rule.FileSystemRights
         }
         if (
+            $rightsBySid.Count -ne 3 -or
             -not $rightsBySid.ContainsKey($systemSid) -or
             -not $rightsBySid.ContainsKey($administratorsSid) -or
             -not $rightsBySid.ContainsKey($gatewaySid) -or
-            (($rightsBySid[$systemSid] -band [int64]$fullControl) -ne [int64]$fullControl) -or
-            (($rightsBySid[$administratorsSid] -band [int64]$fullControl) -ne [int64]$fullControl) -or
-            (($rightsBySid[$gatewaySid] -band [int64]$modifyMask) -ne 0) -or
-            (($rightsBySid[$gatewaySid] -band [int64]$readExecute) -ne [int64]$readExecute)
-        ) { throw "Python runtime ACL is incomplete or grants Gateway write rights: $($item.FullName)" }
+            $rightsBySid[$systemSid] -ne [int64]$fullControl -or
+            $rightsBySid[$administratorsSid] -ne [int64]$fullControl -or
+            $rightsBySid[$gatewaySid] -ne [int64]$gatewayReadExecute
+        ) { throw "Python runtime ACL is not the exact three-ACE model: $($item.path)" }
     }
 }
 
@@ -988,9 +1150,14 @@ function Get-MachineRuntimeAclState {
 }
 
 function Set-MachineRuntimeAclPassGates {
+    $report.gates.SYSTEM_FULLCONTROL = 'PASS'
+    $report.gates.ADMINISTRATORS_FULLCONTROL = 'PASS'
     $report.gates.PYTHON_GATEWAY_EXECUTE = 'PASS'
     $report.gates.PYTHON_GATEWAY_MODIFY_DENY = 'PASS'
     $report.gates.PYTHON_AGENT_ACCESS_DENY = 'PASS'
+    $report.gates.AUTHENTICATED_USERS_MODIFY = 'false'
+    $report.gates.USERS_MODIFY = 'false'
+    $report.gates.DENY_ACES_USED = 'false'
     $report.gates.PYTHON_RUNTIME_ACL = 'PASS'
 }
 
@@ -1020,6 +1187,10 @@ function Complete-InstalledMachineRuntime([object] $Inventory) {
     Set-MachineRuntimePassGates $metadata
     $report.inventory_after = $Inventory.state
 
+    $aclPlan = New-MachineRuntimeAclPlan $pythonBase
+    Set-MachineRuntimeAclPlanGates $aclPlan
+    $report.acl_apply_requested = [bool]$Apply
+
     $aclState = Get-MachineRuntimeAclState
     if ($aclState -eq 'EXACT') {
         Set-MachineRuntimeAclPassGates
@@ -1034,8 +1205,9 @@ function Complete-InstalledMachineRuntime([object] $Inventory) {
     if (-not $Apply) { return }
     Initialize-PhaseStorage
     $report.current_run_applied_phase = 'MachineRuntimeAclRecoveryRequested'
-    Protect-ExactRuntimeTree $pythonBase $true
+    Protect-ExactRuntimeTree $pythonBase $aclPlan
     $report.machine_runtime_acl_modified = $true
+    $report.acl_applied = $true
     Assert-ExactBaseAcl $pythonBase
     Assert-TreeNotModifiableByServices $pythonBase
     $report.current_run_applied_phase = 'MachineRuntimeAclRecovered'
@@ -1058,6 +1230,14 @@ function Write-Gates {
     foreach ($gate in $report.gates.GetEnumerator()) {
         Write-Output "$($gate.Key)=$($gate.Value)"
     }
+}
+
+function Write-MutationBoundarySummary {
+    Write-Output "machine_runtime_acl_modified=$($report.machine_runtime_acl_modified.ToString().ToLowerInvariant())"
+    Write-Output "acl_apply_requested=$($report.acl_apply_requested.ToString().ToLowerInvariant())"
+    Write-Output "ACL_APPLIED=$($report.acl_applied.ToString().ToLowerInvariant())"
+    Write-Output "VENV_REBUILT=$($report.venv_rebuilt.ToString().ToLowerInvariant())"
+    Write-Output "MT5_ACCESSED=$($report.mt5_accessed.ToString().ToLowerInvariant())"
 }
 
 function Write-UninstallPreflightSummary {
@@ -1295,8 +1475,12 @@ try {
             $after = Get-TradingLabPythonInventory
             $report.inventory_after = $after.state
             Assert-MachineInstallationInventory $after
-            Protect-ExactRuntimeTree $pythonBase $true
+            $aclPlan = New-MachineRuntimeAclPlan $pythonBase
+            Set-MachineRuntimeAclPlanGates $aclPlan
+            $report.acl_apply_requested = $true
+            Protect-ExactRuntimeTree $pythonBase $aclPlan
             $report.machine_runtime_acl_modified = $true
+            $report.acl_applied = $true
             Assert-ExactBaseAcl $pythonBase
             Assert-TreeNotModifiableByServices $pythonBase
             Set-MachineRuntimePassGates $metadata
@@ -1371,7 +1555,7 @@ try {
                 if (Test-Path -LiteralPath $venvPath) {
                     $failedPath = Join-Path $maintenanceRoot "venv-failed-$runId"
                     Move-Item -LiteralPath $venvPath -Destination $failedPath
-                    Protect-ExactRuntimeTree $failedPath $false
+                    Protect-AdministrativeMaintenanceTree $failedPath
                 }
                 if ($oldMoved -and -not (Test-Path -LiteralPath $venvPath)) {
                     Move-Item -LiteralPath $backupPath -Destination $venvPath
@@ -1380,7 +1564,7 @@ try {
                 throw
             }
             if ($oldMoved) {
-                Protect-ExactRuntimeTree $backupPath $false
+                Protect-AdministrativeMaintenanceTree $backupPath
                 $report.old_venv_backup = $backupPath
             }
             $report.gates.PYTHON_BASE_MACHINE_WIDE = 'PASS'
@@ -1401,6 +1585,7 @@ try {
         Write-Output "PYTHON_RECOVERY_PHASE=$Phase"
         Write-Output "MUST_NOT_EXECUTE_INSTALLER=$($report.must_not_execute_installer.ToString().ToLowerInvariant())"
         Write-Output "INSTALLER_REEXECUTED=$($report.installer_reexecuted.ToString().ToLowerInvariant())"
+        Write-MutationBoundarySummary
         Write-Output 'PYTHON_RUNTIME_APPLY=NOT_RUN'
         exit 0
     }
@@ -1410,6 +1595,7 @@ try {
     Write-Output "PYTHON_RECOVERY_PHASE=$Phase"
     Write-Output "MUST_NOT_EXECUTE_INSTALLER=$($report.must_not_execute_installer.ToString().ToLowerInvariant())"
     Write-Output "INSTALLER_REEXECUTED=$($report.installer_reexecuted.ToString().ToLowerInvariant())"
+    Write-MutationBoundarySummary
     Write-Output "PYTHON_RUNTIME_GATE_REPORT=$reportPath"
 } catch {
     $report.status = 'FAIL'

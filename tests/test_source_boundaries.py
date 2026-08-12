@@ -264,6 +264,7 @@ class SourceBoundaryTests(unittest.TestCase):
                 "Collect-RuntimeAclResults.ps1",
                 "Install-TradingLabPythonRuntime.ps1",
                 "TradingLabPythonInventory.ps1",
+                "TradingLabPythonAclPlan.ps1",
                 "Initialize-GatewayPythonEnvironment.ps1",
             )
         ]
@@ -305,6 +306,13 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn("INSTALLER_REEXECUTED", installer)
         self.assertIn("ResumeMachineRuntime", installer)
         self.assertIn("PYTHON_AGENT_ACCESS_DENY", installer)
+        self.assertIn("acl_plan", installer)
+        self.assertIn("acl_apply_requested", installer)
+        self.assertIn("ACL_TARGET_ONLY", installer)
+        self.assertIn("ACL_OWNER_ADMINISTRATORS_PLANNED", installer)
+        self.assertIn("GATEWAY_READ_EXECUTE_PLANNED", installer)
+        self.assertIn("AGENT_ACCESS_ABSENT_PLANNED", installer)
+        self.assertIn("DENY_ACES_PLANNED", installer)
         self.assertIn("Assert-InstallMachinePreconditions", installer)
         self.assertIn("INSTALL_CPYTHON_MACHINE_WIDE_MINIMAL", installer)
         self.assertIn("INSTALL_ALL_USERS", installer)
@@ -340,6 +348,50 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn("$env:TMP = $canonicalTemp", environment)
         self.assertIn("$env:PYTHONDONTWRITEBYTECODE = '1'", environment)
         self.assertNotIn("Windows\\TEMP", environment)
+
+    def test_machine_runtime_acl_resume_is_exact_target_and_dry_run_safe(self) -> None:
+        installer = (ROOT / "scripts" / "Install-TradingLabPythonRuntime.ps1").read_text(
+            encoding="utf-8"
+        )
+        plan_source = (ROOT / "scripts" / "TradingLabPythonAclPlan.ps1").read_text(
+            encoding="utf-8"
+        )
+        for invariant in (
+            "ACL_TARGET_NOT_EXACT_RUNTIME",
+            "ACL_TARGET_REPARSE_POINT",
+            "ACL_GATEWAY_RIGHTS_NOT_EXACT_RX",
+            "ACL_FORBIDDEN_ALLOW",
+            "ACL_DENY_ACE_PLANNED",
+            "ACL_SYSTEM_NOT_EXACT_FULLCONTROL",
+            "ACL_ADMINISTRATORS_NOT_EXACT_FULLCONTROL",
+            "ACL_INHERITANCE_NOT_PROTECTED",
+            "ACL_AUTHENTICATED_USERS_MODIFY",
+            "ACL_USERS_MODIFY",
+            "ACL_OTHER_DOMAIN_MUTATION",
+        ):
+            self.assertIn(invariant, plan_source)
+
+        complete_start = installer.index("function Complete-InstalledMachineRuntime")
+        complete_end = installer.index("function Write-Report", complete_start)
+        complete = installer[complete_start:complete_end]
+        dry_return = complete.index("if (-not $Apply) { return }")
+        mutation = complete.index("Protect-ExactRuntimeTree $pythonBase $aclPlan")
+        self.assertLess(dry_return, mutation)
+        self.assertNotIn("Set-Acl", complete[:dry_return])
+        self.assertNotIn(".SetOwner(", complete[:dry_return])
+
+        protect_start = installer.index("function Protect-ExactRuntimeTree")
+        protect_end = installer.index("function New-AdministrativeMaintenanceSecurity", protect_start)
+        protect = installer[protect_start:protect_end]
+        self.assertIn("Assert-ExactRuntimeTarget $Root", protect)
+        self.assertIn("Assert-MachineRuntimeAclPlan $Plan", protect)
+        self.assertLess(
+            protect.index("Assert-InMemoryRuntimeSecurity $fileSecurity $Plan"),
+            protect.index("Set-Acl -LiteralPath $item.FullName"),
+        )
+        self.assertIn("REPARSE_POINT_FAIL_CLOSED", installer)
+        self.assertIn("[System.IO.Directory]::EnumerateFileSystemEntries", installer)
+        self.assertNotIn("AccessControlType]::Deny", installer)
 
     def test_agent_trading_integration_has_no_direct_programdata_or_mt5_access(self) -> None:
         sources = "\n".join(

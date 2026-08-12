@@ -180,6 +180,22 @@ reciben acceso. Si el árbol conserva ACL heredadas, el dry-run emite
 `PYTHON_RUNTIME_ACL=INCOMPLETE_REQUIRES_EXPLICIT_APPLY`; no intenta ocultar la
 instalación válida ni vuelve a ejecutar el installer.
 
+El dry-run de `ResumeMachineRuntime` incluye un `acl_plan` completo antes de
+cualquier autorización de Apply. El plan queda confinado exactamente a
+`C:\Program Files\AutomatonPython\3.14.5`, resuelve las identidades por SID,
+protege la herencia descartando ACEs heredadas y admite exclusivamente tres
+ACEs Allow: SYSTEM FullControl, Administrators FullControl y AutomatonGateway
+ReadAndExecute más Synchronize. AutomatonAgent obtiene acceso `NONE` por
+ausencia de ACE; no se planifican ACEs Deny. La validación rechaza otros
+targets, reparse points, derechos adicionales, grupos amplios o cualquier
+mutación de otro dominio.
+
+Antes del primer `Set-Acl`, la futura ejecución autorizada vuelve a validar el
+plan, materializa en memoria los descriptores de directorio y fichero, valida
+owner/ACEs/herencia y enumera el árbol sin seguir junctions ni enlaces. En
+dry-run permanecen explícitamente `machine_runtime_acl_modified=false`,
+`acl_apply_requested=false` y `ACL_APPLIED=false`.
+
 ## Procedimiento humano elevado para el estado actual
 
 No ejecutar Automaton ni Gateway durante la recuperación. Mantener
