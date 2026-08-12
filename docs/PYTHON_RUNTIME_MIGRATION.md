@@ -79,10 +79,20 @@ ejecución humana explícita:
    que no queden instalaciones traditional 3.14.5, componentes MSI, destino
    parcial ni registro `PythonCore` mixto. También vuelve a verificar el full
    installer y los 27 wheels antes de exponer el plan exacto; solo entonces
-   puede ejecutar el instalador con log durable.
-4. `BuildVenv`: crea exactamente `C:\automaton\.venv.new` con el Python
+   puede ejecutar el instalador con log durable. Si detecta en cambio el
+   payload exacto ya instalado, entra en
+   `TARGET_RUNTIME_ALREADY_INSTALLED_VALIDATION_PENDING`, fija
+   `MUST_NOT_EXECUTE_INSTALLER=true` y no alcanza el sitio de ejecución del
+   bootstrapper.
+4. `ResumeMachineRuntime`: solo admite el payload machine-wide exacto, cuatro
+   MSI bajo SYSTEM y un reporte fallido que pruebe que el installer anterior
+   terminó antes de fallar la validación. Revalida metadata y el log, y puede
+   aplicar exclusivamente la ACL del árbol del runtime con un `-Apply`
+   separado. Nunca instala, desinstala, construye un venv ni toca otros
+   dominios ACL.
+5. `BuildVenv`: crea exactamente `C:\automaton\.venv.new` con el Python
    machine-wide e instala offline desde el wheelhouse y el lock.
-5. `PromoteVenv`: valida de nuevo `.venv.new`, mueve el venv activo a un backup
+6. `PromoteVenv`: valida de nuevo `.venv.new`, mueve el venv activo a un backup
    administrativo y solo entonces promueve el staging. Si la validación
    posterior falla, conserva el resultado fallido y restaura el venv anterior.
 
@@ -96,6 +106,12 @@ describe exclusivamente las mutaciones de esa ejecución. La continuidad se
 expresa aparte con `required_previous_phase`, `previous_phase_verified` y
 `previous_phase_report`; ningún valor de fase de una ejecución anterior basta
 por sí solo para autorizar una operación.
+
+Todos los probes Python ejecutan `python.exe -I -` con
+`ProcessStartInfo.UseShellExecute=false`. El programa se transmite sin
+transformaciones por stdin y stdout/stderr se capturan por separado. No se usa
+`python -c`, shell ni `Invoke-Expression`, eliminando las capas de quoting que
+podrían transformar `separators=(',', ':')`.
 
 La instalación base excluye explícitamente Development Libraries, Test Suite,
 Documentation y Tcl/Tk porque el Gateway consume exclusivamente wheels
@@ -146,6 +162,24 @@ evidencia anidada faltan, cambian de hash, tienen schema/fase/status
 incompatibles, o reaparece cualquier componente traditional/partial/mixed, la
 fase termina fail-closed antes de `Start-Process`.
 
+Tras una instalación mínima, el registro del bundle puede permanecer en HKCU
+del administrador que lanzó el bootstrapper. Ese registro no demuestra un
+segundo payload de usuario. El inventario conserva por separado
+`traditional_bundle_registration_scope`; determina
+`traditional_runtime_payload_scope=MACHINE` únicamente cuando coinciden el
+target bajo Program Files, PythonCore HKLM y exactamente los cuatro MSI
+esperados —Core Interpreter, Executables, Standard Library y pip Bootstrap—
+bajo SYSTEM. El resultado se clasifica como
+`EXPECTED_INSTALLED_TARGET_RUNTIME`; cualquier combinación incompleta o
+adicional es `CONFLICTING_PREEXISTING_RUNTIME`.
+
+El estado ACL posterior al installer se inspecciona antes de mutar. El estado
+exacto solo contiene SYSTEM y Administrators con FullControl y
+AutomatonGateway con ReadAndExecute, sin herencia. AutomatonAgent y Users no
+reciben acceso. Si el árbol conserva ACL heredadas, el dry-run emite
+`PYTHON_RUNTIME_ACL=INCOMPLETE_REQUIRES_EXPLICIT_APPLY`; no intenta ocultar la
+instalación válida ni vuelve a ejecutar el installer.
+
 ## Procedimiento humano elevado para el estado actual
 
 No ejecutar Automaton ni Gateway durante la recuperación. Mantener
@@ -180,8 +214,8 @@ No borrar archivos ni registro manualmente, no usar `msizap` y no ejecutar la
 fase de instalación. Conservar el reporte y el log `traditional-uninstall` para
 autorizar un gate de recuperación adicional basado en evidencia.
 
-Solo si el inventario posterior muestra simultáneamente
-`SAME_VERSION_TRADITIONAL_INSTALL_PRESENT=PASS` y
+Solo si el inventario anterior a la primera instalación muestra simultáneamente
+`SAME_VERSION_TRADITIONAL_INSTALL_PRESENT=ABSENT` y
 `PARTIAL_TARGET_RUNTIME=ABSENT` y
 `MIXED_PYTHONCORE_REGISTRATION=ABSENT`, continuar:
 
@@ -192,6 +226,13 @@ $Installer = 'C:\ProgramData\AutomatonMT5Lab\maintenance\python-3.14.5-amd64.exe
 # los hashes, los 27 wheels y installer_plan antes de pedir un Apply separado.
 .\scripts\Install-TradingLabPythonRuntime.ps1 -Phase InstallMachineRuntime -InstallerPath $Installer
 .\scripts\Install-TradingLabPythonRuntime.ps1 -Phase InstallMachineRuntime -InstallerPath $Installer -Apply
+
+# Si el installer ya terminó pero la validación/ACL quedó pendiente, no repetir
+# la línea anterior. Prevalidar exclusivamente la recuperación:
+.\scripts\Install-TradingLabPythonRuntime.ps1 -Phase ResumeMachineRuntime -InstallerPath $Installer
+
+# Un Apply de ResumeMachineRuntime requiere autorización humana separada y solo
+# puede validar/aplicar la ACL del runtime; nunca ejecuta el bootstrapper.
 
 # 6. Construir y validar staging; el venv activo aún no cambia.
 .\scripts\Install-TradingLabPythonRuntime.ps1 -Phase BuildVenv

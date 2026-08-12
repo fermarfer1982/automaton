@@ -34,7 +34,7 @@ $gatewayStart = [System.IO.File]::ReadAllText($gatewayStartPath)
 
 foreach ($required in @(
     '#Requires -RunAsAdministrator',
-    "[ValidateSet('Inventory', 'PrepareWheelhouse', 'UninstallTraditional', 'InstallMachineRuntime', 'BuildVenv', 'PromoteVenv')]",
+    "[ValidateSet('Inventory', 'PrepareWheelhouse', 'UninstallTraditional', 'InstallMachineRuntime', 'ResumeMachineRuntime', 'BuildVenv', 'PromoteVenv')]",
     "[string] `$Phase = 'Inventory'",
     'INVENTORY_APPLY_FORBIDDEN',
     'SAME_VERSION_TRADITIONAL_INSTALL_PRESENT=FAIL',
@@ -58,7 +58,7 @@ foreach ($required in @(
     "Invoke-LoggedProcess `$basePython @('-I', '-m', 'venv', `$stagingVenvPath)",
     "'--no-index', '--find-links', `$wheelhousePath",
     'importlib.metadata.version("MetaTrader5")',
-    'InstallMachineRuntimeAlreadyComplete', 'BuildVenvAlreadyComplete',
+    'TARGET_RUNTIME_ALREADY_INSTALLED_VALIDATION_PENDING', 'BuildVenvAlreadyComplete',
     'PromoteVenvAlreadyComplete', 'PromotionRolledBack', 'current_run_applied_phase',
     "required_previous_phase = `$null", "previous_phase_verified = `$false",
     "previous_phase_report = `$null", 'Get-VerifiedPrepareWheelhouseEvidence',
@@ -99,11 +99,15 @@ foreach ($required in @(
     "`$report.gates.DOCUMENTATION_DISABLED = 'PASS'",
     "`$report.gates.TCL_TK_DISABLED = 'PASS'",
     'PYTHON_EXE_EXISTS', 'PYTHON314_DLL_EXISTS', 'PYTHON_LIB_EXISTS',
-    'PYTHON_STDLIB_FUNCTIONAL', 'PYTHON_IMPORT_SYS', 'PYTHON_IMPORT_VENV',
-    'PYTHON_EXACT_VERSION', 'PYTHON_ARCHITECTURE_X64', 'PYTHON_BASE_PREFIX_EXACT',
-    'PYTHON_EXECUTABLE_MACHINE_WIDE', 'PYTHON_RUNTIME_USER_PROFILE_DEPENDENCIES',
+    'PYTHON_STDLIB', 'PYTHON_VENV_IMPORT', 'PYTHON_PIP_AVAILABLE',
+    'PYTHON_VERSION_EXACT', 'PYTHON_ARCH_X64', 'PYTHON_BASE_PREFIX_TARGET',
+    'PYTHON_EXECUTABLE_TARGET', 'PYTHON_RUNTIME_USER_PROFILE_DEPENDENCIES',
     'PYTHON_BASE_MACHINE_WIDE', 'PYTHON_BASE_OUTSIDE_USER_PROFILE',
-    'PYTHON_GATEWAY_EXECUTE', 'PYTHON_GATEWAY_MODIFY_DENY',
+    'PYTHON_GATEWAY_EXECUTE', 'PYTHON_GATEWAY_MODIFY_DENY', 'PYTHON_AGENT_ACCESS_DENY',
+    'MUST_NOT_EXECUTE_INSTALLER', 'INSTALLER_REEXECUTED',
+    'INSTALLED_RUNTIME_EVIDENCE', 'INSTALLER_RESULT_EVIDENCE',
+    'EXPECTED_MACHINE_MSI_COMPONENTS', 'UNEXPECTED_MACHINE_MSI_COMPONENTS',
+    'MachineRuntimeAclRecoveryRequested', 'MachineRuntimeAclRecovered',
     'VENV_BASE_OUTSIDE_USER_PROFILE', 'VENV_LOCK_MATCH',
     'META_TRADER5_PACKAGE_PRESENT',
     "trading_mode\s*:\s*OBSERVE_ONLY",
@@ -125,11 +129,18 @@ foreach ($required in @(
     'Resolve-TradingLabInstallPreconditionState',
     'Resolve-TradingLabInstallerArtifactState',
     'Test-TradingLabExactMachineTarget',
+    'Test-TradingLabInstalledRuntimePendingReportRecord',
+    'Find-TradingLabInstalledRuntimePendingReport',
+    'Resolve-TradingLabMachineMsiComponentState',
+    'Invoke-TradingLabPythonStdinJson',
     'Test-TradingLabManagerExcludedFromUninstallPlan',
     'Resolve-TradingLabMsiComponentSetState',
     'PYTHON_MANAGER_RUNTIME', 'TRADITIONAL_BUNDLE', 'TRADITIONAL_MSI_COMPONENT',
     'partial_target_runtime', 'completed_target_runtime', 'broken_active_venv',
     'mixed_pythoncore_registration', 'same_version_traditional_install_present',
+    'traditional_bundle_registration_scope', 'traditional_runtime_payload_scope',
+    'machine_runtime_target_present', 'machine_runtime_msi_components',
+    'EXPECTED_INSTALLED_TARGET_RUNTIME', 'CONFLICTING_PREEXISTING_RUNTIME',
     'target_probe', 'TARGET_LAYOUT_INCOMPLETE'
 )) {
     Assert-True ($inventorySource.Contains($required)) "Python inventory lacks invariant: $required"
@@ -139,7 +150,7 @@ foreach ($forbidden in @(
     'Invoke-WebRequest', 'Start-BitsTransfer', 'curl.exe', 'msizap', 'Win32_Product',
     'Remove-Item', 'reg.exe delete', 'Package Cache', 'WriteAllText((Join-Path $Root ''pyvenv.cfg'')',
     'import MetaTrader5', '.initialize(', '.login(', '.symbol_select(', '.order_check(', '.order_send(',
-    'Start-Service', 'New-LocalUser', 'Add-LocalGroupMember'
+    'Start-Service', 'New-LocalUser', 'Add-LocalGroupMember', 'Invoke-Expression'
 )) {
     Assert-True (-not ($installer + $inventorySource).Contains($forbidden)) "Python recovery gate contains forbidden action: $forbidden"
 }
@@ -173,9 +184,24 @@ Assert-True ($installBlock.IndexOf("`$report.required_previous_phase = 'Uninstal
 Assert-True ($installBlock.IndexOf('Get-VerifiedUninstallTraditionalEvidence') -lt $installBlock.IndexOf('Start-LoggedInstaller $plan.executable')) 'Durable UninstallTraditional evidence must precede installation.'
 Assert-True ($installBlock.IndexOf('Assert-Wheelhouse $wheelhousePath') -lt $installBlock.IndexOf('Start-LoggedInstaller $plan.executable')) 'Wheelhouse revalidation must precede installation.'
 Assert-True ($installBlock.IndexOf('Assert-Installer $InstallerPath') -lt $installBlock.IndexOf('Start-LoggedInstaller $plan.executable')) 'Installer verification must precede installation.'
+Assert-True ($installBlock.IndexOf('Test-InstalledMachineRuntimePending $inventory') -lt $installBlock.IndexOf('Start-LoggedInstaller $plan.executable')) 'Installed-validation-pending detection must precede every installer execution site.'
+Assert-True ($installBlock.IndexOf('Complete-InstalledMachineRuntime $inventory') -lt $installBlock.IndexOf('Start-LoggedInstaller $plan.executable')) 'Installed runtime recovery must branch before the bootstrapper.'
 foreach ($forbiddenInstallMutation in @('.venv.new', 'Move-Item', 'Invoke-LoggedProcess', 'import MetaTrader5')) {
     Assert-True (-not $installBlock.Contains($forbiddenInstallMutation)) "Install phase crosses a forbidden venv/MT5 boundary: $forbiddenInstallMutation"
 }
+$resumeStart = $installer.IndexOf("'ResumeMachineRuntime' {")
+$resumeEnd = $installer.IndexOf("'BuildVenv' {", $resumeStart)
+Assert-True ($resumeStart -ge 0 -and $resumeEnd -gt $resumeStart) 'ResumeMachineRuntime phase boundary is absent.'
+$resumeBlock = $installer.Substring($resumeStart, $resumeEnd - $resumeStart)
+Assert-True ($resumeBlock.Contains('Complete-InstalledMachineRuntime $inventory')) 'Resume phase must use the shared validation/ACL-only recovery path.'
+foreach ($forbiddenResumeAction in @('Start-LoggedInstaller', 'Invoke-LoggedProcess', 'Move-Item', '.venv.new')) {
+    Assert-True (-not $resumeBlock.Contains($forbiddenResumeAction)) "Resume phase contains forbidden action: $forbiddenResumeAction"
+}
+Assert-True ($inventorySource.Contains("`$startInfo.Arguments = '-I -'")) 'Python metadata must execute stdin source with python -.'
+Assert-True ($inventorySource.Contains('RedirectStandardInput = $true')) 'Python stdin must be redirected explicitly.'
+Assert-True ($inventorySource.Contains('$process.StandardInput.Write($Source)')) 'Python source must be written verbatim to stdin.'
+Assert-True (-not $inventorySource.Contains("-I -c")) 'Python metadata must not use fragile -c quoting.'
+Assert-True ($inventorySource.Contains("separators=(',', ':')")) 'Metadata JSON quoting regression is not covered.'
 
 . $inventoryPath
 Assert-True ((Resolve-TradingLabInstallerExit 0) -eq 'SUCCESS') 'Installer exit 0 classification regressed.'
@@ -334,11 +360,45 @@ try {
     [System.IO.Directory]::Delete($corruptUninstallRoot, $true)
 }
 
+$pendingInstallReport = [pscustomobject]@{
+    schema_version = 3; phase = 'InstallMachineRuntime'; apply_requested = $true
+    status = 'FAIL'; trading_mode = 'OBSERVE_ONLY'; python_version = '3.14.5'
+    python_base = 'C:\Program Files\AutomatonPython\3.14.5'
+    installer = 'C:\ProgramData\AutomatonMT5Lab\maintenance\python-3.14.5-amd64.exe'
+    current_run_applied_phase = 'InstallMachineRuntime'
+    required_previous_phase = 'UninstallTraditional'; previous_phase_verified = $true
+    previous_phase_report = 'C:\ProgramData\AutomatonMT5Lab\maintenance\python-runtime-results\python-runtime-prior.json'
+    previous_phase_report_sha256 = ('a' * 64)
+    installer_executed = $true; uninstaller_executed = $false
+    venv_rebuilt = $false; venv_promoted = $false
+    mt5_accessed = $false; automaton_started = $false; gateway_started = $false
+    acl_existing_domains_modified = $false
+    error = 'Python metadata command failed after successful installation.'
+    gates = [pscustomobject]@{
+        TRADING_MODE_OBSERVE_ONLY = 'PASS'; PREVIOUS_PHASE_UNINSTALL_TRADITIONAL = 'PASS'
+        PYTHON_INSTALLER_VERIFIED = 'PASS'; INSTALL_ALL_USERS = 'PASS'; TARGET_MACHINE_WIDE = 'PASS'
+    }
+    installer_plan = [pscustomobject]@{
+        operation = 'INSTALL_CPYTHON_MACHINE_WIDE_MINIMAL'
+        executable = 'C:\ProgramData\AutomatonMT5Lab\maintenance\python-3.14.5-amd64.exe'
+        target_dir = 'C:\Program Files\AutomatonPython\3.14.5'
+    }
+}
+$pendingArgs = @(
+    '3.14.5', 'C:\Program Files\AutomatonPython\3.14.5',
+    'C:\ProgramData\AutomatonMT5Lab\maintenance\python-3.14.5-amd64.exe'
+)
+Assert-True (Test-TradingLabInstalledRuntimePendingReportRecord $pendingInstallReport @pendingArgs) 'Installed-but-validation-pending evidence must pass exact validation.'
+$pendingWithoutInstaller = $pendingInstallReport.PSObject.Copy(); $pendingWithoutInstaller.installer_executed = $false
+Assert-True (-not (Test-TradingLabInstalledRuntimePendingReportRecord $pendingWithoutInstaller @pendingArgs)) 'Recovery evidence must prove the installer completed before validation failed.'
+$pendingWrongPhase = $pendingInstallReport.PSObject.Copy(); $pendingWrongPhase.current_run_applied_phase = 'InstallMachineRuntimeRequested'
+Assert-True (-not (Test-TradingLabInstalledRuntimePendingReportRecord $pendingWrongPhase @pendingArgs)) 'A failure before installer completion must not authorize ACL recovery.'
+
 $validInstallState = [pscustomobject]@{
     python_manager_runtime = 'FUNCTIONAL'; traditional_user_runtime = 'ABSENT'
     traditional_machine_runtime = 'ABSENT'; traditional_msi_components = 0
     partial_target_runtime = 'ABSENT'; mixed_pythoncore_registration = 'ABSENT'
-    same_version_traditional_install_present = 'PASS'
+    same_version_traditional_install_present = 'ABSENT'
 }
 Assert-True (Resolve-TradingLabInstallPreconditionState $validInstallState).valid 'Clean post-uninstall state must authorize install prevalidation.'
 $msiReappeared = $validInstallState.PSObject.Copy(); $msiReappeared.traditional_msi_components = 1
@@ -412,13 +472,13 @@ $traditionalUser = [pscustomobject]@{ kind = 'TRADITIONAL_BUNDLE'; scope = 'HKCU
 $partial = Resolve-Synthetic @($manager, $traditionalUser) @([pscustomobject]@{}) @() $true $true $false $true
 Assert-True ($partial.python_manager_runtime -eq 'FUNCTIONAL') 'Python Manager runtime must remain distinct and functional.'
 Assert-True ($partial.traditional_user_runtime -eq 'PRESENT') 'Same-version traditional user runtime was not detected.'
-Assert-True ($partial.same_version_traditional_install_present -eq 'FAIL') 'Same-version traditional install must fail prevalidation.'
+Assert-True ($partial.same_version_traditional_install_present -eq 'CONFLICTING_PREEXISTING_RUNTIME') 'Conflicting traditional install must fail prevalidation.'
 Assert-True ($partial.partial_target_runtime -eq 'PRESENT') 'Partial target was not classified.'
 Assert-True ($partial.broken_active_venv -eq 'PRESENT') 'Broken redirector venv was not classified.'
 Assert-True ($partial.prevalidation -eq 'FAIL') 'Mixed maintenance state must fail closed.'
 
 $clean = Resolve-Synthetic @($manager) @() @() $true $false $false $true
-Assert-True ($clean.same_version_traditional_install_present -eq 'PASS') 'Clean traditional registration state must pass.'
+Assert-True ($clean.same_version_traditional_install_present -eq 'ABSENT') 'Clean traditional registration state must be absent.'
 Assert-True ($clean.python_manager_runtime -eq 'FUNCTIONAL') 'Manager must survive traditional cleanup.'
 
 $mixedCore = [pscustomobject]@{
@@ -429,10 +489,34 @@ $mixedOnly = Resolve-Synthetic @($manager) @() @($mixedCore) $true $false $false
 Assert-True ($mixedOnly.mixed_pythoncore_registration -eq 'PRESENT') 'Mixed PythonCore registration was not detected.'
 Assert-True ($mixedOnly.prevalidation -eq 'FAIL') 'Mixed PythonCore registration must fail prevalidation alone.'
 
-$machine = [pscustomobject]@{ kind = 'TRADITIONAL_BUNDLE'; scope = 'HKLM' }
-$complete = Resolve-Synthetic @($manager, $machine) @([pscustomobject]@{}) @() $true $true $true $false
+$machineBundleHkcu = [pscustomobject]@{ kind = 'TRADITIONAL_BUNDLE'; scope = 'HKCU' }
+$machineCoreExact = [pscustomobject]@{
+    scope = 'HKLM'; managed_by_python_manager = $false
+    executable_path = 'C:\Program Files\AutomatonPython\3.14.5\python.exe'
+}
+$machineMsiExact = @($script:TradingLabExpectedMachineMsiComponents | ForEach-Object {
+    [pscustomobject]@{
+        product_code = $_.product_code; display_name = $_.display_name
+        user_data_sid = 'S-1-5-18'
+    }
+})
+$complete = Resolve-Synthetic @($manager, $machineBundleHkcu) $machineMsiExact @($machineCoreExact) $true $true $true $false
 Assert-True ($complete.traditional_machine_runtime -eq 'PRESENT') 'Machine traditional runtime was not distinguished.'
+Assert-True ($complete.traditional_user_runtime -eq 'ABSENT') 'HKCU bundle registration must not imply a second user payload.'
+Assert-True ($complete.traditional_bundle_registration_scope -eq 'HKCU') 'Bundle registration scope must remain independently visible.'
+Assert-True ($complete.traditional_runtime_payload_scope -eq 'MACHINE') 'Payload scope must follow PythonCore/MSI/target evidence.'
+Assert-True ($complete.machine_runtime_msi_components -eq 4 -and $complete.unexpected_machine_msi_components -eq 0) 'Exact four-component minimal runtime was not recognized.'
+Assert-True ($complete.same_version_traditional_install_present -eq 'EXPECTED_INSTALLED_TARGET_RUNTIME') 'Expected installed target must not be classified as a conflict.'
+Assert-True ($complete.prevalidation -eq 'TARGET_RUNTIME_ALREADY_INSTALLED_VALIDATION_PENDING') 'Installed runtime must enter validation-pending recovery.'
 Assert-True ($complete.completed_target_runtime -eq 'PRESENT_UNVERIFIED') 'Complete layout must still require execution validation.'
+
+$unexpectedMachineMsi = @($machineMsiExact) + @([pscustomobject]@{
+    product_code = '{FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF}'
+    display_name = 'Python 3.14.5 Unexpected (64-bit)'
+    user_data_sid = 'S-1-5-18'
+})
+$unexpectedMachineState = Resolve-TradingLabMachineMsiComponentState $unexpectedMachineMsi
+Assert-True (-not $unexpectedMachineState.valid -and $unexpectedMachineState.unexpected_product_codes.Count -eq 1) 'Unexpected fifth machine MSI must fail closed.'
 
 foreach ($required in @(
     "`$machinePython = 'C:\Program Files\AutomatonPython\3.14.5\python.exe'",
@@ -484,6 +568,15 @@ foreach ($gate in @(
     INSTALLER_HASH_MISMATCH_FAIL_CLOSED = 'PASS'
     USER_PROFILE_TARGET_FAIL_CLOSED = 'PASS'
     MINIMAL_INSTALLER_COMPONENTS = 'PASS'
+    POST_INSTALL_METADATA_STDIN = 'PASS'
+    INSTALLED_VALIDATION_PENDING_RECOVERY = 'PASS'
+    RECOVERY_NEVER_RERUNS_INSTALLER = 'PASS'
+    BUNDLE_HKCU_MACHINE_PAYLOAD_CLASSIFICATION = 'PASS'
+    EXPECTED_MACHINE_MSI_COMPONENTS_4 = 'PASS'
+    UNEXPECTED_MACHINE_MSI_FAIL_CLOSED = 'PASS'
+    INCOMPLETE_ACL_STATE_DETECTED = 'PASS'
+    ACL_ONLY_RESUME_BOUNDARY = 'PASS'
+    FAILURE_PRESERVES_INSTALLED_RUNTIME = 'PASS'
     VENV_STAGING_AND_ROLLBACK = 'PASS'
     VENV_HASH_LOCK_ONLY = 'PASS'
     META_TRADER5_METADATA_ONLY = 'PASS'

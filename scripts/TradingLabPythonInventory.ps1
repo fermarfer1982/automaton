@@ -4,6 +4,13 @@ $script:TradingLabPythonVersion = '3.14.5'
 $script:TradingLabPythonDisplayVersion = '3.14.5150.0'
 $script:TradingLabPythonTarget = 'C:\Program Files\AutomatonPython\3.14.5'
 $script:TradingLabWorkspace = 'C:\automaton'
+$script:TradingLabSystemSid = 'S-1-5-18'
+$script:TradingLabExpectedMachineMsiComponents = @(
+    [pscustomobject]@{ product_code = '{1B0251E9-CD20-49FC-AD22-70FCDBC2BAD7}'; display_name = 'Python 3.14.5 Executables (64-bit)' },
+    [pscustomobject]@{ product_code = '{7040E6D8-53FD-4FE0-A539-92C0B33E9A10}'; display_name = 'Python 3.14.5 pip Bootstrap (64-bit)' },
+    [pscustomobject]@{ product_code = '{A0B65FCB-97C6-47FD-984A-9EF9ECC1CE3B}'; display_name = 'Python 3.14.5 Standard Library (64-bit)' },
+    [pscustomobject]@{ product_code = '{E402961E-7539-41B4-ADA9-62143E6D32D7}'; display_name = 'Python 3.14.5 Core Interpreter (64-bit)' }
+)
 
 function Get-TradingLabRegistryDefaultValue([string] $Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
@@ -254,6 +261,79 @@ function Find-TradingLabUninstallTraditionalReport(
     throw 'PREVIOUS_PHASE_UNINSTALL_TRADITIONAL=FAIL: no valid durable applied PASS report exists.'
 }
 
+function Test-TradingLabInstalledRuntimePendingReportRecord(
+    [object] $Record,
+    [string] $ExpectedVersion,
+    [string] $ExpectedPythonBase,
+    [string] $ExpectedInstaller
+) {
+    if ($null -eq $Record) { return $false }
+    try {
+        $gates = Get-TradingLabProperty $Record 'gates'
+        $plan = Get-TradingLabProperty $Record 'installer_plan'
+        $previousHash = [string](Get-TradingLabProperty $Record 'previous_phase_report_sha256')
+        return (
+            (Get-TradingLabProperty $Record 'schema_version') -eq 3 -and
+            (Get-TradingLabProperty $Record 'phase') -eq 'InstallMachineRuntime' -and
+            [bool](Get-TradingLabProperty $Record 'apply_requested') -and
+            (Get-TradingLabProperty $Record 'status') -eq 'FAIL' -and
+            (Get-TradingLabProperty $Record 'trading_mode') -eq 'OBSERVE_ONLY' -and
+            (Get-TradingLabProperty $Record 'python_version') -eq $ExpectedVersion -and
+            [System.IO.Path]::GetFullPath((Get-TradingLabProperty $Record 'python_base')) -eq [System.IO.Path]::GetFullPath($ExpectedPythonBase) -and
+            [System.IO.Path]::GetFullPath((Get-TradingLabProperty $Record 'installer')) -eq [System.IO.Path]::GetFullPath($ExpectedInstaller) -and
+            (Get-TradingLabProperty $Record 'current_run_applied_phase') -eq 'InstallMachineRuntime' -and
+            (Get-TradingLabProperty $Record 'required_previous_phase') -eq 'UninstallTraditional' -and
+            [bool](Get-TradingLabProperty $Record 'previous_phase_verified') -and
+            -not [string]::IsNullOrWhiteSpace([string](Get-TradingLabProperty $Record 'previous_phase_report')) -and
+            $previousHash -match '^[0-9a-f]{64}$' -and
+            [bool](Get-TradingLabProperty $Record 'installer_executed') -and
+            -not [bool](Get-TradingLabProperty $Record 'uninstaller_executed') -and
+            -not [bool](Get-TradingLabProperty $Record 'venv_rebuilt') -and
+            -not [bool](Get-TradingLabProperty $Record 'venv_promoted') -and
+            -not [bool](Get-TradingLabProperty $Record 'mt5_accessed') -and
+            -not [bool](Get-TradingLabProperty $Record 'automaton_started') -and
+            -not [bool](Get-TradingLabProperty $Record 'gateway_started') -and
+            -not [bool](Get-TradingLabProperty $Record 'acl_existing_domains_modified') -and
+            (Get-TradingLabProperty $gates 'TRADING_MODE_OBSERVE_ONLY') -eq 'PASS' -and
+            (Get-TradingLabProperty $gates 'PREVIOUS_PHASE_UNINSTALL_TRADITIONAL') -eq 'PASS' -and
+            (Get-TradingLabProperty $gates 'PYTHON_INSTALLER_VERIFIED') -eq 'PASS' -and
+            (Get-TradingLabProperty $gates 'INSTALL_ALL_USERS') -eq 'PASS' -and
+            (Get-TradingLabProperty $gates 'TARGET_MACHINE_WIDE') -eq 'PASS' -and
+            (Get-TradingLabProperty $plan 'operation') -eq 'INSTALL_CPYTHON_MACHINE_WIDE_MINIMAL' -and
+            [System.IO.Path]::GetFullPath((Get-TradingLabProperty $plan 'executable')) -eq [System.IO.Path]::GetFullPath($ExpectedInstaller) -and
+            [System.IO.Path]::GetFullPath((Get-TradingLabProperty $plan 'target_dir')) -eq [System.IO.Path]::GetFullPath($ExpectedPythonBase) -and
+            -not [string]::IsNullOrWhiteSpace([string](Get-TradingLabProperty $Record 'error'))
+        )
+    } catch { return $false }
+}
+
+function Find-TradingLabInstalledRuntimePendingReport(
+    [string] $Directory,
+    [string] $ExpectedVersion,
+    [string] $ExpectedPythonBase,
+    [string] $ExpectedInstaller
+) {
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        throw 'INSTALLED_RUNTIME_EVIDENCE=FAIL: report directory is absent.'
+    }
+    foreach ($candidate in @(Get-ChildItem -LiteralPath $Directory -File -Filter 'python-runtime-*.json' |
+        Sort-Object LastWriteTimeUtc -Descending)) {
+        try {
+            $record = [System.IO.File]::ReadAllText($candidate.FullName, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            if (Test-TradingLabInstalledRuntimePendingReportRecord `
+                $record $ExpectedVersion $ExpectedPythonBase $ExpectedInstaller
+            ) {
+                return [pscustomobject]@{
+                    path = $candidate.FullName
+                    record = $record
+                    last_write_time_utc = $candidate.LastWriteTimeUtc
+                }
+            }
+        } catch { continue }
+    }
+    throw 'INSTALLED_RUNTIME_EVIDENCE=FAIL: no valid failed post-install report exists.'
+}
+
 function Resolve-TradingLabInstallPreconditionState([object] $State) {
     $failures = [System.Collections.Generic.List[string]]::new()
     foreach ($check in @(
@@ -263,7 +343,7 @@ function Resolve-TradingLabInstallPreconditionState([object] $State) {
         [pscustomobject]@{ Name = 'TRADITIONAL_MSI_COMPONENTS_ZERO'; Actual = Get-TradingLabProperty $State 'traditional_msi_components'; Expected = 0 },
         [pscustomobject]@{ Name = 'PARTIAL_TARGET_RUNTIME_ABSENT'; Actual = Get-TradingLabProperty $State 'partial_target_runtime'; Expected = 'ABSENT' },
         [pscustomobject]@{ Name = 'MIXED_PYTHONCORE_REGISTRATION_ABSENT'; Actual = Get-TradingLabProperty $State 'mixed_pythoncore_registration'; Expected = 'ABSENT' },
-        [pscustomobject]@{ Name = 'SAME_VERSION_TRADITIONAL_INSTALL_PRESENT'; Actual = Get-TradingLabProperty $State 'same_version_traditional_install_present'; Expected = 'PASS' }
+        [pscustomobject]@{ Name = 'SAME_VERSION_TRADITIONAL_INSTALL_PRESENT'; Actual = Get-TradingLabProperty $State 'same_version_traditional_install_present'; Expected = 'ABSENT' }
     )) {
         if ($check.Actual -ne $check.Expected) { $failures.Add("$($check.Name):$($check.Actual)") }
     }
@@ -353,6 +433,31 @@ function Resolve-TradingLabMsiComponentSetState(
         display_name_mismatches = $nameMismatch
         valid = $Actual.Count -eq $expectedByCode.Count -and $missing.Count -eq 0 -and
             $unexpected.Count -eq 0 -and $duplicates.Count -eq 0 -and $nameMismatch.Count -eq 0
+    }
+}
+
+function Resolve-TradingLabMachineMsiComponentState(
+    [object[]] $MsiProducts,
+    [object[]] $Expected = $script:TradingLabExpectedMachineMsiComponents,
+    [string] $ExpectedOwnerSid = $script:TradingLabSystemSid
+) {
+    $ownedByMachine = @($MsiProducts | Where-Object {
+        (Get-TradingLabProperty $_ 'user_data_sid') -eq $ExpectedOwnerSid
+    })
+    $setState = Resolve-TradingLabMsiComponentSetState $Expected $ownedByMachine
+    $invalidOwners = @($MsiProducts | Where-Object {
+        (Get-TradingLabProperty $_ 'user_data_sid') -ne $ExpectedOwnerSid
+    } | ForEach-Object { Get-TradingLabProperty $_ 'product_code' })
+    return [pscustomobject]@{
+        expected_count = $Expected.Count
+        expected_present = $setState.actual_count - $setState.unexpected_product_codes.Count
+        actual_machine_count = $ownedByMachine.Count
+        missing_product_codes = @($setState.missing_product_codes)
+        unexpected_product_codes = @($setState.unexpected_product_codes)
+        duplicate_product_codes = @($setState.duplicate_product_codes)
+        display_name_mismatches = @($setState.display_name_mismatches)
+        invalid_owner_product_codes = $invalidOwners
+        valid = $setState.valid -and $invalidOwners.Count -eq 0
     }
 }
 
@@ -471,16 +576,16 @@ function Get-TradingLabPythonLayout([string] $Root) {
     }
 }
 
-function Invoke-TradingLabPythonMetadata([string] $Python) {
+function Invoke-TradingLabPythonStdinJson([string] $Python, [string] $Source) {
     if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
-        return [pscustomobject]@{ attempted = $false; functional = $false; error = 'PYTHON_NOT_FOUND'; metadata = $null }
+        return [pscustomobject]@{ attempted = $false; functional = $false; error = 'PYTHON_NOT_FOUND'; metadata = $null; stderr = $null }
     }
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $Python
-    $metadataSource = "import json,platform,sys,venv;print(json.dumps({'architecture':platform.architecture()[0],'base_prefix':sys.base_prefix,'executable':sys.executable,'prefix':sys.prefix,'venv_import':True,'version':platform.python_version()},sort_keys=True,separators=(',',':')))"
-    $startInfo.Arguments = '-I -c "' + $metadataSource + '"'
+    $startInfo.Arguments = '-I -'
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $startInfo.EnvironmentVariables['PYTHONDONTWRITEBYTECODE'] = '1'
@@ -488,28 +593,51 @@ function Invoke-TradingLabPythonMetadata([string] $Python) {
     $process.StartInfo = $startInfo
     try {
         if (-not $process.Start()) {
-            return [pscustomobject]@{ attempted = $true; functional = $false; error = 'PROCESS_START_FALSE'; metadata = $null }
+            return [pscustomobject]@{ attempted = $true; functional = $false; error = 'PROCESS_START_FALSE'; metadata = $null; stderr = $null }
         }
-        $stdout = $process.StandardOutput.ReadToEnd()
-        $stderr = $process.StandardError.ReadToEnd()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.StandardInput.Write($Source)
+        $process.StandardInput.Close()
         $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
         if ($process.ExitCode -ne 0) {
             return [pscustomobject]@{
                 attempted = $true
                 functional = $false
-                error = "PYTHON_EXIT_$($process.ExitCode):$($stderr.Trim())"
+                error = "PYTHON_EXIT_$($process.ExitCode)"
                 metadata = $null
+                stderr = $stderr.Trim()
             }
         }
         try {
             $metadata = $stdout.Trim() | ConvertFrom-Json
-            return [pscustomobject]@{ attempted = $true; functional = $true; error = $null; metadata = $metadata }
+            return [pscustomobject]@{ attempted = $true; functional = $true; error = $null; metadata = $metadata; stderr = $stderr.Trim() }
         } catch {
-            return [pscustomobject]@{ attempted = $true; functional = $false; error = 'INVALID_METADATA_JSON'; metadata = $null }
+            return [pscustomobject]@{ attempted = $true; functional = $false; error = 'INVALID_METADATA_JSON'; metadata = $null; stderr = $stderr.Trim() }
         }
     } finally {
         $process.Dispose()
     }
+}
+
+function Invoke-TradingLabPythonMetadata([string] $Python) {
+    $source = @'
+import json
+import platform
+import sys
+import venv
+print(json.dumps({
+    "architecture": platform.architecture()[0],
+    "base_prefix": sys.base_prefix,
+    "executable": sys.executable,
+    "prefix": sys.prefix,
+    "venv_import": True,
+    "version": platform.python_version(),
+}, sort_keys=True, separators=(',', ':')))
+'@
+    return Invoke-TradingLabPythonStdinJson $Python $source
 }
 
 function Get-TradingLabVenvState([string] $Root) {
@@ -543,31 +671,73 @@ function Resolve-TradingLabPythonInventoryState(
 ) {
     $managerEntries = @($UninstallEntries | Where-Object { $_.kind -eq 'PYTHON_MANAGER_RUNTIME' })
     $traditionalBundles = @($UninstallEntries | Where-Object { $_.kind -eq 'TRADITIONAL_BUNDLE' })
-    $traditionalUser = @($traditionalBundles | Where-Object { $_.scope -eq 'HKCU' })
-    $traditionalMachine = @($traditionalBundles | Where-Object { $_.scope -in @('HKLM','HKLM32') })
     $traditionalComponents = @($UninstallEntries | Where-Object { $_.kind -eq 'TRADITIONAL_MSI_COMPONENT' })
-    $sameVersionTraditional = $traditionalBundles.Count -gt 0 -or
-        $traditionalComponents.Count -gt 0 -or $MsiProducts.Count -gt 0
+    $bundleScopes = @($traditionalBundles | ForEach-Object { $_.scope } | Sort-Object -Unique)
+    $bundleRegistrationScope = if ($bundleScopes.Count -eq 0) {
+        'NONE'
+    } elseif ($bundleScopes.Count -eq 1) {
+        $bundleScopes[0]
+    } else { 'MULTIPLE' }
+    $machineMsi = Resolve-TradingLabMachineMsiComponentState $MsiProducts
+    $machineCore = @($PythonCoreRegistrations | Where-Object {
+        (Get-TradingLabProperty $_ 'scope') -in @('HKLM', 'HKLM32') -and
+        -not [bool](Get-TradingLabProperty $_ 'managed_by_python_manager') -and
+        (Get-TradingLabProperty $_ 'executable_path') -and
+        [System.IO.Path]::GetFullPath((Get-TradingLabProperty $_ 'executable_path')).Equals(
+            [System.IO.Path]::GetFullPath((Join-Path $script:TradingLabPythonTarget 'python.exe')),
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    })
     $mixedPythonCore = @($PythonCoreRegistrations | Where-Object {
-        $_.managed_by_python_manager -and $_.executable_path -and
-        $_.executable_path -like "$script:TradingLabPythonTarget*"
+        [bool](Get-TradingLabProperty $_ 'managed_by_python_manager') -and
+        (Get-TradingLabProperty $_ 'executable_path') -and
+        (Get-TradingLabProperty $_ 'executable_path') -like "$script:TradingLabPythonTarget*"
     }).Count -gt 0
+    $expectedMachinePayload = $TargetLayout.complete_layout -and
+        $machineCore.Count -eq 1 -and $machineMsi.valid
+    $nonMachineMsi = @($MsiProducts | Where-Object {
+        (Get-TradingLabProperty $_ 'user_data_sid') -ne $script:TradingLabSystemSid
+    })
+    $hasTraditionalEvidence = $traditionalBundles.Count -gt 0 -or
+        $traditionalComponents.Count -gt 0 -or $MsiProducts.Count -gt 0 -or
+        $machineCore.Count -gt 0 -or $TargetLayout.exists
+    $classification = if ($expectedMachinePayload) {
+        'EXPECTED_INSTALLED_TARGET_RUNTIME'
+    } elseif ($hasTraditionalEvidence) {
+        'CONFLICTING_PREEXISTING_RUNTIME'
+    } else { 'ABSENT' }
+    $payloadScope = if ($expectedMachinePayload) {
+        'MACHINE'
+    } elseif ($nonMachineMsi.Count -gt 0 -or ($bundleRegistrationScope -eq 'HKCU' -and -not $machineCore.Count)) {
+        'USER_OR_LEGACY_CONTEXT'
+    } elseif ($machineCore.Count -gt 0 -or $machineMsi.actual_machine_count -gt 0) {
+        'MACHINE_INCOMPLETE'
+    } else { 'NONE' }
     return [pscustomobject]@{
         python_manager_runtime = if ($managerEntries.Count -gt 0 -and $ManagerProbe.functional) { 'FUNCTIONAL' } elseif ($managerEntries.Count -gt 0) { 'REGISTERED_BUT_BROKEN' } else { 'ABSENT' }
-        traditional_user_runtime = if ($traditionalUser.Count -gt 0) { 'PRESENT' } else { 'ABSENT' }
-        traditional_machine_runtime = if ($traditionalMachine.Count -gt 0) { 'PRESENT' } else { 'ABSENT' }
+        traditional_bundle_registration_scope = $bundleRegistrationScope
+        traditional_runtime_payload_scope = $payloadScope
+        traditional_user_runtime = if ($classification -eq 'CONFLICTING_PREEXISTING_RUNTIME' -and $payloadScope -eq 'USER_OR_LEGACY_CONTEXT') { 'PRESENT' } else { 'ABSENT' }
+        traditional_machine_runtime = if ($payloadScope -in @('MACHINE', 'MACHINE_INCOMPLETE')) { 'PRESENT' } else { 'ABSENT' }
         traditional_msi_components = $MsiProducts.Count
+        machine_runtime_target_present = [bool]$TargetLayout.complete_layout
+        machine_runtime_msi_components = $machineMsi.actual_machine_count
+        expected_machine_msi_components = $machineMsi.expected_count
+        unexpected_machine_msi_components = $machineMsi.unexpected_product_codes.Count + $machineMsi.invalid_owner_product_codes.Count
+        machine_runtime_msi_valid = $machineMsi.valid
         python_manager_runtime_path = if ($ManagerProbe.functional) { $ManagerProbe.metadata.base_prefix } else { $null }
         partial_target_runtime = if ($TargetLayout.exists -and -not $TargetLayout.complete_layout) { 'PRESENT' } else { 'ABSENT' }
         completed_target_runtime = if ($TargetLayout.complete_layout) { 'PRESENT_UNVERIFIED' } else { 'ABSENT' }
         broken_active_venv = if ($VenvState.broken) { 'PRESENT' } else { 'ABSENT' }
         mixed_pythoncore_registration = if ($mixedPythonCore) { 'PRESENT' } else { 'ABSENT' }
-        same_version_traditional_install_present = if ($sameVersionTraditional) { 'FAIL' } else { 'PASS' }
+        same_version_traditional_install_present = $classification
         prevalidation = if (
-            $sameVersionTraditional -or
+            $classification -eq 'CONFLICTING_PREEXISTING_RUNTIME' -or
             ($TargetLayout.exists -and -not $TargetLayout.complete_layout) -or
             $mixedPythonCore
-        ) { 'FAIL' } else { 'PASS' }
+        ) { 'FAIL' } elseif ($classification -eq 'EXPECTED_INSTALLED_TARGET_RUNTIME') {
+            'TARGET_RUNTIME_ALREADY_INSTALLED_VALIDATION_PENDING'
+        } else { 'PASS' }
     }
 }
 

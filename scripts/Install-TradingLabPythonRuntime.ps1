@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
 param(
-    [ValidateSet('Inventory', 'PrepareWheelhouse', 'UninstallTraditional', 'InstallMachineRuntime', 'BuildVenv', 'PromoteVenv')]
+    [ValidateSet('Inventory', 'PrepareWheelhouse', 'UninstallTraditional', 'InstallMachineRuntime', 'ResumeMachineRuntime', 'BuildVenv', 'PromoteVenv')]
     [string] $Phase = 'Inventory',
     [string] $InstallerPath = 'C:\ProgramData\AutomatonMT5Lab\maintenance\python-3.14.5-amd64.exe',
     [string] $RegisteredBundlePath,
@@ -70,6 +70,7 @@ $report = [ordered]@{
     lock_file = $lockPath
     installer = $InstallerPath
     installer_executed = $false
+    installer_reexecuted = $false
     uninstaller_executed = $false
     venv_rebuilt = $false
     venv_promoted = $false
@@ -83,6 +84,11 @@ $report = [ordered]@{
     automaton_started = $false
     gateway_started = $false
     acl_existing_domains_modified = $false
+    machine_runtime_acl_modified = $false
+    must_not_execute_installer = $false
+    recovery_state = $null
+    installer_result_log = $null
+    installer_result_log_sha256 = $null
     gates = [ordered]@{}
     inventory_before = $null
     inventory_after = $null
@@ -309,7 +315,7 @@ function Assert-ManagerRuntime([object] $Inventory) {
 }
 
 function Assert-NoTraditionalRuntime([object] $Inventory) {
-    if ($Inventory.state.same_version_traditional_install_present -ne 'PASS') {
+    if ($Inventory.state.same_version_traditional_install_present -notin @('ABSENT', 'PASS')) {
         throw 'SAME_VERSION_TRADITIONAL_INSTALL_PRESENT=FAIL: supported uninstall must complete before machine installation.'
     }
 }
@@ -495,6 +501,72 @@ function Get-VerifiedUninstallTraditionalEvidence {
     }
 }
 
+function Get-VerifiedInstalledRuntimePendingEvidence {
+    Assert-NoReparseComponents $reportDirectory
+    Assert-NoUntrustedModify $reportDirectory @(
+        $gatewaySid, $agentSid, $usersSid, $authenticatedUsersSid, $everyoneSid
+    )
+    $evidence = Find-TradingLabInstalledRuntimePendingReport `
+        $reportDirectory $expectedPythonVersion $pythonBase $InstallerPath
+    $reportItem = Get-Item -LiteralPath $evidence.path -Force -ErrorAction Stop
+    if ($reportItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw 'INSTALLED_RUNTIME_EVIDENCE=FAIL: report is a reparse point.'
+    }
+    Assert-NoUntrustedModify $reportItem.FullName @(
+        $gatewaySid, $agentSid, $usersSid, $authenticatedUsersSid, $everyoneSid
+    )
+    if ($reportItem.Name -ne "python-runtime-$($evidence.record.run_id).json") {
+        throw 'INSTALLED_RUNTIME_EVIDENCE=FAIL: report filename/run_id mismatch.'
+    }
+
+    $uninstallPath = Get-CanonicalPath $evidence.record.previous_phase_report
+    if (-not (Test-PathWithin $uninstallPath $reportDirectory)) {
+        throw 'INSTALLED_RUNTIME_EVIDENCE=FAIL: UninstallTraditional report is outside the protected report directory.'
+    }
+    Assert-NoReparseComponents $uninstallPath
+    $uninstallItem = Get-Item -LiteralPath $uninstallPath -Force -ErrorAction Stop
+    Assert-NoUntrustedModify $uninstallItem.FullName @(
+        $gatewaySid, $agentSid, $usersSid, $authenticatedUsersSid, $everyoneSid
+    )
+    $uninstallHash = (Get-FileHash -LiteralPath $uninstallItem.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($uninstallHash -ne $evidence.record.previous_phase_report_sha256) {
+        throw 'INSTALLED_RUNTIME_EVIDENCE=FAIL: UninstallTraditional report hash mismatch.'
+    }
+    $uninstallRecord = [System.IO.File]::ReadAllText($uninstallItem.FullName, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+    if (-not (Test-TradingLabUninstallTraditionalReportRecord `
+        $uninstallRecord $wheelhousePath $lockPath $expectedPythonVersion $pythonBase $venvPath
+    )) { throw 'INSTALLED_RUNTIME_EVIDENCE=FAIL: linked UninstallTraditional evidence is invalid.' }
+
+    $logPath = Join-Path $logsRoot "python-$($evidence.record.run_id)-machine-install.log"
+    if (-not (Test-Path -LiteralPath $logPath -PathType Leaf)) {
+        throw 'INSTALLER_RESULT_EVIDENCE=FAIL: durable installer log is absent.'
+    }
+    Assert-NoReparseComponents $logPath
+    Assert-NoUntrustedModify $logPath @(
+        $gatewaySid, $agentSid, $usersSid, $authenticatedUsersSid, $everyoneSid
+    )
+    $logText = [System.IO.File]::ReadAllText($logPath, [System.Text.Encoding]::UTF8)
+    foreach ($required in @(
+        'Apply complete, result: 0x0', 'Exit code: 0x0',
+        'Variable: InstallAllUsers = 1', "Variable: TargetDir = $pythonBase",
+        'Variable: Include_core = 1', 'Variable: Include_exe = 1',
+        'Variable: Include_lib = 1', 'Variable: Include_pip = 1',
+        'Variable: Include_dev = 0', 'Variable: Include_test = 0',
+        'Variable: Include_doc = 0', 'Variable: Include_tcltk = 0'
+    )) {
+        if (-not $logText.Contains($required)) {
+            throw "INSTALLER_RESULT_EVIDENCE=FAIL: log lacks reviewed result: $required"
+        }
+    }
+    return [pscustomobject]@{
+        path = $reportItem.FullName
+        sha256 = (Get-FileHash -LiteralPath $reportItem.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        log_path = $logPath
+        log_sha256 = (Get-FileHash -LiteralPath $logPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        record = $evidence.record
+    }
+}
+
 function Set-WheelhousePassGates([object] $State) {
     $report.wheelhouse_validation = $State
     $report.gates.WHEELHOUSE_PRESENT = 'PASS'
@@ -525,6 +597,23 @@ function Assert-InstallMachinePreconditions([object] $Inventory) {
     $report.gates.MIXED_PYTHONCORE_REGISTRATION_ABSENT = 'PASS'
     $report.gates.SAME_VERSION_TRADITIONAL_INSTALL_PRESENT = 'PASS'
     $report.gates.TARGET_PATH_EMPTY_OR_ABSENT = 'PASS'
+}
+
+function Test-InstalledMachineRuntimePending([object] $Inventory) {
+    return (
+        $Inventory.target_layout.complete_layout -and
+        $Inventory.target_probe.functional -and
+        $Inventory.state.traditional_user_runtime -eq 'ABSENT' -and
+        $Inventory.state.traditional_machine_runtime -eq 'PRESENT' -and
+        $Inventory.state.machine_runtime_target_present -and
+        $Inventory.state.machine_runtime_msi_components -eq 4 -and
+        $Inventory.state.expected_machine_msi_components -eq 4 -and
+        $Inventory.state.unexpected_machine_msi_components -eq 0 -and
+        $Inventory.state.machine_runtime_msi_valid -and
+        $Inventory.state.partial_target_runtime -eq 'ABSENT' -and
+        $Inventory.state.mixed_pythoncore_registration -eq 'ABSENT' -and
+        $Inventory.state.same_version_traditional_install_present -eq 'EXPECTED_INSTALLED_TARGET_RUNTIME'
+    )
 }
 
 function New-MachineRuntimeInstallerPlan([string] $Executable) {
@@ -694,11 +783,14 @@ function Assert-LabStoppedAndObserveOnly {
 }
 
 function Invoke-CheckedPythonJson([string] $Python, [string] $Source) {
-    $output = @(& $Python -I -c $Source)
-    if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) {
-        throw "Python metadata command failed for $Python."
+    $result = Invoke-TradingLabPythonStdinJson $Python $Source
+    if (-not $result.functional) {
+        $diagnostic = if ([string]::IsNullOrWhiteSpace([string]$result.stderr)) {
+            $result.error
+        } else { "$($result.error):$($result.stderr)" }
+        throw "Python metadata command failed for ${Python}: $diagnostic"
     }
-    return $output[0] | ConvertFrom-Json
+    return $result.metadata
 }
 
 function Get-PythonMetadata([string] $Python) {
@@ -756,14 +848,13 @@ function Set-MachineRuntimePassGates([object] $Metadata) {
     $report.gates.PYTHON_EXE_EXISTS = 'PASS'
     $report.gates.PYTHON314_DLL_EXISTS = 'PASS'
     $report.gates.PYTHON_LIB_EXISTS = 'PASS'
-    $report.gates.PYTHON_STDLIB_FUNCTIONAL = 'PASS'
-    $report.gates.PYTHON_IMPORT_SYS = 'PASS'
-    $report.gates.PYTHON_IMPORT_VENV = 'PASS'
-    $report.gates.PYTHON_IMPORT_PIP = 'PASS'
-    $report.gates.PYTHON_EXACT_VERSION = 'PASS'
-    $report.gates.PYTHON_ARCHITECTURE_X64 = 'PASS'
-    $report.gates.PYTHON_BASE_PREFIX_EXACT = 'PASS'
-    $report.gates.PYTHON_EXECUTABLE_MACHINE_WIDE = 'PASS'
+    $report.gates.PYTHON_STDLIB = 'PASS'
+    $report.gates.PYTHON_VENV_IMPORT = 'PASS'
+    $report.gates.PYTHON_PIP_AVAILABLE = 'PASS'
+    $report.gates.PYTHON_VERSION_EXACT = 'PASS'
+    $report.gates.PYTHON_ARCH_X64 = 'PASS'
+    $report.gates.PYTHON_BASE_PREFIX_TARGET = 'PASS'
+    $report.gates.PYTHON_EXECUTABLE_TARGET = 'PASS'
     $report.gates.PYTHON_RUNTIME_USER_PROFILE_DEPENDENCIES = 'NONE_PASS'
     $report.gates.PYTHON_BASE_MACHINE_WIDE = 'PASS'
     $report.gates.PYTHON_BASE_OUTSIDE_USER_PROFILE = 'PASS'
@@ -872,14 +963,83 @@ function Start-LoggedInstaller([string] $Executable, [string[]] $Arguments, [str
 }
 
 function Assert-MachineInstallationInventory([object] $Inventory) {
-    if (
-        $Inventory.state.traditional_user_runtime -ne 'ABSENT' -or
-        $Inventory.state.traditional_machine_runtime -ne 'PRESENT' -or
-        $Inventory.state.partial_target_runtime -ne 'ABSENT' -or
-        $Inventory.state.completed_target_runtime -ne 'PRESENT_UNVERIFIED' -or
-        $Inventory.state.mixed_pythoncore_registration -ne 'ABSENT' -or
-        -not $Inventory.target_probe.functional
-    ) { throw 'MACHINE_TRADITIONAL_REGISTRATION=FAIL' }
+    if (-not (Test-InstalledMachineRuntimePending $Inventory)) {
+        throw 'MACHINE_TRADITIONAL_REGISTRATION=FAIL: expected exact machine payload, PythonCore and four SYSTEM MSI components.'
+    }
+    foreach ($component in @($Inventory.msi_products)) {
+        if (
+            $component.user_data_sid -ne $systemSid -or
+            $component.display_version -ne '3.14.5150.0' -or
+            -not $component.local_package -or
+            -not (Test-PathWithin $component.local_package (Join-Path $env:WINDIR 'Installer')) -or
+            -not (Test-Path -LiteralPath $component.local_package -PathType Leaf)
+        ) { throw "MACHINE_MSI_COMPONENT=FAIL: $($component.product_code)" }
+    }
+    $report.gates.EXPECTED_MACHINE_MSI_COMPONENTS = 4
+    $report.gates.UNEXPECTED_MACHINE_MSI_COMPONENTS = 0
+}
+
+function Get-MachineRuntimeAclState {
+    try {
+        Assert-ExactBaseAcl $pythonBase
+        Assert-TreeNotModifiableByServices $pythonBase
+        return 'EXACT'
+    } catch { return 'INCOMPLETE' }
+}
+
+function Set-MachineRuntimeAclPassGates {
+    $report.gates.PYTHON_GATEWAY_EXECUTE = 'PASS'
+    $report.gates.PYTHON_GATEWAY_MODIFY_DENY = 'PASS'
+    $report.gates.PYTHON_AGENT_ACCESS_DENY = 'PASS'
+    $report.gates.PYTHON_RUNTIME_ACL = 'PASS'
+}
+
+function Complete-InstalledMachineRuntime([object] $Inventory) {
+    if (-not (Test-InstalledMachineRuntimePending $Inventory)) {
+        throw 'TARGET_RUNTIME_ALREADY_INSTALLED_VALIDATION_PENDING=FAIL: exact installed payload is absent.'
+    }
+    $report.recovery_state = 'TARGET_RUNTIME_ALREADY_INSTALLED_VALIDATION_PENDING'
+    $report.must_not_execute_installer = $true
+    $report.installer_reexecuted = $false
+    $report.gates.TARGET_RUNTIME_ALREADY_INSTALLED_VALIDATION_PENDING = 'PASS'
+    $report.gates.MUST_NOT_EXECUTE_INSTALLER = 'true'
+    $report.gates.INSTALLER_REEXECUTED = 'false'
+
+    $evidence = Get-VerifiedInstalledRuntimePendingEvidence
+    $report.required_previous_phase = 'InstallMachineRuntime'
+    $report.previous_phase_verified = $true
+    $report.previous_phase_report = $evidence.path
+    $report.previous_phase_report_sha256 = $evidence.sha256
+    $report.installer_result_log = $evidence.log_path
+    $report.installer_result_log_sha256 = $evidence.log_sha256
+    $report.gates.INSTALLED_RUNTIME_EVIDENCE = 'PASS'
+    $report.gates.INSTALLER_RESULT_EVIDENCE = 'PASS'
+
+    $metadata = Assert-BasePython $basePython
+    Assert-MachineInstallationInventory $Inventory
+    Set-MachineRuntimePassGates $metadata
+    $report.inventory_after = $Inventory.state
+
+    $aclState = Get-MachineRuntimeAclState
+    if ($aclState -eq 'EXACT') {
+        Set-MachineRuntimeAclPassGates
+        if ($Apply) {
+            Initialize-PhaseStorage
+            $report.current_run_applied_phase = 'MachineRuntimeValidationRecovered'
+        }
+        return
+    }
+
+    $report.gates.PYTHON_RUNTIME_ACL = 'INCOMPLETE_REQUIRES_EXPLICIT_APPLY'
+    if (-not $Apply) { return }
+    Initialize-PhaseStorage
+    $report.current_run_applied_phase = 'MachineRuntimeAclRecoveryRequested'
+    Protect-ExactRuntimeTree $pythonBase $true
+    $report.machine_runtime_acl_modified = $true
+    Assert-ExactBaseAcl $pythonBase
+    Assert-TreeNotModifiableByServices $pythonBase
+    $report.current_run_applied_phase = 'MachineRuntimeAclRecovered'
+    Set-MachineRuntimeAclPassGates
 }
 
 function Write-Report {
@@ -969,6 +1129,10 @@ try {
         Write-Output "PYTHON_MANAGER_RUNTIME=$($inventory.state.python_manager_runtime)"
         Write-Output "TRADITIONAL_USER_RUNTIME=$($inventory.state.traditional_user_runtime)"
         Write-Output "TRADITIONAL_MACHINE_RUNTIME=$($inventory.state.traditional_machine_runtime)"
+        Write-Output "TRADITIONAL_BUNDLE_REGISTRATION_SCOPE=$($inventory.state.traditional_bundle_registration_scope)"
+        Write-Output "TRADITIONAL_RUNTIME_PAYLOAD_SCOPE=$($inventory.state.traditional_runtime_payload_scope)"
+        Write-Output "MACHINE_RUNTIME_TARGET_PRESENT=$($inventory.state.machine_runtime_target_present)"
+        Write-Output "MACHINE_RUNTIME_MSI_COMPONENTS=$($inventory.state.machine_runtime_msi_components)"
         Write-Output "PARTIAL_TARGET_RUNTIME=$($inventory.state.partial_target_runtime)"
         Write-Output "BROKEN_ACTIVE_VENV=$($inventory.state.broken_active_venv)"
         Write-Output "MIXED_PYTHONCORE_REGISTRATION=$($inventory.state.mixed_pythoncore_registration)"
@@ -1092,6 +1256,10 @@ try {
             $report.gates.MIXED_PYTHONCORE_POST_STATE = $after.state.mixed_pythoncore_registration
         }
         'InstallMachineRuntime' {
+            if (Test-InstalledMachineRuntimePending $inventory) {
+                Complete-InstalledMachineRuntime $inventory
+                break
+            }
             $report.required_previous_phase = 'UninstallTraditional'
             $previousEvidence = Get-VerifiedUninstallTraditionalEvidence
             $report.previous_phase_verified = $true
@@ -1111,22 +1279,6 @@ try {
             Assert-MachineInstallerPlan $plan
             $report.installer_plan = $plan
 
-            $machineAlreadyValid =
-                $inventory.state.traditional_user_runtime -eq 'ABSENT' -and
-                $inventory.state.traditional_machine_runtime -eq 'PRESENT' -and
-                $inventory.state.partial_target_runtime -eq 'ABSENT' -and
-                $inventory.state.completed_target_runtime -eq 'PRESENT_UNVERIFIED' -and
-                $inventory.state.mixed_pythoncore_registration -eq 'ABSENT'
-            if ($machineAlreadyValid) {
-                $metadata = Assert-BasePython $basePython
-                Assert-ExactBaseAcl $pythonBase
-                Assert-TreeNotModifiableByServices $pythonBase
-                Set-MachineRuntimePassGates $metadata
-                $report.gates.PYTHON_GATEWAY_EXECUTE = 'PASS'
-                $report.gates.PYTHON_GATEWAY_MODIFY_DENY = 'PASS'
-                if ($Apply) { Initialize-PhaseStorage; $report.current_run_applied_phase = 'InstallMachineRuntimeAlreadyComplete' }
-                break
-            }
             Assert-InstallMachinePreconditions $inventory
             if (-not $Apply) { break }
             if (-not $report.previous_phase_verified -or $report.required_previous_phase -ne 'UninstallTraditional') {
@@ -1135,6 +1287,7 @@ try {
             Initialize-PhaseStorage
             $installLog = New-PhaseLogPath 'machine-install'
             $report.installer_executed = $true
+            $report.installer_reexecuted = $false
             $report.current_run_applied_phase = 'InstallMachineRuntimeRequested'
             Start-LoggedInstaller $plan.executable $plan.arguments $installLog
             $report.current_run_applied_phase = 'InstallMachineRuntime'
@@ -1143,11 +1296,15 @@ try {
             $report.inventory_after = $after.state
             Assert-MachineInstallationInventory $after
             Protect-ExactRuntimeTree $pythonBase $true
+            $report.machine_runtime_acl_modified = $true
             Assert-ExactBaseAcl $pythonBase
             Assert-TreeNotModifiableByServices $pythonBase
             Set-MachineRuntimePassGates $metadata
-            $report.gates.PYTHON_GATEWAY_EXECUTE = 'PASS'
-            $report.gates.PYTHON_GATEWAY_MODIFY_DENY = 'PASS'
+            Set-MachineRuntimeAclPassGates
+            $report.gates.INSTALLER_REEXECUTED = 'false'
+        }
+        'ResumeMachineRuntime' {
+            Complete-InstalledMachineRuntime $inventory
         }
         'BuildVenv' {
             Assert-MachineInstallationInventory $inventory
@@ -1242,6 +1399,8 @@ try {
         Write-UninstallPreflightSummary
         Write-InstallMachineRuntimePreflightSummary
         Write-Output "PYTHON_RECOVERY_PHASE=$Phase"
+        Write-Output "MUST_NOT_EXECUTE_INSTALLER=$($report.must_not_execute_installer.ToString().ToLowerInvariant())"
+        Write-Output "INSTALLER_REEXECUTED=$($report.installer_reexecuted.ToString().ToLowerInvariant())"
         Write-Output 'PYTHON_RUNTIME_APPLY=NOT_RUN'
         exit 0
     }
@@ -1249,6 +1408,8 @@ try {
     Write-Report
     Write-Gates
     Write-Output "PYTHON_RECOVERY_PHASE=$Phase"
+    Write-Output "MUST_NOT_EXECUTE_INSTALLER=$($report.must_not_execute_installer.ToString().ToLowerInvariant())"
+    Write-Output "INSTALLER_REEXECUTED=$($report.installer_reexecuted.ToString().ToLowerInvariant())"
     Write-Output "PYTHON_RUNTIME_GATE_REPORT=$reportPath"
 } catch {
     $report.status = 'FAIL'
