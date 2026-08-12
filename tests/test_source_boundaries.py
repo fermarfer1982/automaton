@@ -291,6 +291,13 @@ class SourceBoundaryTests(unittest.TestCase):
         )
         self.assertIn("SAME_VERSION_TRADITIONAL_INSTALL_PRESENT=FAIL", installer)
         self.assertIn("INVENTORY_APPLY_FORBIDDEN", installer)
+        self.assertIn("current_run_applied_phase", installer)
+        self.assertNotIn("last_applied_phase", installer)
+        self.assertIn("required_previous_phase", installer)
+        self.assertIn("previous_phase_verified", installer)
+        self.assertIn("previous_phase_report", installer)
+        self.assertIn("PREVIOUS_PHASE_PREPARE_WHEELHOUSE", installer)
+        self.assertIn("Assert-PythonManagerPreserved", installer)
         self.assertNotIn("WriteAllText((Join-Path $Root 'pyvenv.cfg')", installer)
         setup = service_files[0].read_text(encoding="utf-8")
         self.assertIn(

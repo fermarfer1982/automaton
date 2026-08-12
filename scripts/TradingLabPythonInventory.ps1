@@ -23,6 +23,182 @@ function Resolve-TradingLabInstallerExit([int] $ExitCode) {
     return 'INSTALLER_EXIT_NONZERO'
 }
 
+function ConvertTo-TradingLabNormalizedDistributionName([string] $Name) {
+    return [regex]::Replace($Name.ToLowerInvariant(), '[-_.]+', '-')
+}
+
+function Resolve-TradingLabWheelhouseManifestState(
+    [object[]] $LockedRequirements,
+    [object[]] $Artifacts
+) {
+    $missing = [System.Collections.Generic.List[string]]::new()
+    $unexpected = [System.Collections.Generic.List[string]]::new()
+    $corrupt = [System.Collections.Generic.List[string]]::new()
+    $sourceDistributions = [System.Collections.Generic.List[string]]::new()
+    $duplicates = [System.Collections.Generic.List[string]]::new()
+    $matchedArtifacts = [System.Collections.Generic.List[object]]::new()
+
+    $expectedKeys = @{}
+    foreach ($requirement in $LockedRequirements) {
+        $key = "$(ConvertTo-TradingLabNormalizedDistributionName $requirement.name)==$($requirement.version.ToLowerInvariant())"
+        if ($expectedKeys.ContainsKey($key)) { throw "Duplicate locked requirement: $key" }
+        $expectedKeys[$key] = $requirement.sha256.ToLowerInvariant()
+    }
+
+    $actualByKey = @{}
+    foreach ($artifact in $Artifacts) {
+        $name = [string]$artifact.name
+        $isDirectory = [bool](Get-TradingLabProperty $artifact 'is_directory')
+        if ($isDirectory -or $name -notmatch '(?i)\.whl$') {
+            $unexpected.Add($name)
+            if ($name -match '(?i)(\.tar\.gz|\.zip|\.tar\.bz2)$') { $sourceDistributions.Add($name) }
+            continue
+        }
+        $parts = [System.IO.Path]::GetFileNameWithoutExtension($name) -split '-'
+        if ($parts.Count -lt 2) { $unexpected.Add($name); continue }
+        $key = "$(ConvertTo-TradingLabNormalizedDistributionName $parts[0])==$($parts[1].ToLowerInvariant())"
+        if (-not $expectedKeys.ContainsKey($key)) { $unexpected.Add($name); continue }
+        if (-not $actualByKey.ContainsKey($key)) { $actualByKey[$key] = @() }
+        $actualByKey[$key] = @($actualByKey[$key]) + @($artifact)
+        if ([string]$artifact.sha256 -ne $expectedKeys[$key]) { $corrupt.Add($name) }
+        $matchedArtifacts.Add([pscustomobject]@{ key = $key; name = $name; sha256 = $artifact.sha256 })
+    }
+
+    foreach ($key in $expectedKeys.Keys) {
+        if (-not $actualByKey.ContainsKey($key)) {
+            $missing.Add($key)
+        } elseif (@($actualByKey[$key]).Count -ne 1) {
+            $duplicates.Add($key)
+        }
+    }
+    $mt5Key = 'metatrader5==5.0.6090'
+    $numpyKey = 'numpy==2.5.2'
+    return [pscustomobject]@{
+        expected_requirements = $expectedKeys.Count
+        artifact_count = $Artifacts.Count
+        missing_requirements = @($missing)
+        unexpected_artifacts = @($unexpected)
+        corrupt_artifacts = @($corrupt)
+        source_distributions = @($sourceDistributions)
+        duplicate_requirements = @($duplicates)
+        matched_artifacts = @($matchedArtifacts)
+        hash_locked = $corrupt.Count -eq 0 -and $unexpected.Count -eq 0
+        complete = $missing.Count -eq 0 -and $unexpected.Count -eq 0 -and
+            $corrupt.Count -eq 0 -and $duplicates.Count -eq 0 -and
+            $Artifacts.Count -eq $expectedKeys.Count
+        metatrader5_present = $actualByKey.ContainsKey($mt5Key) -and @($actualByKey[$mt5Key]).Count -eq 1
+        numpy_present = $actualByKey.ContainsKey($numpyKey) -and @($actualByKey[$numpyKey]).Count -eq 1
+    }
+}
+
+function Test-TradingLabPrepareWheelhouseReportRecord(
+    [object] $Record,
+    [string] $ExpectedWheelhouse,
+    [string] $ExpectedLock,
+    [string] $ExpectedVersion
+) {
+    if ($null -eq $Record) { return $false }
+    $schema = Get-TradingLabProperty $Record 'schema_version'
+    $appliedPhase = if ($schema -ge 3) {
+        Get-TradingLabProperty $Record 'current_run_applied_phase'
+    } else {
+        Get-TradingLabProperty $Record 'last_applied_phase'
+    }
+    $gates = Get-TradingLabProperty $Record 'gates'
+    return (
+        $schema -in @(2, 3) -and
+        (Get-TradingLabProperty $Record 'phase') -eq 'PrepareWheelhouse' -and
+        [bool](Get-TradingLabProperty $Record 'apply_requested') -and
+        (Get-TradingLabProperty $Record 'status') -eq 'PASS' -and
+        (Get-TradingLabProperty $Record 'trading_mode') -eq 'OBSERVE_ONLY' -and
+        (Get-TradingLabProperty $Record 'python_version') -eq $ExpectedVersion -and
+        [System.IO.Path]::GetFullPath((Get-TradingLabProperty $Record 'wheelhouse')) -eq [System.IO.Path]::GetFullPath($ExpectedWheelhouse) -and
+        [System.IO.Path]::GetFullPath((Get-TradingLabProperty $Record 'lock_file')) -eq [System.IO.Path]::GetFullPath($ExpectedLock) -and
+        $appliedPhase -eq 'PrepareWheelhouse' -and
+        (Get-TradingLabProperty $gates 'DECLARATIVE_HASH_LOCK') -eq 'PASS' -and
+        (Get-TradingLabProperty $gates 'WHEELHOUSE_HASH_LOCKED') -eq 'PASS' -and
+        (Get-TradingLabProperty $gates 'META_TRADER5_WHEEL_PRESENT') -eq 'PASS' -and
+        (Get-TradingLabProperty $gates 'NUMPY_WHEEL_PRESENT') -eq 'PASS' -and
+        -not [bool](Get-TradingLabProperty $Record 'installer_executed') -and
+        -not [bool](Get-TradingLabProperty $Record 'uninstaller_executed') -and
+        -not [bool](Get-TradingLabProperty $Record 'mt5_accessed') -and
+        -not [bool](Get-TradingLabProperty $Record 'automaton_started') -and
+        -not [bool](Get-TradingLabProperty $Record 'gateway_started') -and
+        $null -eq (Get-TradingLabProperty $Record 'error')
+    )
+}
+
+function Find-TradingLabPrepareWheelhouseReport(
+    [string] $Directory,
+    [string] $ExpectedWheelhouse,
+    [string] $ExpectedLock,
+    [string] $ExpectedVersion
+) {
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        throw 'PREVIOUS_PHASE_PREPARE_WHEELHOUSE=FAIL: report directory is absent.'
+    }
+    $candidates = @(Get-ChildItem -LiteralPath $Directory -File -Filter 'python-runtime-*.json' |
+        Sort-Object LastWriteTimeUtc -Descending)
+    foreach ($candidate in $candidates) {
+        try {
+            $record = [System.IO.File]::ReadAllText($candidate.FullName, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            if (Test-TradingLabPrepareWheelhouseReportRecord $record $ExpectedWheelhouse $ExpectedLock $ExpectedVersion) {
+                return [pscustomobject]@{ path = $candidate.FullName; record = $record; last_write_time_utc = $candidate.LastWriteTimeUtc }
+            }
+        } catch { continue }
+    }
+    throw 'PREVIOUS_PHASE_PREPARE_WHEELHOUSE=FAIL: no valid durable PASS report exists.'
+}
+
+function Test-TradingLabManagerExcludedFromUninstallPlan(
+    [object] $Plan,
+    [string] $ManagerRegistryId,
+    [string] $ManagerPath
+) {
+    $destructiveIds = @((Get-TradingLabProperty $Plan 'destructive_registry_ids'))
+    $directDeletes = @((Get-TradingLabProperty $Plan 'direct_filesystem_deletes'))
+    $arguments = @((Get-TradingLabProperty $Plan 'arguments'))
+    $executable = [string](Get-TradingLabProperty $Plan 'executable')
+    $allDestructiveText = @($destructiveIds + $directDeletes + $arguments + @($executable)) -join "`n"
+    return (
+        $ManagerRegistryId -notin $destructiveIds -and
+        -not $executable.Equals((Join-Path $ManagerPath 'pymanager.exe'), [System.StringComparison]::OrdinalIgnoreCase) -and
+        $allDestructiveText.IndexOf($ManagerRegistryId, [System.StringComparison]::OrdinalIgnoreCase) -lt 0 -and
+        $allDestructiveText.IndexOf($ManagerPath, [System.StringComparison]::OrdinalIgnoreCase) -lt 0 -and
+        $allDestructiveText.IndexOf('pymanager.exe uninstall', [System.StringComparison]::OrdinalIgnoreCase) -lt 0
+    )
+}
+
+function Resolve-TradingLabMsiComponentSetState(
+    [object[]] $Expected,
+    [object[]] $Actual
+) {
+    $expectedByCode = @{}
+    foreach ($item in $Expected) { $expectedByCode[$item.product_code.ToUpperInvariant()] = $item.display_name }
+    $actualByCode = @{}
+    $duplicates = [System.Collections.Generic.List[string]]::new()
+    foreach ($item in $Actual) {
+        $code = ([string]$item.product_code).ToUpperInvariant()
+        if ($actualByCode.ContainsKey($code)) { $duplicates.Add($code) }
+        $actualByCode[$code] = $item
+    }
+    $missing = @($expectedByCode.Keys | Where-Object { -not $actualByCode.ContainsKey($_) } | Sort-Object)
+    $unexpected = @($actualByCode.Keys | Where-Object { -not $expectedByCode.ContainsKey($_) } | Sort-Object)
+    $nameMismatch = @($expectedByCode.Keys | Where-Object {
+        $actualByCode.ContainsKey($_) -and $actualByCode[$_].display_name -ne $expectedByCode[$_]
+    } | Sort-Object)
+    return [pscustomobject]@{
+        expected_count = $expectedByCode.Count
+        actual_count = $Actual.Count
+        missing_product_codes = $missing
+        unexpected_product_codes = $unexpected
+        duplicate_product_codes = @($duplicates)
+        display_name_mismatches = $nameMismatch
+        valid = $Actual.Count -eq $expectedByCode.Count -and $missing.Count -eq 0 -and
+            $unexpected.Count -eq 0 -and $duplicates.Count -eq 0 -and $nameMismatch.Count -eq 0
+    }
+}
+
 function Get-TradingLabPythonCoreRegistrations {
     $registrations = [System.Collections.Generic.List[object]]::new()
     foreach ($entry in @(

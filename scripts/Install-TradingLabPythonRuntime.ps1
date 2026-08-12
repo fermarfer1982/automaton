@@ -28,6 +28,19 @@ $expectedInstallerLength = 30361968L
 $expectedInstallerSha256 = 'f9c09f5ed6f796fd1a8bc5ddfa41715a494b453c4781f0e35d5077cf9fa58f6d'
 $expectedRegisteredBundleSha256 = '693522e3a8a747926a2f1f5a013b07315ac9472657d691b8f152fb6438b81723'
 $expectedLockSha256 = '68d14ddc9d943079e8f791bb8f276ae630f46c8ee8997b2bf2afeabed1e30d99'
+$expectedTraditionalBundleId = '{2FC382FA-68A9-44F7-8851-98D7664255E6}'
+$expectedManagerRegistryId = 'pymanager-pythoncore-3.14-64'
+$expectedTraditionalMsiComponents = @(
+    [pscustomobject]@{ product_code = '{1B0251E9-CD20-49FC-AD22-70FCDBC2BAD7}'; display_name = 'Python 3.14.5 Executables (64-bit)' },
+    [pscustomobject]@{ product_code = '{4B0FBDDD-D38E-48FF-A686-1A27792E66F9}'; display_name = 'Python 3.14.5 Tcl/Tk Support (64-bit)' },
+    [pscustomobject]@{ product_code = '{59989632-5855-479A-A589-433911625C16}'; display_name = 'Python 3.14.5 Development Libraries (64-bit)' },
+    [pscustomobject]@{ product_code = '{7040E6D8-53FD-4FE0-A539-92C0B33E9A10}'; display_name = 'Python 3.14.5 pip Bootstrap (64-bit)' },
+    [pscustomobject]@{ product_code = '{A0B65FCB-97C6-47FD-984A-9EF9ECC1CE3B}'; display_name = 'Python 3.14.5 Standard Library (64-bit)' },
+    [pscustomobject]@{ product_code = '{E402961E-7539-41B4-ADA9-62143E6D32D7}'; display_name = 'Python 3.14.5 Core Interpreter (64-bit)' },
+    [pscustomobject]@{ product_code = '{EDE01DCA-6375-4140-A590-B2FA5948D01D}'; display_name = 'Python 3.14.5 Documentation (64-bit)' },
+    [pscustomobject]@{ product_code = '{F479F658-E4C4-4A61-8DB6-3E66633FBFFF}'; display_name = 'Python 3.14.5 Test Suite (64-bit)' },
+    [pscustomobject]@{ product_code = '{F689BE51-4D7A-47E9-A4DF-1C42528856E7}'; display_name = 'Python 3.14.5 Add to Path (64-bit)' }
+)
 $systemSid = 'S-1-5-18'
 $administratorsSid = 'S-1-5-32-544'
 $usersSid = 'S-1-5-32-545'
@@ -42,7 +55,7 @@ $runId = [guid]::NewGuid().ToString('D').ToLowerInvariant()
 $reportDirectory = Join-Path $maintenanceRoot 'python-runtime-results'
 $reportPath = Join-Path $reportDirectory "python-runtime-$runId.json"
 $report = [ordered]@{
-    schema_version = 2
+    schema_version = 3
     run_id = $runId
     phase = $Phase
     apply_requested = [bool]$Apply
@@ -59,7 +72,11 @@ $report = [ordered]@{
     uninstaller_executed = $false
     venv_rebuilt = $false
     venv_promoted = $false
-    last_applied_phase = 'NONE'
+    current_run_applied_phase = 'NONE'
+    required_previous_phase = $null
+    previous_phase_verified = $false
+    previous_phase_report = $null
+    previous_phase_report_sha256 = $null
     old_venv_backup = $null
     mt5_accessed = $false
     automaton_started = $false
@@ -68,6 +85,12 @@ $report = [ordered]@{
     gates = [ordered]@{}
     inventory_before = $null
     inventory_after = $null
+    python_manager_preserve_path = $null
+    traditional_bundle_target = $null
+    traditional_bundle_uninstaller = $null
+    traditional_msi_components = @()
+    wheelhouse_validation = $null
+    uninstall_plan = $null
     error = $null
 }
 
@@ -303,42 +326,55 @@ function Assert-NoMixedPythonCore([object] $Inventory) {
     }
 }
 
+function Get-LockedWheelManifest {
+    $manifest = [System.Collections.Generic.List[object]]::new()
+    foreach ($line in Get-Content -LiteralPath $lockPath) {
+        if ($line -notmatch '^([A-Za-z0-9_.-]+)==([^\s]+)\s+--hash=sha256:([0-9a-fA-F]{64})\s*$') { continue }
+        $manifest.Add([pscustomobject]@{
+            name = ConvertTo-TradingLabNormalizedDistributionName $Matches[1]
+            version = $Matches[2].ToLowerInvariant()
+            sha256 = $Matches[3].ToLowerInvariant()
+        })
+    }
+    if ($manifest.Count -eq 0) { throw 'DECLARATIVE_HASH_LOCK=FAIL: no locked wheel requirements parsed.' }
+    return @($manifest)
+}
+
 function Assert-Wheelhouse([string] $Path) {
-    Assert-NoReparseComponents $Path
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
         throw "WHEELHOUSE_PRESENT=FAIL: $Path"
     }
-    $wheels = @(Get-ChildItem -LiteralPath $Path -File -Filter '*.whl' -ErrorAction Stop)
-    if ($wheels.Count -eq 0) { throw 'WHEELHOUSE_PRESENT=FAIL: no wheels were staged.' }
-    $lockText = [System.IO.File]::ReadAllText($lockPath, [System.Text.Encoding]::UTF8).ToLowerInvariant()
-    foreach ($wheel in $wheels) {
-        $hash = (Get-FileHash -LiteralPath $wheel.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-        if (-not $lockText.Contains("sha256:$hash")) {
-            throw "WHEELHOUSE_HASH_ALLOWLIST=FAIL: $($wheel.Name)"
+    Assert-NoReparseComponents $Path
+    $artifacts = @()
+    foreach ($item in Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop) {
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw "WHEELHOUSE_REPARSE_POINT=FAIL: $($item.FullName)"
+        }
+        $artifacts += [pscustomobject]@{
+            name = $item.Name
+            is_directory = [bool]$item.PSIsContainer
+            sha256 = if ($item.PSIsContainer) { $null } else {
+                (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            }
         }
     }
-    $wheelInventory = @($wheels | ForEach-Object {
-        $parts = $_.BaseName -split '-'
-        if ($parts.Count -lt 2) { throw "WHEELHOUSE_FILENAME=FAIL: $($_.Name)" }
-        [pscustomobject]@{
-            name = [regex]::Replace($parts[0].ToLowerInvariant(), '[-_.]+', '-')
-            version = $parts[1].ToLowerInvariant()
-        }
-    })
-    foreach ($locked in Get-LockedRequirements) {
-        $parts = $locked -split '==', 2
-        if (@($wheelInventory | Where-Object {
-            $_.name -eq $parts[0] -and $_.version -eq $parts[1]
-        }).Count -ne 1) {
-            throw "WHEELHOUSE_LOCK_COVERAGE=FAIL: $locked"
-        }
+    if ($artifacts.Count -eq 0) { throw 'WHEELHOUSE_PRESENT=FAIL: no artifacts were staged.' }
+    $state = Resolve-TradingLabWheelhouseManifestState (Get-LockedWheelManifest) $artifacts
+    if ($state.source_distributions.Count -ne 0) {
+        throw "WHEELHOUSE_SOURCE_DISTRIBUTION=FAIL: $($state.source_distributions -join ',')"
     }
-    foreach ($pattern in @('metatrader5-5.0.6090-*-win_amd64.whl', 'numpy-2.5.2-*-win_amd64.whl')) {
-        if (@(Get-ChildItem -LiteralPath $Path -File -Filter $pattern).Count -ne 1) {
-            throw "WHEELHOUSE_REQUIRED_BINARY=FAIL: $pattern"
-        }
+    if ($state.corrupt_artifacts.Count -ne 0) {
+        throw "WHEELHOUSE_HASH_LOCKED=FAIL: $($state.corrupt_artifacts -join ',')"
     }
-    return $wheels
+    if ($state.unexpected_artifacts.Count -ne 0) {
+        throw "WHEELHOUSE_UNEXPECTED_ARTIFACT=FAIL: $($state.unexpected_artifacts -join ',')"
+    }
+    if (-not $state.complete) {
+        throw "WHEELHOUSE_COMPLETE=FAIL: missing=$($state.missing_requirements -join ','); duplicates=$($state.duplicate_requirements -join ',')"
+    }
+    if (-not $state.metatrader5_present) { throw 'META_TRADER5_WHEEL_PRESENT=FAIL' }
+    if (-not $state.numpy_present) { throw 'NUMPY_WHEEL_PRESENT=FAIL' }
+    return $state
 }
 
 function Get-RegisteredTraditionalBundle([object] $Inventory) {
@@ -346,6 +382,11 @@ function Get-RegisteredTraditionalBundle([object] $Inventory) {
     if ($bundles.Count -ne 1 -or $bundles[0].scope -ne 'HKCU') {
         throw 'TRADITIONAL_USER_RUNTIME=FAIL: exactly one HKCU traditional bundle is required for supported recovery.'
     }
+    if (
+        $bundles[0].registry_id.ToUpperInvariant() -ne $expectedTraditionalBundleId -or
+        $bundles[0].display_name -ne 'Python 3.14.5 (64-bit)' -or
+        $bundles[0].display_version -ne '3.14.5150.0'
+    ) { throw 'TRADITIONAL_BUNDLE_TARGET=FAIL: registered bundle identity is unexpected.' }
     return $bundles[0]
 }
 
@@ -376,6 +417,127 @@ function Resolve-RegisteredBundleExecutable([object] $Bundle) {
         $signature.SignerCertificate.Subject -notmatch '(^|,\s*)O=Python Software Foundation(,|$)'
     ) { throw 'REGISTERED_UNINSTALLER_SIGNATURE=FAIL' }
     return Get-CanonicalPath $registeredPath
+}
+
+function Get-VerifiedPrepareWheelhouseEvidence {
+    Assert-NoReparseComponents $reportDirectory
+    Assert-NoUntrustedModify $reportDirectory @(
+        $gatewaySid, $agentSid, $usersSid, $authenticatedUsersSid, $everyoneSid
+    )
+    $evidence = Find-TradingLabPrepareWheelhouseReport `
+        $reportDirectory $wheelhousePath $lockPath $expectedPythonVersion
+    $reportItem = Get-Item -LiteralPath $evidence.path -Force -ErrorAction Stop
+    if ($reportItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw 'PREVIOUS_PHASE_PREPARE_WHEELHOUSE=FAIL: report is a reparse point.'
+    }
+    Assert-NoUntrustedModify $reportItem.FullName @(
+        $gatewaySid, $agentSid, $usersSid, $authenticatedUsersSid, $everyoneSid
+    )
+    $expectedName = "python-runtime-$($evidence.record.run_id).json"
+    if ($reportItem.Name -ne $expectedName) {
+        throw 'PREVIOUS_PHASE_PREPARE_WHEELHOUSE=FAIL: report filename/run_id mismatch.'
+    }
+    $latestWheelWrite = (Get-ChildItem -LiteralPath $wheelhousePath -File |
+        Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1).LastWriteTimeUtc
+    if ($null -eq $latestWheelWrite -or $reportItem.LastWriteTimeUtc -lt $latestWheelWrite) {
+        throw 'PREVIOUS_PHASE_PREPARE_WHEELHOUSE=FAIL: report predates current wheelhouse artifacts.'
+    }
+    return [pscustomobject]@{
+        path = $reportItem.FullName
+        sha256 = (Get-FileHash -LiteralPath $reportItem.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        record = $evidence.record
+    }
+}
+
+function Assert-ExpectedTraditionalMsiComponents(
+    [object] $Inventory,
+    [string] $ExpectedOwnerSid
+) {
+    $actual = @($Inventory.msi_products)
+    $state = Resolve-TradingLabMsiComponentSetState $expectedTraditionalMsiComponents $actual
+    if (-not $state.valid) {
+        throw "TRADITIONAL_MSI_COMPONENTS=FAIL: expected=9 actual=$($state.actual_count) missing=$($state.missing_product_codes -join ',') unexpected=$($state.unexpected_product_codes -join ',') duplicate=$($state.duplicate_product_codes -join ',') name_mismatch=$($state.display_name_mismatches -join ',')"
+    }
+    $uninstallComponentIds = @($Inventory.uninstall_entries | Where-Object {
+        $_.kind -eq 'TRADITIONAL_MSI_COMPONENT'
+    } | ForEach-Object { $_.registry_id.ToUpperInvariant() } | Sort-Object)
+    $expectedIds = @($expectedTraditionalMsiComponents | ForEach-Object {
+        $_.product_code.ToUpperInvariant()
+    } | Sort-Object)
+    if (@(Compare-Object $expectedIds $uninstallComponentIds).Count -ne 0) {
+        throw 'TRADITIONAL_MSI_COMPONENTS=FAIL: Uninstall entries and Installer UserData disagree.'
+    }
+    $windowsInstallerRoot = Get-CanonicalPath (Join-Path $env:WINDIR 'Installer')
+    foreach ($component in $actual) {
+        if ($component.user_data_sid -ne $ExpectedOwnerSid) {
+            throw "TRADITIONAL_MSI_COMPONENTS=FAIL: unexpected owner SID for $($component.product_code)."
+        }
+        if (
+            -not $component.local_package -or
+            -not (Test-PathWithin $component.local_package $windowsInstallerRoot) -or
+            -not (Test-Path -LiteralPath $component.local_package -PathType Leaf)
+        ) { throw "TRADITIONAL_MSI_COMPONENTS=FAIL: registered MSI cache is absent or outside Windows Installer for $($component.product_code)." }
+        Assert-NoReparseComponents $component.local_package
+    }
+    return @($actual | Sort-Object product_code)
+}
+
+function New-TraditionalUninstallPlan(
+    [object] $Bundle,
+    [string] $Executable,
+    [object[]] $Components
+) {
+    return [ordered]@{
+        operation = 'SUPPORTED_REGISTERED_BUNDLE_UNINSTALL'
+        executable = $Executable
+        arguments = @('/uninstall', '/quiet')
+        log_argument_added_at_execution = '/log <RUN_SCOPED_DURABLE_LOG>'
+        bundle_display_name = $Bundle.display_name
+        bundle_registry_id = $Bundle.registry_id.ToUpperInvariant()
+        destructive_registry_ids = @($Bundle.registry_id.ToUpperInvariant()) + @(
+            $Components | ForEach-Object { $_.product_code.ToUpperInvariant() }
+        )
+        expected_msi_components = @($Components | ForEach-Object {
+            [ordered]@{ display_name = $_.display_name; product_code = $_.product_code.ToUpperInvariant() }
+        })
+        direct_registry_deletes = @()
+        direct_filesystem_deletes = @()
+        package_cache_deletes = @()
+        windows_installer_cache_deletes = @()
+        manager_uninstall_actions = @()
+        active_venv_action = 'UNTOUCHED_BY_SCRIPT'
+        partial_target_action = 'UNTOUCHED_BY_SCRIPT'
+    }
+}
+
+function Assert-PythonManagerPreserved(
+    [object] $Inventory,
+    [object] $Plan
+) {
+    $managerEntries = @($Inventory.uninstall_entries | Where-Object {
+        $_.kind -eq 'PYTHON_MANAGER_RUNTIME'
+    })
+    $expectedManagerPath = Get-CanonicalPath (Join-Path $env:LOCALAPPDATA 'Python\pythoncore-3.14-64')
+    if (
+        $managerEntries.Count -ne 1 -or
+        $managerEntries[0].registry_id -ne $expectedManagerRegistryId -or
+        (Get-CanonicalPath $managerEntries[0].install_location) -ne $expectedManagerPath -or
+        (Get-CanonicalPath $Inventory.python_manager.probe.metadata.base_prefix) -ne $expectedManagerPath -or
+        (Get-CanonicalPath $Inventory.python_manager.executable) -ne (Join-Path $expectedManagerPath 'python.exe')
+    ) { throw 'PYTHON_MANAGER_PRESERVE=FAIL: Manager registration/path/runtime is not exact.' }
+    if (-not (Test-TradingLabManagerExcludedFromUninstallPlan $Plan $expectedManagerRegistryId $expectedManagerPath)) {
+        throw 'PYTHON_MANAGER_PRESERVE=CRITICAL_FAIL: Manager appears in the destructive plan.'
+    }
+    return [pscustomobject]@{ registry_id = $expectedManagerRegistryId; path = $expectedManagerPath }
+}
+
+function Assert-UninstallPlanHasNoDirectCleanup([object] $Plan) {
+    if (@($Plan.direct_registry_deletes).Count -ne 0) { throw 'NO_MANUAL_REGISTRY_CLEANUP=FAIL' }
+    if (@($Plan.package_cache_deletes).Count -ne 0) { throw 'NO_PACKAGE_CACHE_DELETE=FAIL' }
+    if (@($Plan.windows_installer_cache_deletes).Count -ne 0) { throw 'NO_WINDOWS_INSTALLER_CACHE_DELETE=FAIL' }
+    if (@($Plan.direct_filesystem_deletes).Count -ne 0) { throw 'DIRECT_FILESYSTEM_DELETE=FAIL' }
+    if ($Plan.active_venv_action -ne 'UNTOUCHED_BY_SCRIPT') { throw 'ACTIVE_VENV_UNTOUCHED=FAIL' }
+    if ($Plan.partial_target_action -ne 'UNTOUCHED_BY_SCRIPT') { throw 'PARTIAL_TARGET_NOT_DELETED_YET=FAIL' }
 }
 
 function Assert-LabStoppedAndObserveOnly {
@@ -566,6 +728,29 @@ function Write-Gates {
     }
 }
 
+function Write-UninstallPreflightSummary {
+    if ($Phase -ne 'UninstallTraditional' -or $null -eq $report.uninstall_plan) { return }
+    Write-Output "required_previous_phase=$($report.required_previous_phase)"
+    Write-Output "previous_phase_verified=$($report.previous_phase_verified.ToString().ToLowerInvariant())"
+    Write-Output "previous_phase_report=$($report.previous_phase_report)"
+    Write-Output "WHEELHOUSE_EXPECTED_REQUIREMENTS=$($report.wheelhouse_validation.expected_requirements)"
+    Write-Output "WHEELHOUSE_ARTIFACT_COUNT=$($report.wheelhouse_validation.artifact_count)"
+    Write-Output "WHEELHOUSE_MISSING_REQUIREMENTS=$(@($report.wheelhouse_validation.missing_requirements).Count)"
+    Write-Output "WHEELHOUSE_SOURCE_DISTRIBUTIONS=$(@($report.wheelhouse_validation.source_distributions).Count)"
+    Write-Output "WHEELHOUSE_UNEXPECTED_ARTIFACTS=$(@($report.wheelhouse_validation.unexpected_artifacts).Count)"
+    Write-Output "WHEELHOUSE_CORRUPT_ARTIFACTS=$(@($report.wheelhouse_validation.corrupt_artifacts).Count)"
+    Write-Output "PYTHON_MANAGER_PRESERVE_PATH=$($report.python_manager_preserve_path)"
+    Write-Output "TRADITIONAL_BUNDLE_DISPLAY_NAME=$($report.traditional_bundle_target.display_name)"
+    Write-Output "TRADITIONAL_BUNDLE_REGISTRY_ID=$($report.traditional_bundle_target.registry_id)"
+    Write-Output "TRADITIONAL_BUNDLE_UNINSTALLER=$($report.traditional_bundle_uninstaller)"
+    $index = 0
+    foreach ($component in $report.traditional_msi_components) {
+        $index++
+        Write-Output ("TRADITIONAL_MSI_COMPONENT_{0:D2}={1}|{2}" -f `
+            $index, $component.product_code, $component.display_name)
+    }
+}
+
 try {
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
@@ -610,8 +795,13 @@ try {
     switch ($Phase) {
         'PrepareWheelhouse' {
             if (Test-Path -LiteralPath $wheelhousePath) {
-                [void](Assert-Wheelhouse $wheelhousePath)
+                $wheelhouseState = Assert-Wheelhouse $wheelhousePath
+                $report.wheelhouse_validation = $wheelhouseState
+                $report.gates.WHEELHOUSE_PRESENT = 'PASS'
                 $report.gates.WHEELHOUSE_HASH_LOCKED = 'PASS'
+                $report.gates.WHEELHOUSE_COMPLETE = 'PASS'
+                $report.gates.META_TRADER5_WHEEL_PRESENT = 'PASS'
+                $report.gates.NUMPY_WHEEL_PRESENT = 'PASS'
             }
             if (-not $Apply) { break }
             Initialize-PhaseStorage
@@ -619,7 +809,7 @@ try {
                 $wheelhouseStaging = Join-Path $maintenanceRoot "wheelhouse.new-$runId"
                 if (Test-Path -LiteralPath $wheelhouseStaging) { throw 'WHEELHOUSE_STAGING_COLLISION=FAIL' }
                 [void][System.IO.Directory]::CreateDirectory($wheelhouseStaging)
-                $report.last_applied_phase = 'PrepareWheelhouseRequested'
+                $report.current_run_applied_phase = 'PrepareWheelhouseRequested'
                 Invoke-LoggedProcess $managerPython @(
                     '-I', '-m', 'pip', 'download', '--disable-pip-version-check', '--no-input',
                     '--dest', $wheelhouseStaging, '--only-binary=:all:', '--require-hashes', '-r', $lockPath
@@ -631,46 +821,81 @@ try {
                 }
                 Move-Item -LiteralPath $wheelhouseStaging -Destination $wheelhousePath
             }
-            [void](Assert-Wheelhouse $wheelhousePath)
-            $report.last_applied_phase = 'PrepareWheelhouse'
+            $wheelhouseState = Assert-Wheelhouse $wheelhousePath
+            $report.wheelhouse_validation = $wheelhouseState
+            $report.current_run_applied_phase = 'PrepareWheelhouse'
+            $report.gates.WHEELHOUSE_PRESENT = 'PASS'
             $report.gates.WHEELHOUSE_HASH_LOCKED = 'PASS'
+            $report.gates.WHEELHOUSE_COMPLETE = 'PASS'
             $report.gates.META_TRADER5_WHEEL_PRESENT = 'PASS'
             $report.gates.NUMPY_WHEEL_PRESENT = 'PASS'
         }
         'UninstallTraditional' {
-            [void](Assert-Wheelhouse $wheelhousePath)
-            if (
-                $inventory.state.same_version_traditional_install_present -eq 'PASS' -and
-                $inventory.state.partial_target_runtime -eq 'ABSENT' -and
-                $inventory.state.mixed_pythoncore_registration -eq 'ABSENT'
-            ) {
-                $report.gates.SAME_VERSION_TRADITIONAL_INSTALL_PRESENT = 'PASS'
-                $report.gates.PARTIAL_TARGET_RUNTIME = 'ABSENT'
-                $report.gates.PYTHON_MANAGER_RUNTIME_PRESERVED = 'PASS'
-                if ($Apply) { Initialize-PhaseStorage; $report.last_applied_phase = 'UninstallTraditionalAlreadyComplete' }
-                break
-            }
+            $report.required_previous_phase = 'PrepareWheelhouse'
+            $wheelhouseState = Assert-Wheelhouse $wheelhousePath
+            $report.wheelhouse_validation = $wheelhouseState
+            $report.gates.WHEELHOUSE_PRESENT = 'PASS'
+            $report.gates.WHEELHOUSE_HASH_LOCKED = 'PASS'
+            $report.gates.WHEELHOUSE_COMPLETE = 'PASS'
+            $report.gates.META_TRADER5_WHEEL_PRESENT = 'PASS'
+            $report.gates.NUMPY_WHEEL_PRESENT = 'PASS'
+            $previousEvidence = Get-VerifiedPrepareWheelhouseEvidence
+            $report.previous_phase_verified = $true
+            $report.previous_phase_report = $previousEvidence.path
+            $report.previous_phase_report_sha256 = $previousEvidence.sha256
+            $report.gates.PREVIOUS_PHASE_PREPARE_WHEELHOUSE = 'PASS'
+
             $bundle = Get-RegisteredTraditionalBundle $inventory
             $bundleExecutable = Resolve-RegisteredBundleExecutable $bundle
+            $components = Assert-ExpectedTraditionalMsiComponents $inventory $identity.User.Value
+            $plan = New-TraditionalUninstallPlan $bundle $bundleExecutable $components
+            $managerEvidence = Assert-PythonManagerPreserved $inventory $plan
+            Assert-UninstallPlanHasNoDirectCleanup $plan
+            if ($inventory.state.partial_target_runtime -ne 'PRESENT') {
+                throw 'PARTIAL_TARGET_NOT_DELETED_YET=FAIL: expected current recovery input is absent.'
+            }
+            if (
+                -not $inventory.active_venv.redirector_exists -or
+                -not $inventory.active_venv.pyvenv_cfg_exists
+            ) { throw 'ACTIVE_VENV_UNTOUCHED=FAIL: active venv evidence is absent before uninstall.' }
+
+            $report.python_manager_preserve_path = $managerEvidence.path
+            $report.traditional_bundle_target = [ordered]@{
+                display_name = $bundle.display_name
+                registry_id = $bundle.registry_id.ToUpperInvariant()
+            }
+            $report.traditional_bundle_uninstaller = $bundleExecutable
+            $report.traditional_msi_components = @($plan.expected_msi_components)
+            $report.uninstall_plan = $plan
+            $report.gates.PYTHON_MANAGER_RUNTIME = 'PASS'
+            $report.gates.PYTHON_MANAGER_PRESERVE = 'PASS'
+            $report.gates.TRADITIONAL_BUNDLE_TARGET = 'PASS'
+            $report.gates.TRADITIONAL_MSI_COMPONENTS_EXPECTED = 9
+            $report.gates.NO_MANUAL_REGISTRY_CLEANUP = 'PASS'
+            $report.gates.NO_PACKAGE_CACHE_DELETE = 'PASS'
+            $report.gates.NO_WINDOWS_INSTALLER_CACHE_DELETE = 'PASS'
+            $report.gates.ACTIVE_VENV_UNTOUCHED = 'PASS'
+            $report.gates.PARTIAL_TARGET_NOT_DELETED_YET = 'PASS'
             $report.gates.SAME_VERSION_TRADITIONAL_INSTALL_PRESENT = 'FAIL_EXPECTED_RECOVERY_INPUT'
             $report.gates.REGISTERED_UNINSTALLER_VERIFIED = 'PASS'
             if (-not $Apply) { break }
+            if (-not $report.previous_phase_verified -or $report.required_previous_phase -ne 'PrepareWheelhouse') {
+                throw 'PREVIOUS_PHASE_PREPARE_WHEELHOUSE=FAIL: destructive execution is not authorized by stale current-run state.'
+            }
             Initialize-PhaseStorage
             $uninstallLog = New-PhaseLogPath 'traditional-uninstall'
             $report.uninstaller_executed = $true
-            $report.last_applied_phase = 'UninstallTraditionalRequested'
+            $report.current_run_applied_phase = 'UninstallTraditionalRequested'
             Start-LoggedInstaller $bundleExecutable @('/uninstall', '/quiet') $uninstallLog
-            $report.last_applied_phase = 'UninstallTraditional'
+            $report.current_run_applied_phase = 'UninstallTraditional'
             $after = Get-TradingLabPythonInventory
             $report.inventory_after = $after.state
             [void](Assert-ManagerRuntime $after)
             Assert-NoTraditionalRuntime $after
-            Assert-NoPartialTarget $after
-            Assert-NoMixedPythonCore $after
             $report.gates.SAME_VERSION_TRADITIONAL_INSTALL_PRESENT = 'PASS'
-            $report.gates.PARTIAL_TARGET_RUNTIME = 'ABSENT'
-            $report.gates.MIXED_PYTHONCORE_REGISTRATION = 'ABSENT'
-            $report.gates.PYTHON_MANAGER_RUNTIME_PRESERVED = 'PASS'
+            $report.gates.PYTHON_MANAGER_PRESERVE = 'PASS'
+            $report.gates.PARTIAL_TARGET_POST_STATE = $after.state.partial_target_runtime
+            $report.gates.MIXED_PYTHONCORE_POST_STATE = $after.state.mixed_pythoncore_registration
         }
         'InstallMachineRuntime' {
             $machineAlreadyValid =
@@ -687,7 +912,7 @@ try {
                 $report.gates.PYTHON_BASE_OUTSIDE_USER_PROFILE = 'PASS'
                 $report.gates.PYTHON_GATEWAY_EXECUTE = 'PASS'
                 $report.gates.PYTHON_GATEWAY_MODIFY_DENY = 'PASS'
-                if ($Apply) { Initialize-PhaseStorage; $report.last_applied_phase = 'InstallMachineRuntimeAlreadyComplete' }
+                if ($Apply) { Initialize-PhaseStorage; $report.current_run_applied_phase = 'InstallMachineRuntimeAlreadyComplete' }
                 break
             }
             Assert-NoTraditionalRuntime $inventory
@@ -701,7 +926,7 @@ try {
             Initialize-PhaseStorage
             $installLog = New-PhaseLogPath 'machine-install'
             $report.installer_executed = $true
-            $report.last_applied_phase = 'InstallMachineRuntimeRequested'
+            $report.current_run_applied_phase = 'InstallMachineRuntimeRequested'
             Start-LoggedInstaller $InstallerPath @(
                 '/quiet', 'InstallAllUsers=1', ('TargetDir=' + $pythonBase),
                 'AssociateFiles=0', 'PrependPath=0', 'AppendPath=0', 'Shortcuts=0',
@@ -710,7 +935,7 @@ try {
                 'Include_pip=1', 'Include_symbols=0', 'Include_tcltk=0',
                 'Include_test=0', 'Include_tools=0', 'CompileAll=0'
             ) $installLog
-            $report.last_applied_phase = 'InstallMachineRuntime'
+            $report.current_run_applied_phase = 'InstallMachineRuntime'
             [void](Assert-BasePython $basePython)
             $after = Get-TradingLabPythonInventory
             $report.inventory_after = $after.state
@@ -732,12 +957,12 @@ try {
                 $report.gates.VENV_BASE_OUTSIDE_USER_PROFILE = 'PASS'
                 $report.gates.VENV_LOCK_MATCH = 'PASS'
                 $report.gates.META_TRADER5_PACKAGE_PRESENT = 'PASS'
-                if ($Apply) { Initialize-PhaseStorage; $report.last_applied_phase = 'BuildVenvAlreadyComplete' }
+                if ($Apply) { Initialize-PhaseStorage; $report.current_run_applied_phase = 'BuildVenvAlreadyComplete' }
                 break
             }
             if (-not $Apply) { break }
             Initialize-PhaseStorage
-            $report.last_applied_phase = 'BuildVenvRequested'
+            $report.current_run_applied_phase = 'BuildVenvRequested'
             Invoke-LoggedProcess $basePython @('-I', '-m', 'venv', $stagingVenvPath) 'venv-create'
             $stagingPython = Join-Path $stagingVenvPath 'Scripts\python.exe'
             Invoke-LoggedProcess $stagingPython @(
@@ -746,7 +971,7 @@ try {
                 '--require-hashes', '-r', $lockPath
             ) 'venv-install'
             [void](Assert-Venv $stagingVenvPath)
-            $report.last_applied_phase = 'BuildVenv'
+            $report.current_run_applied_phase = 'BuildVenv'
             $report.venv_rebuilt = $true
             $report.gates.VENV_BASE_OUTSIDE_USER_PROFILE = 'PASS'
             $report.gates.VENV_LOCK_MATCH = 'PASS'
@@ -762,7 +987,7 @@ try {
                 $report.gates.VENV_BASE_OUTSIDE_USER_PROFILE = 'PASS'
                 $report.gates.VENV_LOCK_MATCH = 'PASS'
                 $report.gates.META_TRADER5_PACKAGE_PRESENT = 'PASS'
-                if ($Apply) { Initialize-PhaseStorage; $report.last_applied_phase = 'PromoteVenvAlreadyComplete' }
+                if ($Apply) { Initialize-PhaseStorage; $report.current_run_applied_phase = 'PromoteVenvAlreadyComplete' }
                 break
             }
             [void](Assert-Venv $stagingVenvPath)
@@ -778,11 +1003,11 @@ try {
                 Move-Item -LiteralPath $venvPath -Destination $backupPath
                 $oldMoved = $true
             }
-            $report.last_applied_phase = 'ActiveVenvBackedUp'
+            $report.current_run_applied_phase = 'ActiveVenvBackedUp'
             try {
                 Move-Item -LiteralPath $stagingVenvPath -Destination $venvPath
                 [void](Assert-Venv $venvPath)
-                $report.last_applied_phase = 'PromoteVenv'
+                $report.current_run_applied_phase = 'PromoteVenv'
                 $report.venv_promoted = $true
             } catch {
                 if (Test-Path -LiteralPath $venvPath) {
@@ -792,7 +1017,7 @@ try {
                 }
                 if ($oldMoved -and -not (Test-Path -LiteralPath $venvPath)) {
                     Move-Item -LiteralPath $backupPath -Destination $venvPath
-                    $report.last_applied_phase = 'PromotionRolledBack'
+                    $report.current_run_applied_phase = 'PromotionRolledBack'
                 }
                 throw
             }
@@ -812,6 +1037,8 @@ try {
     if (-not $Apply) {
         $report.status = 'DRY_RUN_PASS'
         $report | ConvertTo-Json -Depth 10
+        Write-Gates
+        Write-UninstallPreflightSummary
         Write-Output "PYTHON_RECOVERY_PHASE=$Phase"
         Write-Output 'PYTHON_RUNTIME_APPLY=NOT_RUN'
         exit 0

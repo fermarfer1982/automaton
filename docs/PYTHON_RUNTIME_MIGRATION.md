@@ -66,9 +66,13 @@ ejecución humana explícita:
    admitidos por el lock a un staging de maintenance. Solo promueve el
    wheelhouse tras verificar todos los hashes y los wheels MT5/numpy.
 2. `UninstallTraditional`: exige el wheelhouse completo antes de ejecutar el
-   desinstalador registrado con `/uninstall /quiet /log`. Después exige que no
-   queden bundle, componentes MSI, destino parcial ni registro `PythonCore`
-   mixto, y que Python Manager siga funcional.
+   desinstalador registrado con `/uninstall /quiet /log`. Antes de `-Apply`
+   vuelve a validar todos los wheels y enlaza un reporte durable PASS de
+   `PrepareWheelhouse`. La fase no contiene borrado directo de registro,
+   Package Cache, Windows Installer cache, venv activo ni target parcial. Tras
+   el desinstalador exige que no queden bundle/componentes tradicionales y que
+   Python Manager siga funcional; cualquier target parcial o registro
+   `PythonCore` mixto restante bloquea fases posteriores y requiere otro gate.
 3. `InstallMachineRuntime`: solo puede ejecutarse cuando no queda ninguna
    instalación traditional 3.14.5 ni destino parcial. Usa el full installer
    verificado con log durable y componentes mínimos.
@@ -83,7 +87,11 @@ válido se reconoce como `AlreadyComplete`; un artefacto existente pero inválid
 se conserva y bloquea la continuación. No hay borrado automático para “hacer
 que pase”. Cada ejecución de installer, pip o venv produce stdout/stderr o log
 en `C:\ProgramData\AutomatonMT5Lab\maintenance\logs`. Cada fase aplicada crea
-un reporte JSON con `last_applied_phase` en `python-runtime-results`.
+un reporte JSON en `python-runtime-results`. `current_run_applied_phase`
+describe exclusivamente las mutaciones de esa ejecución. La continuidad se
+expresa aparte con `required_previous_phase`, `previous_phase_verified` y
+`previous_phase_report`; ningún valor de fase de una ejecución anterior basta
+por sí solo para autorizar una operación.
 
 La instalación base excluye Development Libraries, tests, documentación,
 Tcl/Tk, launcher, asociaciones y PATH. Conserva executables, stdlib y pip:
@@ -107,16 +115,20 @@ Set-Location C:\automaton
 .\scripts\Install-TradingLabPythonRuntime.ps1 -Phase PrepareWheelhouse
 .\scripts\Install-TradingLabPythonRuntime.ps1 -Phase PrepareWheelhouse -Apply
 
-# 3. Retirar de forma soportada el traditional 3.14.5 dañado.
+# 3. Prevalidar la retirada soportada. Debe imprimir todos los gates de
+# continuidad, wheelhouse, Manager, bundle y los 9 ProductCodes.
 .\scripts\Install-TradingLabPythonRuntime.ps1 -Phase UninstallTraditional
+
+# Revisar la salida antes de autorizar separadamente la mutación:
 .\scripts\Install-TradingLabPythonRuntime.ps1 -Phase UninstallTraditional -Apply
 
 # 4. Debe mostrar traditional ausente y partial target ausente.
 .\scripts\Install-TradingLabPythonRuntime.ps1 -Phase Inventory
 ```
 
-Si `UninstallTraditional` deja componentes MSI, el destino parcial o el
-registro `PythonCore` mixto, detenerse.
+Si `UninstallTraditional` deja componentes MSI, falla. Si el desinstalador
+soportado deja el destino parcial o el registro `PythonCore` mixto, detenerse
+antes de `InstallMachineRuntime` y preparar una fase de saneamiento separada.
 No borrar archivos ni registro manualmente, no usar `msizap` y no ejecutar la
 fase de instalación. Conservar el reporte y el log `traditional-uninstall` para
 autorizar un gate de recuperación adicional basado en evidencia.
