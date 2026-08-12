@@ -53,7 +53,7 @@ foreach ($required in @(
     'Get-RegisteredTraditionalBundle', 'Resolve-RegisteredBundleExecutable',
     "Start-LoggedInstaller `$bundleExecutable @('/uninstall', '/quiet') `$uninstallLog",
     'Resolve-TradingLabInstallerExit $process.ExitCode',
-    'Start-LoggedInstaller $InstallerPath', "@('/log', `$LogPath)",
+    'Start-LoggedInstaller $plan.executable $plan.arguments $installLog', "@('/log', `$LogPath)",
     'InstallAllUsers=1', 'Include_dev=0', 'Include_test=0', 'Include_doc=0', 'Include_tcltk=0',
     "Invoke-LoggedProcess `$basePython @('-I', '-m', 'venv', `$stagingVenvPath)",
     "'--no-index', '--find-links', `$wheelhousePath",
@@ -62,7 +62,9 @@ foreach ($required in @(
     'PromoteVenvAlreadyComplete', 'PromotionRolledBack', 'current_run_applied_phase',
     "required_previous_phase = `$null", "previous_phase_verified = `$false",
     "previous_phase_report = `$null", 'Get-VerifiedPrepareWheelhouseEvidence',
+    'Get-VerifiedUninstallTraditionalEvidence',
     "`$report.gates.PREVIOUS_PHASE_PREPARE_WHEELHOUSE = 'PASS'",
+    "`$report.gates.PREVIOUS_PHASE_UNINSTALL_TRADITIONAL = 'PASS'",
     "`$report.gates.WHEELHOUSE_PRESENT = 'PASS'",
     "`$report.gates.WHEELHOUSE_HASH_LOCKED = 'PASS'",
     "`$report.gates.WHEELHOUSE_COMPLETE = 'PASS'",
@@ -80,8 +82,26 @@ foreach ($required in @(
     'WHEELHOUSE_EXPECTED_REQUIREMENTS=', 'WHEELHOUSE_ARTIFACT_COUNT=',
     'WHEELHOUSE_MISSING_REQUIREMENTS=', 'WHEELHOUSE_SOURCE_DISTRIBUTIONS=',
     'WHEELHOUSE_UNEXPECTED_ARTIFACTS=', 'WHEELHOUSE_CORRUPT_ARTIFACTS=',
+    'installer_plan.operation=', 'installer_plan.executable=', 'installer_plan.arguments=',
+    'installer_plan.target_dir=', 'installer_plan.log_path_template=',
     'Assert-ExpectedTraditionalMsiComponents', 'Assert-PythonManagerPreserved',
     'Assert-UninstallPlanHasNoDirectCleanup',
+    'Assert-InstallMachinePreconditions', 'New-MachineRuntimeInstallerPlan',
+    'Assert-MachineInstallerPlan', 'INSTALL_CPYTHON_MACHINE_WIDE_MINIMAL',
+    "`$report.gates.INSTALL_ALL_USERS = 'PASS'",
+    "`$report.gates.TARGET_MACHINE_WIDE = 'PASS'",
+    "`$report.gates.TARGET_OUTSIDE_USER_PROFILE = 'PASS'",
+    "`$report.gates.PREPEND_PATH_DISABLED = 'PASS'",
+    "`$report.gates.LAUNCHER_DISABLED = 'PASS'",
+    "`$report.gates.FILE_ASSOCIATIONS_DISABLED = 'PASS'",
+    "`$report.gates.DEVELOPMENT_LIBRARIES_DISABLED = 'PASS'",
+    "`$report.gates.TEST_SUITE_DISABLED = 'PASS'",
+    "`$report.gates.DOCUMENTATION_DISABLED = 'PASS'",
+    "`$report.gates.TCL_TK_DISABLED = 'PASS'",
+    'PYTHON_EXE_EXISTS', 'PYTHON314_DLL_EXISTS', 'PYTHON_LIB_EXISTS',
+    'PYTHON_STDLIB_FUNCTIONAL', 'PYTHON_IMPORT_SYS', 'PYTHON_IMPORT_VENV',
+    'PYTHON_EXACT_VERSION', 'PYTHON_ARCHITECTURE_X64', 'PYTHON_BASE_PREFIX_EXACT',
+    'PYTHON_EXECUTABLE_MACHINE_WIDE', 'PYTHON_RUNTIME_USER_PROFILE_DEPENDENCIES',
     'PYTHON_BASE_MACHINE_WIDE', 'PYTHON_BASE_OUTSIDE_USER_PROFILE',
     'PYTHON_GATEWAY_EXECUTE', 'PYTHON_GATEWAY_MODIFY_DENY',
     'VENV_BASE_OUTSIDE_USER_PROFILE', 'VENV_LOCK_MATCH',
@@ -100,6 +120,11 @@ foreach ($required in @(
     'Resolve-TradingLabWheelhouseManifestState',
     'Test-TradingLabPrepareWheelhouseReportRecord',
     'Find-TradingLabPrepareWheelhouseReport',
+    'Test-TradingLabUninstallTraditionalReportRecord',
+    'Find-TradingLabUninstallTraditionalReport',
+    'Resolve-TradingLabInstallPreconditionState',
+    'Resolve-TradingLabInstallerArtifactState',
+    'Test-TradingLabExactMachineTarget',
     'Test-TradingLabManagerExcludedFromUninstallPlan',
     'Resolve-TradingLabMsiComponentSetState',
     'PYTHON_MANAGER_RUNTIME', 'TRADITIONAL_BUNDLE', 'TRADITIONAL_MSI_COMPONENT',
@@ -122,8 +147,7 @@ foreach ($forbidden in @(
 $inventoryApply = $installer.IndexOf('INVENTORY_APPLY_FORBIDDEN')
 $phaseSwitch = $installer.IndexOf('switch ($Phase)')
 Assert-True ($inventoryApply -ge 0 -and $inventoryApply -lt $phaseSwitch) 'Inventory must reject -Apply before phase dispatch.'
-Assert-True ($installer.IndexOf('Assert-NoTraditionalRuntime $inventory') -lt $installer.IndexOf('Start-LoggedInstaller $InstallerPath')) 'Traditional registration must block install execution.'
-Assert-True ($installer.IndexOf('Assert-NoPartialTarget $inventory') -lt $installer.IndexOf('Start-LoggedInstaller $InstallerPath')) 'Partial target must block install execution.'
+Assert-True ($installer.IndexOf('Assert-InstallMachinePreconditions $inventory') -lt $installer.IndexOf('Start-LoggedInstaller $plan.executable')) 'Current runtime state must block install execution.'
 Assert-True ($installer.IndexOf('$report.previous_phase_verified = $true') -lt $installer.IndexOf("Start-LoggedInstaller `$bundleExecutable")) 'Durable previous-phase verification must precede supported uninstall.'
 Assert-True ($installer.IndexOf('Assert-PythonManagerPreserved $inventory $plan') -lt $installer.IndexOf("Start-LoggedInstaller `$bundleExecutable")) 'Manager preservation proof must precede supported uninstall.'
 Assert-True ($installer.IndexOf('Assert-UninstallPlanHasNoDirectCleanup $plan') -lt $installer.IndexOf("Start-LoggedInstaller `$bundleExecutable")) 'No-direct-cleanup proof must precede supported uninstall.'
@@ -141,6 +165,17 @@ foreach ($forbiddenUninstallMutation in @(
     Assert-True (-not $uninstallBlock.Contains($forbiddenUninstallMutation)) "Uninstall phase contains forbidden direct cleanup: $forbiddenUninstallMutation"
 }
 Assert-True (($uninstallBlock.Split(@('Start-LoggedInstaller $bundleExecutable'), [System.StringSplitOptions]::None).Count - 1) -eq 1) 'Uninstall phase must contain exactly one supported bundle execution site.'
+$installStart = $installer.IndexOf("'InstallMachineRuntime' {")
+$installEnd = $installer.IndexOf("'BuildVenv' {", $installStart)
+Assert-True ($installStart -ge 0 -and $installEnd -gt $installStart) 'InstallMachineRuntime phase boundary is absent.'
+$installBlock = $installer.Substring($installStart, $installEnd - $installStart)
+Assert-True ($installBlock.IndexOf("`$report.required_previous_phase = 'UninstallTraditional'") -lt $installBlock.IndexOf('Start-LoggedInstaller $plan.executable')) 'UninstallTraditional continuity must precede installation.'
+Assert-True ($installBlock.IndexOf('Get-VerifiedUninstallTraditionalEvidence') -lt $installBlock.IndexOf('Start-LoggedInstaller $plan.executable')) 'Durable UninstallTraditional evidence must precede installation.'
+Assert-True ($installBlock.IndexOf('Assert-Wheelhouse $wheelhousePath') -lt $installBlock.IndexOf('Start-LoggedInstaller $plan.executable')) 'Wheelhouse revalidation must precede installation.'
+Assert-True ($installBlock.IndexOf('Assert-Installer $InstallerPath') -lt $installBlock.IndexOf('Start-LoggedInstaller $plan.executable')) 'Installer verification must precede installation.'
+foreach ($forbiddenInstallMutation in @('.venv.new', 'Move-Item', 'Invoke-LoggedProcess', 'import MetaTrader5')) {
+    Assert-True (-not $installBlock.Contains($forbiddenInstallMutation)) "Install phase crosses a forbidden venv/MT5 boundary: $forbiddenInstallMutation"
+}
 
 . $inventoryPath
 Assert-True ((Resolve-TradingLabInstallerExit 0) -eq 'SUCCESS') 'Installer exit 0 classification regressed.'
@@ -214,6 +249,121 @@ try {
 } finally {
     [System.IO.Directory]::Delete($missingReportRoot, $false)
 }
+
+$validUninstallReport = [pscustomobject]@{
+    schema_version = 3
+    run_id = '00000000-0000-0000-0000-000000000002'
+    phase = 'UninstallTraditional'
+    apply_requested = $true
+    status = 'PASS'
+    trading_mode = 'OBSERVE_ONLY'
+    python_version = '3.14.5'
+    python_base = 'C:\Program Files\AutomatonPython\3.14.5'
+    active_venv = 'C:\automaton\.venv'
+    wheelhouse = $validReport.wheelhouse
+    lock_file = $validReport.lock_file
+    current_run_applied_phase = 'UninstallTraditional'
+    required_previous_phase = 'PrepareWheelhouse'
+    previous_phase_verified = $true
+    previous_phase_report = 'C:\ProgramData\AutomatonMT5Lab\maintenance\python-runtime-results\python-runtime-00000000-0000-0000-0000-000000000001.json'
+    previous_phase_report_sha256 = ('a' * 64)
+    installer_executed = $false
+    uninstaller_executed = $true
+    venv_rebuilt = $false
+    venv_promoted = $false
+    mt5_accessed = $false
+    automaton_started = $false
+    gateway_started = $false
+    acl_existing_domains_modified = $false
+    error = $null
+    gates = [pscustomobject]@{
+        DECLARATIVE_HASH_LOCK = 'PASS'; PYTHON_MANAGER_RUNTIME = 'PASS'
+        PREVIOUS_PHASE_PREPARE_WHEELHOUSE = 'PASS'; WHEELHOUSE_PRESENT = 'PASS'
+        WHEELHOUSE_HASH_LOCKED = 'PASS'; WHEELHOUSE_COMPLETE = 'PASS'
+        META_TRADER5_WHEEL_PRESENT = 'PASS'; NUMPY_WHEEL_PRESENT = 'PASS'
+        PYTHON_MANAGER_PRESERVE = 'PASS'; SAME_VERSION_TRADITIONAL_INSTALL_PRESENT = 'PASS'
+        PARTIAL_TARGET_POST_STATE = 'ABSENT'; MIXED_PYTHONCORE_POST_STATE = 'ABSENT'
+    }
+    inventory_after = [pscustomobject]@{
+        python_manager_runtime = 'FUNCTIONAL'; traditional_user_runtime = 'ABSENT'
+        traditional_machine_runtime = 'ABSENT'; traditional_msi_components = 0
+        partial_target_runtime = 'ABSENT'; mixed_pythoncore_registration = 'ABSENT'
+        same_version_traditional_install_present = 'PASS'
+    }
+    wheelhouse_validation = [pscustomobject]@{
+        expected_requirements = 27; artifact_count = 27
+        missing_requirements = @(); source_distributions = @(); unexpected_artifacts = @()
+        corrupt_artifacts = @(); duplicate_requirements = @()
+        matched_artifacts = @(1..27); hash_locked = $true; complete = $true
+        metatrader5_present = $true; numpy_present = $true
+    }
+}
+$uninstallArgs = @(
+    $validUninstallReport, $validUninstallReport.wheelhouse, $validUninstallReport.lock_file,
+    '3.14.5', $validUninstallReport.python_base, $validUninstallReport.active_venv
+)
+$uninstallRecordArgs = @(
+    $validUninstallReport.wheelhouse, $validUninstallReport.lock_file,
+    '3.14.5', $validUninstallReport.python_base, $validUninstallReport.active_venv
+)
+Assert-True (Test-TradingLabUninstallTraditionalReportRecord @uninstallArgs) 'Valid applied UninstallTraditional report must pass.'
+$wrongPhaseReport = $validUninstallReport.PSObject.Copy()
+$wrongPhaseReport.phase = 'PrepareWheelhouse'
+Assert-True (-not (Test-TradingLabUninstallTraditionalReportRecord $wrongPhaseReport @uninstallRecordArgs)) 'Previous phase other than UninstallTraditional must fail closed.'
+$failedUninstallReport = $validUninstallReport.PSObject.Copy()
+$failedUninstallReport.status = 'FAIL'
+Assert-True (-not (Test-TradingLabUninstallTraditionalReportRecord $failedUninstallReport @uninstallRecordArgs)) 'Non-PASS UninstallTraditional report must fail closed.'
+$legacyUninstallReport = $validUninstallReport.PSObject.Copy()
+$legacyUninstallReport.schema_version = 2
+Assert-True (-not (Test-TradingLabUninstallTraditionalReportRecord $legacyUninstallReport @uninstallRecordArgs)) 'Incompatible UninstallTraditional schema must fail closed.'
+$corruptUninstallRoot = Join-Path $env:TEMP ("automaton-corrupt-uninstall-report-" + [guid]::NewGuid().ToString('D'))
+[void][System.IO.Directory]::CreateDirectory($corruptUninstallRoot)
+try {
+    $missingUninstallFailed = $false
+    try {
+        [void](Find-TradingLabUninstallTraditionalReport $corruptUninstallRoot @uninstallRecordArgs)
+    } catch { $missingUninstallFailed = $_.Exception.Message -like 'PREVIOUS_PHASE_UNINSTALL_TRADITIONAL=FAIL*' }
+    Assert-True $missingUninstallFailed 'Missing UninstallTraditional evidence must fail closed.'
+    Set-Content -LiteralPath (Join-Path $corruptUninstallRoot 'python-runtime-corrupt.json') -Value '{not-json' -Encoding UTF8
+    $corruptReportFailed = $false
+    try {
+        [void](Find-TradingLabUninstallTraditionalReport $corruptUninstallRoot @uninstallRecordArgs)
+    } catch { $corruptReportFailed = $_.Exception.Message -like 'PREVIOUS_PHASE_UNINSTALL_TRADITIONAL=FAIL*' }
+    Assert-True $corruptReportFailed 'Corrupt UninstallTraditional evidence must fail closed.'
+} finally {
+    [System.IO.Directory]::Delete($corruptUninstallRoot, $true)
+}
+
+$validInstallState = [pscustomobject]@{
+    python_manager_runtime = 'FUNCTIONAL'; traditional_user_runtime = 'ABSENT'
+    traditional_machine_runtime = 'ABSENT'; traditional_msi_components = 0
+    partial_target_runtime = 'ABSENT'; mixed_pythoncore_registration = 'ABSENT'
+    same_version_traditional_install_present = 'PASS'
+}
+Assert-True (Resolve-TradingLabInstallPreconditionState $validInstallState).valid 'Clean post-uninstall state must authorize install prevalidation.'
+$msiReappeared = $validInstallState.PSObject.Copy(); $msiReappeared.traditional_msi_components = 1
+Assert-True (-not (Resolve-TradingLabInstallPreconditionState $msiReappeared).valid) 'A reappearing traditional MSI must fail closed.'
+$partialReappeared = $validInstallState.PSObject.Copy(); $partialReappeared.partial_target_runtime = 'PRESENT'
+Assert-True (-not (Resolve-TradingLabInstallPreconditionState $partialReappeared).valid) 'A reappearing partial target must fail closed.'
+$mixedReappeared = $validInstallState.PSObject.Copy(); $mixedReappeared.mixed_pythoncore_registration = 'PRESENT'
+Assert-True (-not (Resolve-TradingLabInstallPreconditionState $mixedReappeared).valid) 'A reappearing mixed PythonCore registration must fail closed.'
+
+$validInstallerState = Resolve-TradingLabInstallerArtifactState `
+    'python-3.14.5-amd64.exe' 30361968 ('a' * 64) 'Valid' `
+    'CN=Python Software Foundation, O=Python Software Foundation, C=US' `
+    'python-3.14.5-amd64.exe' 30361968 ('a' * 64)
+Assert-True $validInstallerState.verified 'Exact installer evidence must pass.'
+$badHashInstallerState = Resolve-TradingLabInstallerArtifactState `
+    'python-3.14.5-amd64.exe' 30361968 ('b' * 64) 'Valid' `
+    'CN=Python Software Foundation, O=Python Software Foundation, C=US' `
+    'python-3.14.5-amd64.exe' 30361968 ('a' * 64)
+Assert-True (-not $badHashInstallerState.verified -and -not $badHashInstallerState.hash_valid) 'Installer hash mismatch must fail closed.'
+Assert-True (Test-TradingLabExactMachineTarget `
+    'C:\Program Files\AutomatonPython\3.14.5' 'C:\Program Files\AutomatonPython\3.14.5' 'C:\Users') `
+    'Exact machine-wide target must pass.'
+Assert-True (-not (Test-TradingLabExactMachineTarget `
+    'C:\Users\Admin\AutomatonPython' 'C:\Program Files\AutomatonPython\3.14.5' 'C:\Users')) `
+    'A user-profile Python target must fail closed.'
 
 $maliciousManagerPlan = [pscustomobject]@{
     executable = 'C:\Users\Admin\AppData\Local\Python\pythoncore-3.14-64\pymanager.exe'
@@ -314,6 +464,12 @@ foreach ($gate in @(
     IDEMPOTENT_RESUME_DESIGN = 'PASS'
     DURABLE_INSTALLER_LOGS = 'PASS'
     PREVIOUS_PHASE_PREPARE_WHEELHOUSE = 'PASS'
+    PREVIOUS_PHASE_UNINSTALL_TRADITIONAL = 'PASS'
+    MISSING_UNINSTALL_REPORT_FAIL_CLOSED = 'PASS'
+    CORRUPT_UNINSTALL_REPORT_FAIL_CLOSED = 'PASS'
+    WRONG_UNINSTALL_PHASE_FAIL_CLOSED = 'PASS'
+    FAILED_UNINSTALL_STATUS_FAIL_CLOSED = 'PASS'
+    INCOMPATIBLE_UNINSTALL_SCHEMA_FAIL_CLOSED = 'PASS'
     MISSING_WHEELHOUSE_FAIL_CLOSED = 'PASS'
     CORRUPT_WHEEL_FAIL_CLOSED = 'PASS'
     WHEELHOUSE_COMPLETE_EXACT = 'PASS'
@@ -322,6 +478,12 @@ foreach ($gate in @(
     PYTHON_MANAGER_UNINSTALL_PLAN_CRITICAL_FAIL = 'PASS'
     TRADITIONAL_MSI_COMPONENTS_EXPECTED_9 = 'PASS'
     UNEXPECTED_MSI_PRODUCT_CODE_FAIL_CLOSED = 'PASS'
+    TRADITIONAL_MSI_REAPPEAR_FAIL_CLOSED = 'PASS'
+    PARTIAL_TARGET_REAPPEAR_FAIL_CLOSED = 'PASS'
+    MIXED_PYTHONCORE_REAPPEAR_FAIL_CLOSED = 'PASS'
+    INSTALLER_HASH_MISMATCH_FAIL_CLOSED = 'PASS'
+    USER_PROFILE_TARGET_FAIL_CLOSED = 'PASS'
+    MINIMAL_INSTALLER_COMPONENTS = 'PASS'
     VENV_STAGING_AND_ROLLBACK = 'PASS'
     VENV_HASH_LOCK_ONLY = 'PASS'
     META_TRADER5_METADATA_ONLY = 'PASS'

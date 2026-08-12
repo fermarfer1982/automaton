@@ -150,6 +150,163 @@ function Find-TradingLabPrepareWheelhouseReport(
     throw 'PREVIOUS_PHASE_PREPARE_WHEELHOUSE=FAIL: no valid durable PASS report exists.'
 }
 
+function Test-TradingLabUninstallTraditionalReportRecord(
+    [object] $Record,
+    [string] $ExpectedWheelhouse,
+    [string] $ExpectedLock,
+    [string] $ExpectedVersion,
+    [string] $ExpectedPythonBase,
+    [string] $ExpectedActiveVenv
+) {
+    if ($null -eq $Record) { return $false }
+    try {
+        $gates = Get-TradingLabProperty $Record 'gates'
+        $after = Get-TradingLabProperty $Record 'inventory_after'
+        $wheelhouse = Get-TradingLabProperty $Record 'wheelhouse_validation'
+        $previousHash = [string](Get-TradingLabProperty $Record 'previous_phase_report_sha256')
+        return (
+            (Get-TradingLabProperty $Record 'schema_version') -eq 3 -and
+            (Get-TradingLabProperty $Record 'phase') -eq 'UninstallTraditional' -and
+            [bool](Get-TradingLabProperty $Record 'apply_requested') -and
+            (Get-TradingLabProperty $Record 'status') -eq 'PASS' -and
+            (Get-TradingLabProperty $Record 'trading_mode') -eq 'OBSERVE_ONLY' -and
+            (Get-TradingLabProperty $Record 'python_version') -eq $ExpectedVersion -and
+            [System.IO.Path]::GetFullPath((Get-TradingLabProperty $Record 'python_base')) -eq [System.IO.Path]::GetFullPath($ExpectedPythonBase) -and
+            [System.IO.Path]::GetFullPath((Get-TradingLabProperty $Record 'active_venv')) -eq [System.IO.Path]::GetFullPath($ExpectedActiveVenv) -and
+            [System.IO.Path]::GetFullPath((Get-TradingLabProperty $Record 'wheelhouse')) -eq [System.IO.Path]::GetFullPath($ExpectedWheelhouse) -and
+            [System.IO.Path]::GetFullPath((Get-TradingLabProperty $Record 'lock_file')) -eq [System.IO.Path]::GetFullPath($ExpectedLock) -and
+            (Get-TradingLabProperty $Record 'current_run_applied_phase') -eq 'UninstallTraditional' -and
+            (Get-TradingLabProperty $Record 'required_previous_phase') -eq 'PrepareWheelhouse' -and
+            [bool](Get-TradingLabProperty $Record 'previous_phase_verified') -and
+            -not [string]::IsNullOrWhiteSpace([string](Get-TradingLabProperty $Record 'previous_phase_report')) -and
+            $previousHash -match '^[0-9a-f]{64}$' -and
+            -not [bool](Get-TradingLabProperty $Record 'installer_executed') -and
+            [bool](Get-TradingLabProperty $Record 'uninstaller_executed') -and
+            -not [bool](Get-TradingLabProperty $Record 'venv_rebuilt') -and
+            -not [bool](Get-TradingLabProperty $Record 'venv_promoted') -and
+            -not [bool](Get-TradingLabProperty $Record 'mt5_accessed') -and
+            -not [bool](Get-TradingLabProperty $Record 'automaton_started') -and
+            -not [bool](Get-TradingLabProperty $Record 'gateway_started') -and
+            -not [bool](Get-TradingLabProperty $Record 'acl_existing_domains_modified') -and
+            (Get-TradingLabProperty $gates 'DECLARATIVE_HASH_LOCK') -eq 'PASS' -and
+            (Get-TradingLabProperty $gates 'PYTHON_MANAGER_RUNTIME') -eq 'PASS' -and
+            (Get-TradingLabProperty $gates 'PREVIOUS_PHASE_PREPARE_WHEELHOUSE') -eq 'PASS' -and
+            (Get-TradingLabProperty $gates 'WHEELHOUSE_PRESENT') -eq 'PASS' -and
+            (Get-TradingLabProperty $gates 'WHEELHOUSE_HASH_LOCKED') -eq 'PASS' -and
+            (Get-TradingLabProperty $gates 'WHEELHOUSE_COMPLETE') -eq 'PASS' -and
+            (Get-TradingLabProperty $gates 'META_TRADER5_WHEEL_PRESENT') -eq 'PASS' -and
+            (Get-TradingLabProperty $gates 'NUMPY_WHEEL_PRESENT') -eq 'PASS' -and
+            (Get-TradingLabProperty $gates 'PYTHON_MANAGER_PRESERVE') -eq 'PASS' -and
+            (Get-TradingLabProperty $gates 'SAME_VERSION_TRADITIONAL_INSTALL_PRESENT') -eq 'PASS' -and
+            (Get-TradingLabProperty $gates 'PARTIAL_TARGET_POST_STATE') -eq 'ABSENT' -and
+            (Get-TradingLabProperty $gates 'MIXED_PYTHONCORE_POST_STATE') -eq 'ABSENT' -and
+            (Get-TradingLabProperty $after 'python_manager_runtime') -eq 'FUNCTIONAL' -and
+            (Get-TradingLabProperty $after 'traditional_user_runtime') -eq 'ABSENT' -and
+            (Get-TradingLabProperty $after 'traditional_machine_runtime') -eq 'ABSENT' -and
+            (Get-TradingLabProperty $after 'traditional_msi_components') -eq 0 -and
+            (Get-TradingLabProperty $after 'partial_target_runtime') -eq 'ABSENT' -and
+            (Get-TradingLabProperty $after 'mixed_pythoncore_registration') -eq 'ABSENT' -and
+            (Get-TradingLabProperty $after 'same_version_traditional_install_present') -eq 'PASS' -and
+            (Get-TradingLabProperty $wheelhouse 'expected_requirements') -eq 27 -and
+            (Get-TradingLabProperty $wheelhouse 'artifact_count') -eq 27 -and
+            @((Get-TradingLabProperty $wheelhouse 'missing_requirements')).Count -eq 0 -and
+            @((Get-TradingLabProperty $wheelhouse 'source_distributions')).Count -eq 0 -and
+            @((Get-TradingLabProperty $wheelhouse 'unexpected_artifacts')).Count -eq 0 -and
+            @((Get-TradingLabProperty $wheelhouse 'corrupt_artifacts')).Count -eq 0 -and
+            @((Get-TradingLabProperty $wheelhouse 'duplicate_requirements')).Count -eq 0 -and
+            @((Get-TradingLabProperty $wheelhouse 'matched_artifacts')).Count -eq 27 -and
+            [bool](Get-TradingLabProperty $wheelhouse 'hash_locked') -and
+            [bool](Get-TradingLabProperty $wheelhouse 'complete') -and
+            [bool](Get-TradingLabProperty $wheelhouse 'metatrader5_present') -and
+            [bool](Get-TradingLabProperty $wheelhouse 'numpy_present') -and
+            $null -eq (Get-TradingLabProperty $Record 'error')
+        )
+    } catch { return $false }
+}
+
+function Find-TradingLabUninstallTraditionalReport(
+    [string] $Directory,
+    [string] $ExpectedWheelhouse,
+    [string] $ExpectedLock,
+    [string] $ExpectedVersion,
+    [string] $ExpectedPythonBase,
+    [string] $ExpectedActiveVenv
+) {
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        throw 'PREVIOUS_PHASE_UNINSTALL_TRADITIONAL=FAIL: report directory is absent.'
+    }
+    $candidates = @(Get-ChildItem -LiteralPath $Directory -File -Filter 'python-runtime-*.json' |
+        Sort-Object LastWriteTimeUtc -Descending)
+    foreach ($candidate in $candidates) {
+        try {
+            $record = [System.IO.File]::ReadAllText($candidate.FullName, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            if (Test-TradingLabUninstallTraditionalReportRecord `
+                $record $ExpectedWheelhouse $ExpectedLock $ExpectedVersion $ExpectedPythonBase $ExpectedActiveVenv
+            ) {
+                return [pscustomobject]@{
+                    path = $candidate.FullName
+                    record = $record
+                    last_write_time_utc = $candidate.LastWriteTimeUtc
+                }
+            }
+        } catch { continue }
+    }
+    throw 'PREVIOUS_PHASE_UNINSTALL_TRADITIONAL=FAIL: no valid durable applied PASS report exists.'
+}
+
+function Resolve-TradingLabInstallPreconditionState([object] $State) {
+    $failures = [System.Collections.Generic.List[string]]::new()
+    foreach ($check in @(
+        [pscustomobject]@{ Name = 'PYTHON_MANAGER_RUNTIME'; Actual = Get-TradingLabProperty $State 'python_manager_runtime'; Expected = 'FUNCTIONAL' },
+        [pscustomobject]@{ Name = 'TRADITIONAL_USER_RUNTIME_ABSENT'; Actual = Get-TradingLabProperty $State 'traditional_user_runtime'; Expected = 'ABSENT' },
+        [pscustomobject]@{ Name = 'TRADITIONAL_MACHINE_RUNTIME_ABSENT'; Actual = Get-TradingLabProperty $State 'traditional_machine_runtime'; Expected = 'ABSENT' },
+        [pscustomobject]@{ Name = 'TRADITIONAL_MSI_COMPONENTS_ZERO'; Actual = Get-TradingLabProperty $State 'traditional_msi_components'; Expected = 0 },
+        [pscustomobject]@{ Name = 'PARTIAL_TARGET_RUNTIME_ABSENT'; Actual = Get-TradingLabProperty $State 'partial_target_runtime'; Expected = 'ABSENT' },
+        [pscustomobject]@{ Name = 'MIXED_PYTHONCORE_REGISTRATION_ABSENT'; Actual = Get-TradingLabProperty $State 'mixed_pythoncore_registration'; Expected = 'ABSENT' },
+        [pscustomobject]@{ Name = 'SAME_VERSION_TRADITIONAL_INSTALL_PRESENT'; Actual = Get-TradingLabProperty $State 'same_version_traditional_install_present'; Expected = 'PASS' }
+    )) {
+        if ($check.Actual -ne $check.Expected) { $failures.Add("$($check.Name):$($check.Actual)") }
+    }
+    return [pscustomobject]@{ valid = $failures.Count -eq 0; failures = @($failures) }
+}
+
+function Resolve-TradingLabInstallerArtifactState(
+    [string] $Name,
+    [long] $Length,
+    [string] $Sha256,
+    [string] $SignatureStatus,
+    [string] $SignerSubject,
+    [string] $ExpectedName,
+    [long] $ExpectedLength,
+    [string] $ExpectedSha256
+) {
+    $sizeValid = $Name -eq $ExpectedName -and $Length -eq $ExpectedLength
+    $hashValid = $Sha256.ToLowerInvariant() -eq $ExpectedSha256.ToLowerInvariant()
+    $signatureValid = $SignatureStatus -eq 'Valid' -and
+        $SignerSubject -match '(^|,\s*)O=Python Software Foundation(,|$)'
+    return [pscustomobject]@{
+        size_valid = $sizeValid
+        hash_valid = $hashValid
+        authenticode_valid = $signatureValid
+        verified = $sizeValid -and $hashValid -and $signatureValid
+    }
+}
+
+function Test-TradingLabExactMachineTarget(
+    [string] $Path,
+    [string] $ExpectedTarget,
+    [string] $UsersRoot
+) {
+    try {
+        $candidate = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+        $expected = [System.IO.Path]::GetFullPath($ExpectedTarget).TrimEnd('\')
+        $users = [System.IO.Path]::GetFullPath($UsersRoot).TrimEnd('\')
+        return $candidate.Equals($expected, [System.StringComparison]::OrdinalIgnoreCase) -and
+            -not ($candidate.Equals($users, [System.StringComparison]::OrdinalIgnoreCase) -or
+                $candidate.StartsWith($users + '\', [System.StringComparison]::OrdinalIgnoreCase))
+    } catch { return $false }
+}
+
 function Test-TradingLabManagerExcludedFromUninstallPlan(
     [object] $Plan,
     [string] $ManagerRegistryId,

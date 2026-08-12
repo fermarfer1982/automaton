@@ -73,9 +73,13 @@ ejecución humana explícita:
    el desinstalador exige que no queden bundle/componentes tradicionales y que
    Python Manager siga funcional; cualquier target parcial o registro
    `PythonCore` mixto restante bloquea fases posteriores y requiere otro gate.
-3. `InstallMachineRuntime`: solo puede ejecutarse cuando no queda ninguna
-   instalación traditional 3.14.5 ni destino parcial. Usa el full installer
-   verificado con log durable y componentes mínimos.
+3. `InstallMachineRuntime`: exige y verifica por hash un reporte durable PASS
+   aplicado de `UninstallTraditional`, y vuelve a recorrer la evidencia
+   enlazada de `PrepareWheelhouse`. Después revalida de forma independiente
+   que no queden instalaciones traditional 3.14.5, componentes MSI, destino
+   parcial ni registro `PythonCore` mixto. También vuelve a verificar el full
+   installer y los 27 wheels antes de exponer el plan exacto; solo entonces
+   puede ejecutar el instalador con log durable.
 4. `BuildVenv`: crea exactamente `C:\automaton\.venv.new` con el Python
    machine-wide e instala offline desde el wheelhouse y el lock.
 5. `PromoteVenv`: valida de nuevo `.venv.new`, mueve el venv activo a un backup
@@ -93,11 +97,54 @@ expresa aparte con `required_previous_phase`, `previous_phase_verified` y
 `previous_phase_report`; ningún valor de fase de una ejecución anterior basta
 por sí solo para autorizar una operación.
 
-La instalación base excluye Development Libraries, tests, documentación,
-Tcl/Tk, launcher, asociaciones y PATH. Conserva executables, stdlib y pip:
-`venv` forma parte de stdlib y pip se necesita para instalar el lock offline.
-La ausencia de compilación está garantizada por el lock wheel-only y vuelve a
-verificarse al preparar el wheelhouse.
+La instalación base excluye explícitamente Development Libraries, Test Suite,
+Documentation y Tcl/Tk porque el Gateway consume exclusivamente wheels
+`cp314-win_amd64`: no compila extensiones, no ejecuta la suite de CPython, no
+presenta documentación local y no usa interfaces Tk. También deshabilita el
+launcher, asociaciones de archivos y modificaciones de PATH para que la ruta
+del intérprete sea siempre explícita. Conserva Core Interpreter, Executables,
+Standard Library y pip bootstrap. `venv` forma parte de Standard Library y pip
+es necesario para reconstruir el venv exclusivamente desde el wheelhouse y el
+lock. La prohibición de compilación se refuerza con `--only-binary=:all:` y la
+completitud/hash de los 27 wheels se vuelve a verificar antes de instalar el
+runtime, aunque los wheels no se instalan hasta `BuildVenv`.
+
+El dry-run de `InstallMachineRuntime` debe mostrar, como mínimo:
+
+```text
+required_previous_phase=UninstallTraditional
+previous_phase_verified=true
+previous_phase_report=<REPORTE_DURABLE_APLICADO>
+previous_phase_report_sha256=<SHA256>
+PREVIOUS_PHASE_UNINSTALL_TRADITIONAL=PASS
+TRADITIONAL_USER_RUNTIME_ABSENT=PASS
+TRADITIONAL_MACHINE_RUNTIME_ABSENT=PASS
+TRADITIONAL_MSI_COMPONENTS_ZERO=PASS
+PARTIAL_TARGET_RUNTIME_ABSENT=PASS
+MIXED_PYTHONCORE_REGISTRATION_ABSENT=PASS
+TARGET_PATH_EMPTY_OR_ABSENT=PASS
+PYTHON_INSTALLER_SIZE=PASS
+PYTHON_INSTALLER_SHA256=PASS
+PYTHON_INSTALLER_AUTHENTICODE=PASS
+WHEELHOUSE_EXPECTED_REQUIREMENTS=27
+WHEELHOUSE_ARTIFACT_COUNT=27
+INSTALL_ALL_USERS=PASS
+TARGET_MACHINE_WIDE=PASS
+TARGET_OUTSIDE_USER_PROFILE=PASS
+PREPEND_PATH_DISABLED=PASS
+LAUNCHER_DISABLED=PASS
+FILE_ASSOCIATIONS_DISABLED=PASS
+DEVELOPMENT_LIBRARIES_DISABLED=PASS
+TEST_SUITE_DISABLED=PASS
+DOCUMENTATION_DISABLED=PASS
+TCL_TK_DISABLED=PASS
+installer_plan.operation=INSTALL_CPYTHON_MACHINE_WIDE_MINIMAL
+```
+
+Un reporte anterior nunca sustituye el inventario actual. Si el reporte o su
+evidencia anidada faltan, cambian de hash, tienen schema/fase/status
+incompatibles, o reaparece cualquier componente traditional/partial/mixed, la
+fase termina fail-closed antes de `Start-Process`.
 
 ## Procedimiento humano elevado para el estado actual
 
@@ -141,7 +188,8 @@ Solo si el inventario posterior muestra simultáneamente
 ```powershell
 $Installer = 'C:\ProgramData\AutomatonMT5Lab\maintenance\python-3.14.5-amd64.exe'
 
-# 5. Instalar una única copia traditional machine-wide.
+# 5. Prevalidar una única copia traditional machine-wide. Revisar la cadena,
+# los hashes, los 27 wheels y installer_plan antes de pedir un Apply separado.
 .\scripts\Install-TradingLabPythonRuntime.ps1 -Phase InstallMachineRuntime -InstallerPath $Installer
 .\scripts\Install-TradingLabPythonRuntime.ps1 -Phase InstallMachineRuntime -InstallerPath $Installer -Apply
 
