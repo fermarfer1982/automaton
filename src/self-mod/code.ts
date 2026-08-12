@@ -105,6 +105,8 @@ const PROTECTED_FILES: readonly string[] = Object.freeze([
   "scripts/Test-AgentRuntimeAcl.ps1",
   "scripts/Test-GatewayRuntimeAcl.ps1",
   "scripts/Collect-RuntimeAclResults.ps1",
+  "scripts/Install-TradingLabPythonRuntime.ps1",
+  "scripts/Initialize-GatewayPythonEnvironment.ps1",
   "scripts/Resolve-TradingLabNode.ps1",
   "scripts/setup.ps1",
   "scripts/start_gateway.ps1",
@@ -121,6 +123,7 @@ const PROTECTED_FILES: readonly string[] = Object.freeze([
   "docs/SECURITY_INVARIANTS.md",
   "docs/READINESS_AUDIT.md",
   "docs/WINDOWS_ACL_MODEL.md",
+  "docs/PYTHON_RUNTIME_MIGRATION.md",
 ]);
 
 /**

@@ -139,6 +139,15 @@ invocación, stack y último test completado. Las rutas de perfiles ajenos y los
 patrones con aspecto de secreto se redactan; ninguna key o credencial se
 incluye en el reporte.
 
+El runtime Python autorizado está fuera de perfiles de usuario, en
+`C:\Program Files\AutomatonPython\3.14.5`. Su árbol tiene ACL protegida y exacta:
+SYSTEM/Administrators FullControl y Gateway ReadAndExecute; Agent no lo necesita
+y no recibe acceso. El runtime test ejecuta el redirector del venv bajo Gateway,
+verifica `sys.base_prefix` y solicita derechos de modificación/borrado sobre
+base, DLL, stdlib, venv Scripts y site-packages. Un Allow inesperado es crítico.
+La migración reproducible y su instalador verificado se documentan en
+[PYTHON_RUNTIME_MIGRATION.md](PYTHON_RUNTIME_MIGRATION.md).
+
 Los canarios mutables se limitan al estado privado del Agent y a los dominios
 `operational`, `research` y `audit\sqlite` del Gateway. El journal y el log de
 seguridad reciben un único append identificable y durable; esos eventos no se

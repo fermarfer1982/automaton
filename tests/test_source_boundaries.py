@@ -38,10 +38,13 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn('"scripts/Test-AgentRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Test-GatewayRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Collect-RuntimeAclResults.ps1"', source)
+        self.assertIn('"scripts/Install-TradingLabPythonRuntime.ps1"', source)
+        self.assertIn('"scripts/Initialize-GatewayPythonEnvironment.ps1"', source)
         self.assertIn('"scripts/Resolve-TradingLabNode.ps1"', source)
         self.assertIn('"docs/SECURITY_INVARIANTS.md"', source)
         self.assertIn('"docs/READINESS_AUDIT.md"', source)
         self.assertIn('"docs/WINDOWS_ACL_MODEL.md"', source)
+        self.assertIn('"docs/PYTHON_RUNTIME_MIGRATION.md"', source)
         self.assertIn('"requirements-gateway-win-py314.lock"', source)
         invariants = (ROOT / "docs" / "SECURITY_INVARIANTS.md").read_text(encoding="utf-8")
         for invariant in range(1, 13):
@@ -245,6 +248,62 @@ class SourceBoundaryTests(unittest.TestCase):
             "CRITICAL_UNEXPECTED_ALLOW",
         ):
             self.assertIn(classification, gateway)
+
+    def test_service_python_runtime_never_depends_on_a_user_profile(self) -> None:
+        service_files = [
+            ROOT / "scripts" / name
+            for name in (
+                "setup.ps1",
+                "start_gateway.ps1",
+                "status.ps1",
+                "test_gateway.ps1",
+                "enable_demo_trading.ps1",
+                "disable_trading.ps1",
+                "Test-GatewayRuntimeAcl.ps1",
+                "Collect-RuntimeAclResults.ps1",
+                "Install-TradingLabPythonRuntime.ps1",
+                "Initialize-GatewayPythonEnvironment.ps1",
+            )
+        ]
+        user_path = re.compile(r"(?i)[a-z]:\\users\\[^'\"\r\n]+")
+        allowed_agent_state = re.compile(
+            r"(?i)^c:\\users\\automatonagent\\\.automaton(?:\\|$)"
+        )
+        allowed_redaction = re.compile(r"(?i)^c:\\users\\\[redacted_profile\]")
+        for path in service_files:
+            source = path.read_text(encoding="utf-8")
+            self.assertNotIn("AppData\\Local\\Programs\\Python", source, path.name)
+            for match in user_path.findall(source):
+                self.assertTrue(
+                    allowed_agent_state.match(match) or allowed_redaction.match(match),
+                    f"service runtime dependency under a user profile in {path.name}: {match}",
+                )
+        installer = (ROOT / "scripts" / "Install-TradingLabPythonRuntime.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("C:\\Program Files\\AutomatonPython\\3.14.5", installer)
+        self.assertIn("Assert-OutsideUserProfiles", installer)
+        self.assertIn("& $basePython -I -m venv $stagingPath", installer)
+        self.assertNotIn("WriteAllText((Join-Path $Root 'pyvenv.cfg')", installer)
+        setup = service_files[0].read_text(encoding="utf-8")
+        self.assertIn(
+            "$machinePython = 'C:\\Program Files\\AutomatonPython\\3.14.5\\python.exe'",
+            setup,
+        )
+        self.assertNotIn("& python -c", setup)
+        gateway_start = (ROOT / "scripts" / "start_gateway.ps1").read_text(encoding="utf-8")
+        environment = (
+            ROOT / "scripts" / "Initialize-GatewayPythonEnvironment.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertLess(
+            gateway_start.index("Initialize-GatewayPythonEnvironment"),
+            gateway_start.index("& $python"),
+        )
+        self.assertIn("AutomatonMT5Lab\\operational", environment)
+        self.assertIn("$env:TEMP = $canonicalTemp", environment)
+        self.assertIn("$env:TMP = $canonicalTemp", environment)
+        self.assertIn("$env:PYTHONDONTWRITEBYTECODE = '1'", environment)
+        self.assertNotIn("Windows\\TEMP", environment)
 
     def test_agent_trading_integration_has_no_direct_programdata_or_mt5_access(self) -> None:
         sources = "\n".join(

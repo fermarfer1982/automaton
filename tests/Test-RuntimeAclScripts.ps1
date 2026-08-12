@@ -145,6 +145,13 @@ foreach ($required in @(
     'Add-PythonRuntimePreflightTests', 'PYTHON_EXECUTABLE_PATH',
     'PYTHON_EXECUTE', 'PYTHON_EXECUTABLE_IDENTITY', 'PYTHON_SQLITE_IMPORT',
     'PYTHON_RUNTIME_TEMP', 'PYTHON_RUNTIME_TEMP_CONFINED',
+    'PYTHON_BASE_MACHINE_WIDE', 'PYTHON_BASE_OUTSIDE_USER_PROFILE',
+    'PYTHON_GATEWAY_EXECUTE', 'PYTHON_GATEWAY_MODIFY_DENY',
+    'VENV_BASE_OUTSIDE_USER_PROFILE',
+    'PYTHON_BASE_ROOT_MODIFY', 'PYTHON_BASE_EXE_MODIFY',
+    'PYTHON_BASE_DLL_MODIFY', 'PYTHON_BASE_STDLIB_MODIFY',
+    'PYTHON_VENV_EXE_MODIFY', 'PYTHON_VENV_SCRIPTS_MODIFY',
+    'PYTHON_VENV_SITE_PACKAGES_MODIFY',
     'SQLITE_PROCESS', 'SQLITE_DB_CREATE', 'SQLITE_WAL_MODE',
     'SQLITE_WAL_CREATE', 'SQLITE_SHM_CREATE', 'SQLITE_COMMIT',
     'SQLITE_READ_BACK', 'SQLITE_CHECKPOINT', 'SQLITE_CLOSE', 'SQLITE_CLEANUP',
@@ -156,6 +163,12 @@ foreach ($required in @(
 )) {
     Assert-True ($gateway.Contains($required)) "Gateway Python/SQLite diagnostic stage is missing: $required"
 }
+Assert-True `
+    ($gateway.Contains("`$machinePythonBase = 'C:\Program Files\AutomatonPython\3.14.5'")) `
+    'Gateway runtime must require the exact machine-wide Python base.'
+Assert-True `
+    ($gateway.Contains("`$startInfo.EnvironmentVariables['PYTHONDONTWRITEBYTECODE'] = '1'")) `
+    'Gateway Python probes must not attempt bytecode writes into immutable runtime code.'
 Assert-True `
     (-not $gateway.Contains('2>&1')) `
     'Python stderr must not be converted into a generic PowerShell RemoteException.'
@@ -226,4 +239,7 @@ Assert-True `
     FAILURE_CLASSIFICATION = 'PASS'
     PYTHON_STDERR_CAPTURE = 'PASS'
     SQLITE_STAGE_DIAGNOSTICS = 'PASS'
+    PYTHON_BASE_MACHINE_WIDE_STATIC = 'PASS'
+    PYTHON_BASE_OUTSIDE_USER_PROFILE_STATIC = 'PASS'
+    PYTHON_GATEWAY_MODIFY_PROBES = 'PASS'
 } | ConvertTo-Json

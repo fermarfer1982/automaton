@@ -25,8 +25,11 @@ identidades dedicadas y con `TRADING_MODE=OBSERVE_ONLY`.
 | Perfil sin shell/pagos/replicación/install/push/self-mod de seguridad | `runtime-profile.ts`, `self-mod/code.ts`, tests source-boundary | Probado estáticamente |
 | Scripts, ACL, kill switch independiente y enable DEMO humano | `scripts/*.ps1`, `operator.py`, tests ACL/operator | AST/tests locales; aplicación real pendiente |
 
-La `.venv` local se instaló con `--require-hashes` y el lock CPython 3.14 x64.
-La suite `pytest` ejecuta 131 tests y 11 subtests: todos pasan. TypeScript
+La `.venv` local se instaló con `--require-hashes` y el lock CPython 3.14 x64,
+pero su redirector todavía referencia un Python del perfil administrativo y no
+es un runtime válido para Gateway. La migración machine-wide descrita en
+`PYTHON_RUNTIME_MIGRATION.md` queda pendiente del gate humano. La suite `pytest`
+ejecuta 133 tests y 11 subtests: todos pasan. TypeScript
 typecheck y build pasan; Vitest ejecuta 69 ficheros y 1.656 tests: todos pasan,
 incluidos los 5 ficheros/12 tests específicos de trading.
 

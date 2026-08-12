@@ -167,6 +167,13 @@ $SHARE_ALL = [uint32]7
 
 $workspace = 'C:\automaton'
 $pythonExe = Join-Path $workspace '.venv\Scripts\python.exe'
+$machinePythonBase = 'C:\Program Files\AutomatonPython\3.14.5'
+$machinePythonExe = Join-Path $machinePythonBase 'python.exe'
+$machinePythonDll = Join-Path $machinePythonBase 'python314.dll'
+$machinePythonStdlibFile = Join-Path $machinePythonBase 'Lib\os.py'
+$venvScriptsPath = Join-Path $workspace '.venv\Scripts'
+$venvPythonExe = Join-Path $venvScriptsPath 'python.exe'
+$venvSitePackagesPath = Join-Path $workspace '.venv\Lib\site-packages'
 $controlPath = Join-Path $labRoot 'control'
 $configPath = Join-Path $controlPath 'trading.yaml'
 $demoAuthorizationPath = Join-Path $controlPath 'demo-authorization'
@@ -414,6 +421,7 @@ function Invoke-LocalPythonJson(
         $startInfo.RedirectStandardError = $true
         $startInfo.EnvironmentVariables['TEMP'] = $runtimeTempPath
         $startInfo.EnvironmentVariables['TMP'] = $runtimeTempPath
+        $startInfo.EnvironmentVariables['PYTHONDONTWRITEBYTECODE'] = '1'
         foreach ($key in $Environment.Keys) {
             $startInfo.EnvironmentVariables[[string]$key] = [string]$Environment[$key]
         }
@@ -506,16 +514,63 @@ function Add-PythonRuntimePreflightTests {
     $executeSource = @'
 import json
 import sys
-print(json.dumps({"executable": sys.executable, "ok": True}, sort_keys=True, separators=(",", ":")))
+print(json.dumps({"base_prefix": sys.base_prefix, "executable": sys.executable, "ok": True}, sort_keys=True, separators=(",", ":")))
 '@
     $execute = Invoke-LocalPythonJson $executeSource @{} 'python-execute'
     $executeValue = Assert-PythonInvocation 'PYTHON_EXECUTE' $execute 'PINNED_INTERPRETER_EXECUTED'
     Set-TestContext 'PYTHON_PREFLIGHT' 'PYTHON_EXECUTABLE_IDENTITY'
     if (-not $executeValue.ok -or $executeValue.executable -ne $expectedPythonPath) {
         Add-TestResult 'PYTHON_EXECUTABLE_IDENTITY' $expectedPythonPath 'MISMATCH' 'PYTHON_REPORTED_UNEXPECTED_EXECUTABLE'
+        $script:failureClassification = 'TEST_FAILED_EXPECTATION'
         throw 'PYTHON_EXECUTABLE_IDENTITY_MISMATCH'
     }
     Add-TestResult 'PYTHON_EXECUTABLE_IDENTITY' $expectedPythonPath $expectedPythonPath 'PYTHON_REPORTED_PINNED_EXECUTABLE'
+    Add-TestResult 'PYTHON_GATEWAY_EXECUTE' 'PASS' 'PASS' 'PROCESS_EXECUTED_UNDER_GATEWAY_TOKEN'
+
+    Set-TestContext 'PYTHON_PREFLIGHT' 'PYTHON_BASE_MACHINE_WIDE'
+    $reportedBase = [System.IO.Path]::GetFullPath([string]$executeValue.base_prefix).TrimEnd('\')
+    $profilesRoot = [System.IO.Path]::GetFullPath((Join-Path $env:SystemDrive 'Users')).TrimEnd('\')
+    if ($reportedBase -ne $machinePythonBase) {
+        Add-TestResult 'PYTHON_BASE_MACHINE_WIDE' 'PASS' 'MISMATCH' 'BASE_PREFIX_NOT_MANAGED_MACHINE_WIDE'
+        $script:failureClassification = 'TEST_FAILED_EXPECTATION'
+        throw 'PYTHON_BASE_MACHINE_WIDE_MISMATCH'
+    }
+    Add-TestResult 'PYTHON_BASE_MACHINE_WIDE' 'PASS' 'PASS' 'EXACT_MANAGED_PROGRAM_FILES_BASE'
+    Set-TestContext 'PYTHON_PREFLIGHT' 'PYTHON_BASE_OUTSIDE_USER_PROFILE'
+    if (
+        $reportedBase.Equals($profilesRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $reportedBase.StartsWith($profilesRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)
+    ) {
+        Add-TestResult 'PYTHON_BASE_OUTSIDE_USER_PROFILE' 'PASS' 'MISMATCH' 'BASE_PREFIX_UNDER_USER_PROFILE'
+        $script:failureClassification = 'TEST_FAILED_EXPECTATION'
+        throw 'PYTHON_BASE_UNDER_USER_PROFILE'
+    }
+    Add-TestResult 'PYTHON_BASE_OUTSIDE_USER_PROFILE' 'PASS' 'PASS' 'BASE_PREFIX_OUTSIDE_USER_PROFILES'
+    Add-TestResult 'VENV_BASE_OUTSIDE_USER_PROFILE' 'PASS' 'PASS' 'VENV_REDIRECTS_OUTSIDE_USER_PROFILES'
+
+    foreach ($requiredPath in @(
+        [pscustomobject]@{ Name = 'PYTHON_BASE_EXE_PRESENT'; Path = $machinePythonExe },
+        [pscustomobject]@{ Name = 'PYTHON_BASE_DLL_PRESENT'; Path = $machinePythonDll },
+        [pscustomobject]@{ Name = 'PYTHON_BASE_STDLIB_PRESENT'; Path = $machinePythonStdlibFile },
+        [pscustomobject]@{ Name = 'PYTHON_VENV_EXE_PRESENT'; Path = $venvPythonExe },
+        [pscustomobject]@{ Name = 'PYTHON_VENV_SCRIPTS_PRESENT'; Path = $venvScriptsPath },
+        [pscustomobject]@{ Name = 'PYTHON_VENV_SITE_PACKAGES_PRESENT'; Path = $venvSitePackagesPath }
+    )) {
+        Set-TestContext 'PYTHON_RUNTIME_BOUNDARY' $requiredPath.Name
+        if (-not (Test-Path -LiteralPath $requiredPath.Path)) {
+            throw "PYTHON_RUNTIME_PROTECTED_PATH_MISSING:$($requiredPath.Path)"
+        }
+    }
+    Add-DeniedRightTest 'PYTHON_BASE_ROOT_MODIFY' $machinePythonBase $FILE_ADD_FILE $true $true
+    Add-DeniedRightTest 'PYTHON_BASE_EXE_MODIFY' $machinePythonExe $FILE_WRITE_DATA $false $true
+    Add-DeniedRightTest 'PYTHON_BASE_DLL_MODIFY' $machinePythonDll $FILE_WRITE_DATA $false $true
+    Add-DeniedRightTest 'PYTHON_BASE_STDLIB_MODIFY' $machinePythonStdlibFile $FILE_WRITE_DATA $false $true
+    Add-DeniedRightTest 'PYTHON_BASE_EXE_DELETE' $machinePythonExe $DELETE $false $true
+    Add-DeniedRightTest 'PYTHON_VENV_EXE_MODIFY' $venvPythonExe $FILE_WRITE_DATA $false $true
+    Add-DeniedRightTest 'PYTHON_VENV_SCRIPTS_MODIFY' $venvScriptsPath $FILE_ADD_FILE $true $true
+    Add-DeniedRightTest 'PYTHON_VENV_SITE_PACKAGES_MODIFY' $venvSitePackagesPath $FILE_ADD_FILE $true $true
+    Add-DeniedRightTest 'PYTHON_VENV_EXE_DELETE' $venvPythonExe $DELETE $false $true
+    Add-TestResult 'PYTHON_GATEWAY_MODIFY_DENY' 'DENY' 'DENY' 'BASE_VENV_CODE_WRITE_AND_DELETE_DENIED'
 
     Set-TestContext 'PYTHON_PREFLIGHT' 'PYTHON_SQLITE_IMPORT'
     $importSource = @'
@@ -914,6 +969,8 @@ try {
     $runtimeError = $diagnostic.exception_type
     $failureClassification = if ($criticalFail) {
         'CRITICAL_UNEXPECTED_ALLOW'
+    } elseif ($failureClassification -eq 'TEST_FAILED_EXPECTATION') {
+        'TEST_FAILED_EXPECTATION'
     } else {
         'TEST_INFRASTRUCTURE_ERROR'
     }
@@ -934,6 +991,8 @@ foreach ($test in $tests.Values) {
 }
 $status = if ($criticalFail) {
     'CRITICAL_UNEXPECTED_ALLOW'
+} elseif ($failureClassification -eq 'TEST_FAILED_EXPECTATION') {
+    'TEST_FAILED_EXPECTATION'
 } elseif ($null -ne $diagnostic -or $infrastructureFailure) {
     'TEST_INFRASTRUCTURE_ERROR'
 } elseif (-not $allPassed) {

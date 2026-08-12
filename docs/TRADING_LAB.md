@@ -101,6 +101,13 @@ Los scripts resuelven exclusivamente el runtime portable local
 `.runtime\node-v22.22.0-win-x64`, verifican Node v22.22.0 x64 y el SHA-256 del
 ejecutable antes de usar Corepack con pnpm 10.28.1. `.runtime/` no se versiona.
 
+Python no se resuelve desde `PATH` ni desde perfiles personales. El gate
+separado [PYTHON_RUNTIME_MIGRATION.md](PYTHON_RUNTIME_MIGRATION.md) instala el
+CPython 3.14.5 x64 completo y verificado en
+`C:\Program Files\AutomatonPython\3.14.5`, reconstruye `.venv` desde ese
+intérprete y comprueba que Gateway solo tenga ReadAndExecute. El script es
+dry-run por defecto y requiere `-Apply`; no arranca servicios ni accede a MT5.
+
 ACLs separadas (la matriz exacta y sus limitaciones están en
 [WINDOWS_ACL_MODEL.md](WINDOWS_ACL_MODEL.md)):
 
