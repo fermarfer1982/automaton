@@ -181,12 +181,12 @@ function Resolve-TradingLabBuildVenvPlanState(
             $create = $steps[0]; $install = $steps[1]
             if (-not (Test-TradingLabInventoryExactPath (Get-TradingLabProperty $create 'executable') $ExpectedBasePython)) { $failures.Add('CREATE_EXECUTABLE') }
             $actualCreateArguments = (@((Get-TradingLabProperty $create 'arguments')) -join "`n")
-            $expectedCreateArguments = (@('-I','-m','venv',$ExpectedStaging) -join "`n")
+            $expectedCreateArguments = (@('-B','-I','-m','venv',$ExpectedStaging) -join "`n")
             if ($actualCreateArguments -ne $expectedCreateArguments) { $failures.Add('CREATE_ARGUMENTS') }
             $stagingPython = Join-Path $ExpectedStaging 'Scripts\python.exe'
             if (-not (Test-TradingLabInventoryExactPath (Get-TradingLabProperty $install 'executable') $stagingPython)) { $failures.Add('PIP_EXECUTABLE') }
             $arguments = @((Get-TradingLabProperty $install 'arguments'))
-            foreach ($required in @('-I','-m','pip','install','--disable-pip-version-check','--no-input','--no-index','--find-links',$ExpectedWheelhouse,'--require-hashes','--only-binary=:all:','-r',$ExpectedLock)) {
+            foreach ($required in @('-B','-I','-m','pip','install','--disable-pip-version-check','--no-input','--no-index','--find-links',$ExpectedWheelhouse,'--require-hashes','--only-binary=:all:','-r',$ExpectedLock)) {
                 if ($required -notin $arguments) { $failures.Add("PIP_ARGUMENT:$required") }
             }
             if ($arguments -contains '--user') { $failures.Add('PIP_USER') }

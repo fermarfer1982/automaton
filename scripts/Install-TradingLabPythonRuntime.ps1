@@ -9,6 +9,12 @@ param(
     [string] $GatewayPythonBaseRunId,
     [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
     [string] $AgentPythonBaseRunId,
+    [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+    [string] $BuildVenvRunId,
+    [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+    [string] $GatewayPythonStagingRunId,
+    [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+    [string] $AgentPythonStagingRunId,
     [switch] $Apply
 )
 
@@ -96,7 +102,32 @@ $report = [ordered]@{
     agent_python_base_run_id = $AgentPythonBaseRunId
     agent_python_base_report = $null
     agent_python_base_report_sha256 = $null
+    build_venv_run_id = $BuildVenvRunId
+    build_venv_report = $null
+    build_venv_report_sha256 = $null
+    gateway_python_staging_run_id = $GatewayPythonStagingRunId
+    gateway_python_staging_report = $null
+    gateway_python_staging_report_sha256 = $null
+    agent_python_staging_run_id = $AgentPythonStagingRunId
+    agent_python_staging_report = $null
+    agent_python_staging_report_sha256 = $null
     old_venv_backup = $null
+    promotion_strategy = $null
+    staging_promoted = $false
+    backup_preserved = $false
+    staging_preserved = $false
+    backup_created = $false
+    final_venv_created = $false
+    final_venv_validated = $false
+    promotion_failed_rolled_back = $false
+    active_restored = $false
+    critical_recovery_required = $false
+    staging_venv_modified = $false
+    staging_venv_renamed = $false
+    staging_venv_deleted = $false
+    staging_venv_executed_during_apply = $false
+    active_venv_process_users = @()
+    staging_venv_process_users = @()
     mt5_accessed = $false
     mt5_package_installed = $false
     mt5_imported = $false
@@ -130,6 +161,12 @@ $report = [ordered]@{
     build_venv_plan = $null
     post_build_validation_plan = $null
     post_build_validation = $null
+    promote_venv_plan = $null
+    rollback_plan = $null
+    staging_live_validation = $null
+    final_venv_validation = $null
+    final_non_relocation_validation = $null
+    final_acl_validation = $null
     uninstall_plan = $null
     installer_plan = $null
     error = $null
@@ -137,6 +174,7 @@ $report = [ordered]@{
 
 . (Join-Path $PSScriptRoot 'TradingLabPythonInventory.ps1')
 . (Join-Path $PSScriptRoot 'TradingLabBuildVenvGate.ps1')
+. (Join-Path $PSScriptRoot 'TradingLabPromoteVenvGate.ps1')
 . (Join-Path $PSScriptRoot 'TradingLabPythonAclPlan.ps1')
 . (Join-Path $PSScriptRoot 'TradingLabFileSystemRights.ps1')
 
@@ -852,6 +890,75 @@ function Get-VerifiedPythonBaseRuntimeEvidence(
     }
 }
 
+function Get-VerifiedBuildVenvEvidence([string] $EvidenceRunId) {
+    $normalized = ([guid]::ParseExact($EvidenceRunId, 'D')).ToString('D').ToLowerInvariant()
+    $path = Join-Path $reportDirectory "python-runtime-$normalized.json"
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw 'BUILD_VENV_EVIDENCE=FAIL: exact report is absent.'
+    }
+    Assert-NoReparseComponents $path
+    if (-not (Test-PathWithin $path $reportDirectory)) {
+        throw 'BUILD_VENV_EVIDENCE=FAIL: report escaped the protected directory.'
+    }
+    Assert-NoUntrustedModify $path @(
+        $gatewaySid, $agentSid, $usersSid, $authenticatedUsersSid, $everyoneSid
+    )
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($path)
+        $record = [System.Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $digest = $sha.ComputeHash($bytes) } finally { $sha.Dispose() }
+        $snapshotHash = ([System.BitConverter]::ToString($digest)).Replace('-', '').ToLowerInvariant()
+    } catch { throw 'BUILD_VENV_EVIDENCE=FAIL: report JSON is invalid.' }
+    if (-not (Test-TradingLabBuildVenvEvidenceRecord `
+        $record $normalized $pythonBase $venvPath $stagingVenvPath $wheelhousePath $lockPath
+    )) { throw 'BUILD_VENV_EVIDENCE=FAIL: report content or boundaries are invalid.' }
+    if ((Split-Path $path -Leaf) -ne "python-runtime-$normalized.json") {
+        throw 'BUILD_VENV_EVIDENCE=FAIL: filename/run_id mismatch.'
+    }
+    return [pscustomobject]@{
+        path = Get-CanonicalPath $path
+        sha256 = $snapshotHash
+        record = $record
+    }
+}
+
+function Get-VerifiedPythonStagingRuntimeEvidence(
+    [string] $Role,
+    [string] $EvidenceRunId,
+    [string] $ExpectedSid
+) {
+    $normalized = ([guid]::ParseExact($EvidenceRunId, 'D')).ToString('D').ToLowerInvariant()
+    $root = if ($Role -eq 'AutomatonGateway') {
+        'C:\ProgramData\AutomatonMT5Lab\operational\acl-runtime-results'
+    } else { 'C:\Users\AutomatonAgent\.automaton\acl-runtime-results' }
+    $stem = if ($Role -eq 'AutomatonGateway') { 'gateway' } else { 'agent' }
+    $path = Join-Path $root "$stem-python-staging-$normalized.json"
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "$($stem.ToUpperInvariant())_STAGING_RUNTIME_EVIDENCE=FAIL: exact report is absent."
+    }
+    Assert-NoReparseComponents $path
+    if (-not (Test-PathWithin $path $root)) {
+        throw "$($stem.ToUpperInvariant())_STAGING_RUNTIME_EVIDENCE=FAIL: canonical path escaped."
+    }
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($path)
+        $record = [System.Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $digest = $sha.ComputeHash($bytes) } finally { $sha.Dispose() }
+        $snapshotHash = ([System.BitConverter]::ToString($digest)).Replace('-', '').ToLowerInvariant()
+    } catch { throw "$($stem.ToUpperInvariant())_STAGING_RUNTIME_EVIDENCE=FAIL: JSON is invalid." }
+    if (-not (Test-TradingLabPythonStagingEvidenceRecord `
+        $record $Role $normalized $ExpectedSid
+    )) { throw "$($stem.ToUpperInvariant())_STAGING_RUNTIME_EVIDENCE=FAIL: content, tests or boundaries are invalid." }
+    return [pscustomobject]@{
+        path = Get-CanonicalPath $path
+        sha256 = $snapshotHash
+        staging_tree_count = Get-TradingLabStagingEvidenceTreeCount $record
+        record = $record
+    }
+}
+
 function New-BuildVenvPlan {
     $stagingPython = Join-Path $stagingVenvPath 'Scripts\python.exe'
     $environment = [ordered]@{
@@ -877,7 +984,7 @@ function New-BuildVenvPlan {
             [ordered]@{
                 name = 'CREATE_STAGING_VENV'
                 executable = $basePython
-                arguments = @('-I', '-m', 'venv', $stagingVenvPath)
+                arguments = @('-B', '-I', '-m', 'venv', $stagingVenvPath)
                 use_shell = $false
                 environment = $environment
             },
@@ -885,7 +992,7 @@ function New-BuildVenvPlan {
                 name = 'INSTALL_HASH_LOCKED_WHEELS'
                 executable = $stagingPython
                 arguments = @(
-                    '-I', '-m', 'pip', 'install', '--disable-pip-version-check',
+                    '-B', '-I', '-m', 'pip', 'install', '--disable-pip-version-check',
                     '--no-input', '--no-index', '--find-links', $wheelhousePath,
                     '--require-hashes', '--only-binary=:all:', '-r', $lockPath
                 )
@@ -914,7 +1021,7 @@ function New-PostBuildValidationPlan {
     return [ordered]@{
         operation = 'VALIDATE_STAGING_WITHOUT_IMPORTING_METATRADER5'
         executable = (Join-Path $stagingVenvPath 'Scripts\python.exe')
-        arguments = @('-I', '-')
+        arguments = @('-B', '-I', '-')
         use_shell = $false
         source_transport = 'STDIN'
         imports = @('importlib.metadata', 'json', 'platform', 'site', 'sys', 'venv')
@@ -931,6 +1038,147 @@ function New-PostBuildValidationPlan {
         validate_service_mutation_denied = $true
         call_set_acl = $false
     }
+}
+
+function New-PromoteVenvPlan {
+    $backupPath = Join-Path $workspace ".venv.backup.$runId"
+    $failedPath = Join-Path $workspace ".venv.failed.$runId"
+    $finalPython = Join-Path $venvPath 'Scripts\python.exe'
+    $tempPath = Join-Path $maintenanceRoot "runtime-tmp\promote-venv-$runId"
+    $environment = [ordered]@{
+        PIP_CONFIG_FILE = 'NUL'
+        PIP_NO_INDEX = '1'
+        PIP_DISABLE_PIP_VERSION_CHECK = '1'
+        PIP_NO_CACHE_DIR = '1'
+        PYTHONNOUSERSITE = '1'
+        PYTHONDONTWRITEBYTECODE = '1'
+        TEMP = $tempPath
+        TMP = $tempPath
+    }
+    return [ordered]@{
+        operation = 'TRANSACTIONAL_FINAL_VENV_REBUILD'
+        promotion_strategy = 'REBUILD_AT_FINAL_PATH_TRANSACTIONALLY'
+        active_venv = $venvPath
+        staging_venv_read_only = $stagingVenvPath
+        staging_action = 'PRESERVE_READ_ONLY'
+        backup_path = $backupPath
+        failed_path = $failedPath
+        base_python = $basePython
+        lock_file = $lockPath
+        wheelhouse = $wheelhousePath
+        temp_path = $tempPath
+        network = 'DISABLED_NO_INDEX'
+        steps = @(
+            [ordered]@{
+                phase = 'BACKUP'
+                operation = 'RENAME_DIRECTORY_SAME_VOLUME'
+                source = $venvPath
+                destination = $backupPath
+                copy = $false
+                delete = $false
+                call_set_acl = $false
+            },
+            [ordered]@{
+                phase = 'CREATE_FINAL'
+                operation = 'CREATE_VENV_AT_FINAL_PATH'
+                executable = $basePython
+                arguments = @('-B', '-I', '-m', 'venv', $venvPath)
+                target = $venvPath
+                use_shell = $false
+                environment = $environment
+            },
+            [ordered]@{
+                phase = 'INSTALL_FINAL'
+                operation = 'INSTALL_HASH_LOCKED_WHEELS_OFFLINE'
+                executable = $finalPython
+                arguments = @(
+                    '-B', '-I', '-m', 'pip', 'install', '--disable-pip-version-check',
+                    '--no-input', '--no-index', '--find-links', $wheelhousePath,
+                    '--require-hashes', '--only-binary=:all:', '-r', $lockPath
+                )
+                target = $venvPath
+                use_shell = $false
+                environment = $environment
+            },
+            [ordered]@{
+                phase = 'VALIDATE_FINAL'
+                operation = 'VALIDATE_READ_ONLY'
+                executable = $finalPython
+                arguments = @('-B', '-I', '-')
+                source_transport = 'STDIN'
+                target = $venvPath
+                import_allowlist = @('fastapi', 'pydantic', 'yaml', 'uvicorn')
+                metatrader5_validation = 'IMPORTLIB_METADATA_ONLY'
+                use_shell = $false
+            },
+            [ordered]@{
+                phase = 'NON_RELOCATION'
+                operation = 'SCAN_FINAL_ASCII_UTF16LE_READ_ONLY'
+                target = $venvPath
+                forbidden_reference = $stagingVenvPath
+                expected_references = 0
+                expected_read_errors = 0
+            },
+            [ordered]@{
+                phase = 'ACL'
+                operation = 'VALIDATE_READ_ONLY'
+                target = $venvPath
+                inherit_from = $workspace
+                call_set_acl = $false
+            }
+        )
+    }
+}
+
+function New-PromoteVenvRollbackPlan([object] $Plan) {
+    return [ordered]@{
+        operation = 'DETERMINISTIC_SINGLE_ROLLBACK'
+        staging_action = 'PRESERVE_UNTOUCHED'
+        failed_artifact_action = 'PRESERVE_FOR_INSPECTION'
+        delete_failed = $false
+        delete_staging = $false
+        cases = @(
+            [ordered]@{
+                failure_point = 'BEFORE_BACKUP'
+                actions = @('LEAVE_ACTIVE_UNTOUCHED')
+            },
+            [ordered]@{
+                failure_point = 'AFTER_BACKUP_BEFORE_FINAL'
+                actions = @('RENAME_BACKUP_TO_ACTIVE')
+                backup = $Plan.backup_path
+                active = $venvPath
+            },
+            [ordered]@{
+                failure_point = 'AFTER_PARTIAL_FINAL'
+                actions = @('RENAME_PARTIAL_FINAL_TO_FAILED', 'RENAME_BACKUP_TO_ACTIVE')
+                partial_final = $venvPath
+                failed = $Plan.failed_path
+                backup = $Plan.backup_path
+            },
+            [ordered]@{
+                failure_point = 'ROLLBACK_FAILURE'
+                result = 'FAIL_CLOSED_CRITICAL_RECOVERY_REQUIRED'
+                automatic_retry = $false
+            }
+        )
+    }
+}
+
+function Assert-PromoteVenvPlan([object] $Plan) {
+    $state = Resolve-TradingLabPromoteVenvPlanState `
+        $Plan $basePython $venvPath $stagingVenvPath $Plan.backup_path `
+        $Plan.failed_path $lockPath $wheelhousePath $Plan.temp_path
+    if (-not $state.valid) {
+        throw "PROMOTE_VENV_PLAN=FAIL: $($state.failures -join ',')"
+    }
+    $report.gates.PROMOTE_VENV_PLAN = 'PASS'
+    $report.gates.PROMOTION_STRATEGY = 'REBUILD_AT_FINAL_PATH_TRANSACTIONALLY'
+    $report.gates.STAGING_NOT_RELOCATED = 'PASS'
+    $report.gates.FINAL_PATH_EXACT = 'PASS'
+    $report.gates.PIP_OFFLINE_NO_INDEX = 'PASS'
+    $report.gates.PIP_REQUIRE_HASHES = 'PASS'
+    $report.gates.PIP_ONLY_BINARY = 'PASS'
+    $report.gates.PIP_NO_URL = 'PASS'
 }
 
 function Set-WheelhousePassGates([object] $State) {
@@ -1417,7 +1665,7 @@ function Invoke-BuildVenvStdinJson(
     [string] $Source,
     [string] $TempPath
 ) {
-    $result = Invoke-BuildVenvProcess $Python @('-I', '-') 'venv-validate' $TempPath $Source
+    $result = Invoke-BuildVenvProcess $Python @('-B', '-I', '-') 'venv-validate' $TempPath $Source
     if (-not [string]::IsNullOrWhiteSpace($result.stderr)) {
         throw 'STAGING_VALIDATION_STDERR=FAIL: see durable validation log.'
     }
@@ -1468,7 +1716,11 @@ print(json.dumps({
     $cfgPath = Join-Path $Root 'pyvenv.cfg'
     $cfg = [System.IO.File]::ReadAllText($cfgPath, [System.Text.Encoding]::UTF8)
     if ($cfg -match '(?i)[a-z]:\\users\\' -or
-        $cfg -notmatch ('(?im)^\s*home\s*=\s*' + [regex]::Escape($pythonBase) + '\s*$')) {
+        $cfg -notmatch ('(?im)^\s*home\s*=\s*' + [regex]::Escape($pythonBase) + '\s*$') -or
+        $cfg -notmatch ('(?im)^\s*executable\s*=\s*' + [regex]::Escape($basePython) + '\s*$') -or
+        $cfg -notmatch '(?im)^\s*include-system-site-packages\s*=\s*false\s*$' -or
+        $cfg -notmatch ('(?im)^\s*command\s*=\s*' + [regex]::Escape($basePython) +
+            '\s+-m\s+venv\s+' + [regex]::Escape((Get-CanonicalPath $Root)) + '\s*$')) {
         throw 'STAGING_PYVENV_CFG=FAIL'
     }
     $distributionState = Resolve-TradingLabStagingDistributionState `
@@ -1497,6 +1749,377 @@ print(json.dumps({
     $report.gates.STAGING_METATRADER5_METADATA = 'PASS'
     $report.gates.STAGING_SERVICE_MUTATION_DENY = 'PASS'
     return $metadata
+}
+
+function Get-PromoteVenvValidationSource {
+    return @'
+import importlib
+import importlib.metadata
+import json
+import platform
+import site
+import sys
+import venv
+distributions = []
+for distribution in importlib.metadata.distributions():
+    name = distribution.metadata.get("Name")
+    if name:
+        distributions.append({"name": name, "version": distribution.version})
+imports = {}
+for name in ("fastapi", "pydantic", "yaml", "uvicorn"):
+    try:
+        importlib.import_module(name)
+        imports[name] = True
+    except Exception:
+        imports[name] = False
+print(json.dumps({
+    "architecture": platform.architecture()[0],
+    "base_prefix": sys.base_prefix,
+    "distributions": sorted(distributions, key=lambda item: item["name"].lower()),
+    "executable": sys.executable,
+    "imports": imports,
+    "metatrader5_imported": "MetaTrader5" in sys.modules,
+    "metatrader5_metadata": importlib.metadata.version("MetaTrader5"),
+    "prefix": sys.prefix,
+    "sys_path": sys.path,
+    "user_site_enabled": bool(site.ENABLE_USER_SITE),
+    "venv_import": True,
+    "version": platform.python_version(),
+}, sort_keys=True, separators=(",", ":")))
+'@
+}
+
+function Invoke-PromoteReadOnlyStdinJson([string] $Python, [string] $Source) {
+    $tempRoot = Join-Path $maintenanceRoot 'runtime-tmp'
+    if (-not (Test-Path -LiteralPath $tempRoot -PathType Container)) {
+        throw 'PROMOTE_READ_ONLY_TEMP_PRESENT=FAIL'
+    }
+    Assert-NoReparseComponents $tempRoot
+    $startInfo = New-BuildVenvProcessStartInfo $Python @('-B', '-I', '-') $tempRoot
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) { throw 'PROMOTE_READ_ONLY_PROCESS_START_FALSE' }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.StandardInput.Write($Source)
+        $process.StandardInput.Close()
+        $process.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0 -or -not [string]::IsNullOrWhiteSpace($stderr)) {
+            throw "PROMOTE_READ_ONLY_PROCESS=FAIL: exit=$($process.ExitCode)"
+        }
+        try { return $stdout.Trim() | ConvertFrom-Json }
+        catch { throw 'PROMOTE_READ_ONLY_JSON=FAIL' }
+    } finally { $process.Dispose() }
+}
+
+function Get-VenvReadOnlyTreeSnapshot([string] $Root) {
+    $canonicalRoot = Get-CanonicalPath $Root
+    if (-not (Test-Path -LiteralPath $canonicalRoot -PathType Container)) {
+        throw 'VENV_TREE_PRESENT=FAIL'
+    }
+    Assert-NoReparseComponents $canonicalRoot
+    $snapshot = [System.Collections.Generic.List[object]]::new()
+    $pending = [System.Collections.Generic.Queue[string]]::new()
+    $pending.Enqueue($canonicalRoot)
+    while ($pending.Count -gt 0) {
+        $current = $pending.Dequeue()
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw "VENV_TREE_REPARSE_POINT=FAIL: $($item.FullName)"
+        }
+        $canonicalItem = Get-CanonicalPath $item.FullName
+        if (-not (Test-PathWithin $canonicalItem $canonicalRoot)) {
+            throw "VENV_TREE_CONFINEMENT=FAIL: $canonicalItem"
+        }
+        $snapshot.Add($item)
+        if (-not $item.PSIsContainer) { continue }
+        foreach ($childPath in [System.IO.Directory]::EnumerateFileSystemEntries($canonicalItem)) {
+            $child = Get-Item -LiteralPath $childPath -Force -ErrorAction Stop
+            if ($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                throw "VENV_TREE_REPARSE_POINT=FAIL: $($child.FullName)"
+            }
+            $canonicalChild = Get-CanonicalPath $child.FullName
+            if (-not (Test-PathWithin $canonicalChild $canonicalRoot)) {
+                throw "VENV_TREE_CONFINEMENT=FAIL: $canonicalChild"
+            }
+            if ($child.PSIsContainer) { $pending.Enqueue($canonicalChild) }
+            else { $snapshot.Add($child) }
+        }
+    }
+    return @($snapshot)
+}
+
+function Get-VenvAclReadOnlyAudit([string] $Root) {
+    Assert-NoReparseComponents $Root
+    function Get-VenvAclItemState([string] $Path) {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $itemRights = @{}
+        $itemDeny = 0
+        $itemUnexpected = 0
+        $allowedSids = @($systemSid, $administratorsSid, $gatewaySid, $agentSid)
+        foreach ($rule in $acl.Access) {
+            $sid = Resolve-IdentitySid $rule.IdentityReference
+            if ($rule.AccessControlType.ToString() -eq 'Deny') { $itemDeny++; continue }
+            if ($sid -notin $allowedSids) { $itemUnexpected++; continue }
+            if (-not $itemRights.ContainsKey($sid)) { $itemRights[$sid] = [int64]0 }
+            $itemRights[$sid] = [int64]$itemRights[$sid] -bor [int64]$rule.FileSystemRights
+        }
+        $itemSystemFull = $itemRights.ContainsKey($systemSid) -and
+            ([int64]$itemRights[$systemSid] -band [int64]$fullControl) -eq [int64]$fullControl
+        $itemAdminFull = $itemRights.ContainsKey($administratorsSid) -and
+            ([int64]$itemRights[$administratorsSid] -band [int64]$fullControl) -eq [int64]$fullControl
+        $itemGatewayRx = $itemRights.ContainsKey($gatewaySid) -and
+            ([int64]$itemRights[$gatewaySid] -band [int64]$gatewayReadExecute) -eq [int64]$gatewayReadExecute
+        $itemAgentRx = $itemRights.ContainsKey($agentSid) -and
+            ([int64]$itemRights[$agentSid] -band [int64]$gatewayReadExecute) -eq [int64]$gatewayReadExecute
+        $itemGatewayMutation = $itemRights.ContainsKey($gatewaySid) -and
+            [bool](Test-TradingLabFileSystemRightsMutation ([int64]$itemRights[$gatewaySid]))
+        $itemAgentMutation = $itemRights.ContainsKey($agentSid) -and
+            [bool](Test-TradingLabFileSystemRightsMutation ([int64]$itemRights[$agentSid]))
+        $itemOwnerAdmin = (Resolve-IdentitySid $acl.Owner) -eq $administratorsSid
+        return [pscustomobject]@{
+            valid = $itemOwnerAdmin -and -not [bool]$acl.AreAccessRulesProtected -and
+                $itemSystemFull -and $itemAdminFull -and $itemGatewayRx -and $itemAgentRx -and
+                -not $itemGatewayMutation -and -not $itemAgentMutation -and
+                $itemDeny -eq 0 -and $itemUnexpected -eq 0
+            acl = $acl
+            rights = $itemRights
+            owner_administrators = $itemOwnerAdmin
+            deny_aces = $itemDeny
+            unexpected_principals = $itemUnexpected
+            gateway_mutation = [bool]$itemGatewayMutation
+            agent_mutation = [bool]$itemAgentMutation
+        }
+    }
+    $rootAcl = Get-Acl -LiteralPath $Root -ErrorAction Stop
+    $rights = @{}
+    $denyAces = 0
+    $unexpected = 0
+    $expectedSids = @($systemSid, $administratorsSid, $gatewaySid, $agentSid)
+    foreach ($rule in $rootAcl.Access) {
+        $sid = Resolve-IdentitySid $rule.IdentityReference
+        if ($rule.AccessControlType.ToString() -eq 'Deny') {
+            $denyAces++; continue
+        }
+        if ($sid -notin $expectedSids) { $unexpected++; continue }
+        if (-not $rights.ContainsKey($sid)) { $rights[$sid] = [int64]0 }
+        $rights[$sid] = [int64]$rights[$sid] -bor [int64]$rule.FileSystemRights
+    }
+    $ownerSid = Resolve-IdentitySid $rootAcl.Owner
+    $systemFull = $rights.ContainsKey($systemSid) -and
+        ([int64]$rights[$systemSid] -band [int64]$fullControl) -eq [int64]$fullControl
+    $adminFull = $rights.ContainsKey($administratorsSid) -and
+        ([int64]$rights[$administratorsSid] -band [int64]$fullControl) -eq [int64]$fullControl
+    $gatewayRx = $rights.ContainsKey($gatewaySid) -and
+        ([int64]$rights[$gatewaySid] -band [int64]$gatewayReadExecute) -eq [int64]$gatewayReadExecute
+    $agentRx = $rights.ContainsKey($agentSid) -and
+        ([int64]$rights[$agentSid] -band [int64]$gatewayReadExecute) -eq [int64]$gatewayReadExecute
+    $gatewayMutation = if ($rights.ContainsKey($gatewaySid)) {
+        [bool](Test-TradingLabFileSystemRightsMutation ([int64]$rights[$gatewaySid]))
+    } else { $false }
+    $agentMutation = if ($rights.ContainsKey($agentSid)) {
+        [bool](Test-TradingLabFileSystemRightsMutation ([int64]$rights[$agentSid]))
+    } else { $false }
+    $scanned = 0
+    $reparse = 0
+    $recursiveFindings = 0
+    foreach ($item in Get-VenvReadOnlyTreeSnapshot $Root) {
+        $scanned++
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { $reparse++ }
+        $itemState = Get-VenvAclItemState $item.FullName
+        if (-not $itemState.valid) { $recursiveFindings++ }
+    }
+    $valid = $ownerSid -eq $administratorsSid -and $systemFull -and $adminFull -and
+        $gatewayRx -and $agentRx -and -not $gatewayMutation -and -not $agentMutation -and
+        -not [bool]$rootAcl.AreAccessRulesProtected -and $denyAces -eq 0 -and
+        $unexpected -eq 0 -and $reparse -eq 0 -and $recursiveFindings -eq 0
+    return [pscustomobject]@{
+        valid = $valid
+        owner_administrators = $ownerSid -eq $administratorsSid
+        inheritance_protected = [bool]$rootAcl.AreAccessRulesProtected
+        system_full_control = $systemFull
+        administrators_full_control = $adminFull
+        gateway_read_execute = $gatewayRx
+        agent_read_execute = $agentRx
+        gateway_mutation_rights = if ($gatewayMutation) { 1 } else { 0 }
+        agent_mutation_rights = if ($agentMutation) { 1 } else { 0 }
+        deny_aces = $denyAces
+        unexpected_principals = $unexpected
+        recursive_findings = $recursiveFindings
+        reparse_points = $reparse
+        scanned_items = $scanned
+    }
+}
+
+function Assert-ExactVenvLiveReadOnly([string] $Root, [bool] $Staging) {
+    $expectedRoot = if ($Staging) { $stagingVenvPath } else { $venvPath }
+    if (-not (Test-TradingLabInventoryExactPath $Root $expectedRoot)) {
+        throw 'VENV_LIVE_TARGET_EXACT=FAIL'
+    }
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+        throw 'VENV_LIVE_PRESENT=FAIL'
+    }
+    Assert-NoReparseComponents $Root
+    [void](Get-VenvReadOnlyTreeSnapshot $Root)
+    $python = Join-Path $Root 'Scripts\python.exe'
+    $metadata = Invoke-PromoteReadOnlyStdinJson $python (Get-PromoteVenvValidationSource)
+    if ($metadata.version -ne $expectedPythonVersion -or $metadata.architecture -ne '64bit' -or
+        -not (Test-TradingLabInventoryExactPath $metadata.prefix $Root) -or
+        -not (Test-TradingLabInventoryExactPath $metadata.base_prefix $pythonBase) -or
+        -not (Test-TradingLabInventoryExactPath $metadata.executable $python) -or
+        -not [bool]$metadata.venv_import -or [bool]$metadata.user_site_enabled) {
+        throw 'VENV_LIVE_METADATA=FAIL'
+    }
+    foreach ($path in @($metadata.sys_path)) {
+        if ([string]$path -match '(?i)^C:\\Users\\') { throw 'VENV_LIVE_USER_PROFILE_DEPENDENCY=FAIL' }
+    }
+    foreach ($name in @('fastapi','pydantic','yaml','uvicorn')) {
+        if (-not [bool]$metadata.imports.$name) { throw "VENV_LIVE_IMPORT_$($name.ToUpperInvariant())=FAIL" }
+    }
+    if ($metadata.metatrader5_metadata -ne '5.0.6090' -or [bool]$metadata.metatrader5_imported) {
+        throw 'VENV_LIVE_METATRADER5_METADATA_ONLY=FAIL'
+    }
+    $distributionState = Resolve-TradingLabStagingDistributionState `
+        (Get-LockedWheelManifest) @($metadata.distributions) @('pip')
+    if (-not $distributionState.valid) { throw 'VENV_LIVE_DISTRIBUTIONS=FAIL' }
+    $cfg = [System.IO.File]::ReadAllText((Join-Path $Root 'pyvenv.cfg'), [System.Text.Encoding]::UTF8)
+    if ($cfg -match '(?i)[a-z]:\\users\\' -or
+        $cfg -notmatch ('(?im)^\s*home\s*=\s*' + [regex]::Escape($pythonBase) + '\s*$') -or
+        $cfg -notmatch ('(?im)^\s*executable\s*=\s*' + [regex]::Escape($basePython) + '\s*$') -or
+        $cfg -notmatch '(?im)^\s*include-system-site-packages\s*=\s*false\s*$' -or
+        $cfg -notmatch ('(?im)^\s*command\s*=\s*' + [regex]::Escape($basePython) +
+            '\s+-m\s+venv\s+' + [regex]::Escape((Get-CanonicalPath $Root)) + '\s*$')) {
+        throw 'VENV_LIVE_PYVENV_CFG=FAIL'
+    }
+    if (-not $Staging -and $cfg.IndexOf($stagingVenvPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        throw 'FINAL_PYVENV_CFG_STAGING_REFERENCE=FAIL'
+    }
+    $acl = Get-VenvAclReadOnlyAudit $Root
+    if (-not $acl.valid) { throw 'VENV_LIVE_ACL=FAIL' }
+    return [pscustomobject]@{
+        metadata = $metadata
+        distributions = $distributionState
+        pyvenv_cfg = 'PASS_MACHINE_BASE_FINAL_PATH'
+        acl = $acl
+    }
+}
+
+function Get-VenvProcessUsers {
+    $active = [System.Collections.Generic.List[object]]::new()
+    $staging = [System.Collections.Generic.List[object]]::new()
+    foreach ($process in @(Get-CimInstance Win32_Process -ErrorAction Stop)) {
+        if (Test-TradingLabProcessUsesVenv $process.ExecutablePath $process.CommandLine $venvPath) {
+            $active.Add([pscustomobject]@{ process_id = $process.ProcessId; name = $process.Name })
+        }
+        if (Test-TradingLabProcessUsesVenv $process.ExecutablePath $process.CommandLine $stagingVenvPath) {
+            $staging.Add([pscustomobject]@{ process_id = $process.ProcessId; name = $process.Name })
+        }
+    }
+    return [pscustomobject]@{ active = @($active); staging = @($staging) }
+}
+
+function Get-VenvTreeFingerprint([string] $Root) {
+    Assert-NoReparseComponents $Root
+    $builder = [System.Text.StringBuilder]::new()
+    $files = @(Get-VenvReadOnlyTreeSnapshot $Root | Where-Object { -not $_.PSIsContainer } |
+        Sort-Object FullName)
+    foreach ($file in $files) {
+        if ($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw 'VENV_TREE_FINGERPRINT_REPARSE_POINT=FAIL'
+        }
+        $relative = $file.FullName.Substring((Get-CanonicalPath $Root).Length).TrimStart('\')
+        $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        [void]$builder.Append($relative.ToLowerInvariant()).Append('|').Append($file.Length).Append('|').Append($hash).Append("`n")
+    }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($builder.ToString())
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $digest = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+    return [pscustomobject]@{ file_count = $files.Count; sha256 = $digest }
+}
+
+function Assert-PromotionArtifactsAbsent([object] $Plan) {
+    $backups = @(Get-ChildItem -LiteralPath $workspace -Directory -Filter '.venv.backup.*' -Force)
+    $failed = @(Get-ChildItem -LiteralPath $workspace -Directory -Filter '.venv.failed.*' -Force)
+    $state = Resolve-TradingLabPromoteArtifactState `
+        (Test-Path -LiteralPath $Plan.backup_path) `
+        (Test-Path -LiteralPath $Plan.failed_path) $backups.Count $failed.Count
+    if (-not $state.valid) { throw "PROMOTION_ARTIFACTS_ABSENT=FAIL: $($state.failures -join ',')" }
+    $report.gates.BACKUP_PATH_ABSENT = 'PASS'
+    $report.gates.FAILED_PATH_ABSENT = 'PASS'
+    $report.gates.PROMOTION_ARTIFACTS_ABSENT = 'PASS'
+}
+
+function Get-FinalNonRelocationAudit([string] $Root) {
+    $asciiNeedle = [System.Text.Encoding]::ASCII.GetBytes($stagingVenvPath)
+    $utf16Needle = [System.Text.Encoding]::Unicode.GetBytes($stagingVenvPath)
+    $references = [System.Collections.Generic.List[string]]::new()
+    $readErrors = [System.Collections.Generic.List[string]]::new()
+    foreach ($file in Get-VenvReadOnlyTreeSnapshot $Root | Where-Object { -not $_.PSIsContainer }) {
+        try {
+            $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+            $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+            $utf16 = [System.Text.Encoding]::Unicode.GetString($bytes)
+            if ($ascii.IndexOf($stagingVenvPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+                $utf16.IndexOf($stagingVenvPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $references.Add($file.FullName)
+            }
+        } catch { $readErrors.Add($file.FullName) }
+    }
+    foreach ($required in @('pyvenv.cfg','Scripts\pip.exe','Scripts\uvicorn.exe','Scripts\pytest.exe')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $Root $required) -PathType Leaf)) {
+            $readErrors.Add((Join-Path $Root $required))
+        }
+    }
+    return [pscustomobject]@{
+        final_staging_path_references = $references.Count
+        read_errors = $readErrors.Count
+        referenced_files = @($references)
+        read_error_files = @($readErrors)
+        ascii_needle_length = $asciiNeedle.Length
+        utf16le_needle_length = $utf16Needle.Length
+        valid = $references.Count -eq 0 -and $readErrors.Count -eq 0
+    }
+}
+
+function Invoke-PromoteVenvRollback([object] $Plan, [bool] $BackupCompleted) {
+    if (-not $BackupCompleted) {
+        $report.active_restored = $true
+        return
+    }
+    $partialExists = Test-Path -LiteralPath $venvPath
+    $partialMoved = -not $partialExists
+    if ($partialExists) {
+        if (Test-Path -LiteralPath $Plan.failed_path) {
+            $report.critical_recovery_required = $true
+            throw 'FAIL_CLOSED_CRITICAL_RECOVERY_REQUIRED: failed path collision during rollback.'
+        }
+        try {
+            [System.IO.Directory]::Move($venvPath, $Plan.failed_path)
+            $partialMoved = $true
+        } catch { $partialMoved = $false }
+    }
+    $restoreSucceeded = $false
+    if ($partialMoved -and -not (Test-Path -LiteralPath $venvPath) -and
+        (Test-Path -LiteralPath $Plan.backup_path -PathType Container)) {
+        try {
+            [System.IO.Directory]::Move($Plan.backup_path, $venvPath)
+            $restoreSucceeded = Test-Path -LiteralPath $venvPath -PathType Container
+        } catch { $restoreSucceeded = $false }
+    }
+    $outcome = Resolve-TradingLabRollbackExpectation `
+        $BackupCompleted $partialExists $partialMoved $restoreSucceeded
+    if ($outcome.critical) {
+        $report.critical_recovery_required = $true
+        $report.current_run_applied_phase = 'CriticalRecoveryRequired'
+        throw 'FAIL_CLOSED_CRITICAL_RECOVERY_REQUIRED'
+    }
+    $report.active_restored = $outcome.active_restored
+    $report.promotion_failed_rolled_back = $true
+    $report.current_run_applied_phase = 'PromotionFailedRolledBack'
 }
 
 function Start-LoggedInstaller([string] $Executable, [string[]] $Arguments, [string] $LogPath) {
@@ -1711,6 +2334,13 @@ function Write-MutationBoundarySummary {
     Write-Output "ACTIVE_VENV_DELETED=$($report.active_venv_deleted.ToString().ToLowerInvariant())"
     Write-Output "ACTIVE_VENV_RENAMED=$($report.active_venv_renamed.ToString().ToLowerInvariant())"
     Write-Output "ACTIVE_VENV_EXECUTED=$($report.active_venv_executed.ToString().ToLowerInvariant())"
+    Write-Output "STAGING_VENV_MODIFIED=$($report.staging_venv_modified.ToString().ToLowerInvariant())"
+    Write-Output "STAGING_VENV_RENAMED=$($report.staging_venv_renamed.ToString().ToLowerInvariant())"
+    Write-Output "STAGING_VENV_DELETED=$($report.staging_venv_deleted.ToString().ToLowerInvariant())"
+    Write-Output "STAGING_VENV_EXECUTED_DURING_APPLY=$($report.staging_venv_executed_during_apply.ToString().ToLowerInvariant())"
+    Write-Output "BACKUP_CREATED=$($report.backup_created.ToString().ToLowerInvariant())"
+    Write-Output "FINAL_VENV_CREATED=$($report.final_venv_created.ToString().ToLowerInvariant())"
+    Write-Output "FINAL_VENV_VALIDATED=$($report.final_venv_validated.ToString().ToLowerInvariant())"
     Write-Output "MT5_IMPORTED=$($report.mt5_imported.ToString().ToLowerInvariant())"
     Write-Output "MT5_ACCESSED=$($report.mt5_accessed.ToString().ToLowerInvariant())"
     Write-Output "ORDER_CHECK_CALLED=$($report.order_check_called.ToString().ToLowerInvariant())"
@@ -1720,6 +2350,21 @@ function Write-MutationBoundarySummary {
     Write-Output "ACL_MODIFIED=$($report.acl_modified.ToString().ToLowerInvariant())"
     Write-Output "GATEWAY_STARTED=$($report.gateway_started.ToString().ToLowerInvariant())"
     Write-Output "AUTOMATON_STARTED=$($report.automaton_started.ToString().ToLowerInvariant())"
+}
+
+function Write-PromoteVenvPreflightSummary {
+    if ($Phase -ne 'PromoteVenv' -or $null -eq $report.promote_venv_plan) { return }
+    Write-Output "promotion_strategy=$($report.promotion_strategy)"
+    Write-Output "BUILD_VENV_REPORT=$($report.build_venv_report)"
+    Write-Output "BUILD_VENV_REPORT_SHA256=$($report.build_venv_report_sha256)"
+    Write-Output "GATEWAY_PYTHON_STAGING_REPORT=$($report.gateway_python_staging_report)"
+    Write-Output "GATEWAY_PYTHON_STAGING_REPORT_SHA256=$($report.gateway_python_staging_report_sha256)"
+    Write-Output "AGENT_PYTHON_STAGING_REPORT=$($report.agent_python_staging_report)"
+    Write-Output "AGENT_PYTHON_STAGING_REPORT_SHA256=$($report.agent_python_staging_report_sha256)"
+    Write-Output "ACTIVE_VENV_PROCESS_USERS=$(@($report.active_venv_process_users).Count)"
+    Write-Output "STAGING_VENV_PROCESS_USERS=$(@($report.staging_venv_process_users).Count)"
+    Write-Output "promote_venv_plan=$($report.promote_venv_plan | ConvertTo-Json -Depth 12 -Compress)"
+    Write-Output "rollback_plan=$($report.rollback_plan | ConvertTo-Json -Depth 12 -Compress)"
 }
 
 function Write-BuildVenvPreflightSummary {
@@ -1809,7 +2454,7 @@ try {
     $report.gates.DECLARATIVE_HASH_LOCK = 'PASS'
 
     $inventory = Get-TradingLabPythonInventory
-    if ($Phase -in @('Inventory', 'BuildVenv')) {
+    if ($Phase -in @('Inventory', 'BuildVenv', 'PromoteVenv')) {
         $inventory = Get-ReadOnlyVerifiedMachineRuntimeInventory $inventory
     }
     $report.inventory_before = $inventory.state
@@ -2096,59 +2741,196 @@ try {
             }
         }
         'PromoteVenv' {
-            Assert-MachineInstallationInventory $inventory
-            [void](Assert-BasePython $basePython)
-            if (-not (Test-Path -LiteralPath $stagingVenvPath) -and (Test-Path -LiteralPath $venvPath)) {
-                [void](Assert-Venv $venvPath)
-                $report.gates.PYTHON_BASE_MACHINE_WIDE = 'PASS'
-                $report.gates.PYTHON_BASE_OUTSIDE_USER_PROFILE = 'PASS'
-                $report.gates.VENV_BASE_OUTSIDE_USER_PROFILE = 'PASS'
-                $report.gates.VENV_LOCK_MATCH = 'PASS'
-                $report.gates.META_TRADER5_PACKAGE_PRESENT = 'PASS'
-                if ($Apply) { Initialize-PhaseStorage; $report.current_run_applied_phase = 'PromoteVenvAlreadyComplete' }
-                break
+            if ([string]::IsNullOrWhiteSpace($BuildVenvRunId) -or
+                [string]::IsNullOrWhiteSpace($GatewayPythonStagingRunId) -or
+                [string]::IsNullOrWhiteSpace($AgentPythonStagingRunId)) {
+                throw 'PROMOTE_VENV_EVIDENCE_RUN_IDS_REQUIRED=FAIL: supply all three explicit UUIDs.'
             }
-            [void](Assert-Venv $stagingVenvPath)
-            if ((git -C $workspace status --porcelain=v1 --untracked-files=no | Out-String).Trim()) {
+            $report.promotion_strategy = 'REBUILD_AT_FINAL_PATH_TRANSACTIONALLY'
+            $report.must_not_execute_installer = $true
+            $report.must_not_call_set_acl = $true
+            $report.gates.MUST_NOT_EXECUTE_INSTALLER = 'true'
+            $report.gates.INSTALLER_REEXECUTED = 'false'
+            $report.gates.MUST_NOT_CALL_SET_ACL = 'true'
+            $report.gates.SET_ACL_CALL_COUNT = 0
+
+            $buildEvidence = Get-VerifiedBuildVenvEvidence $BuildVenvRunId
+            $report.required_previous_phase = 'BuildVenv'
+            $report.previous_phase_verified = $true
+            $report.previous_phase_report = $buildEvidence.path
+            $report.previous_phase_report_sha256 = $buildEvidence.sha256
+            $report.build_venv_run_id = $buildEvidence.record.run_id
+            $report.build_venv_report = $buildEvidence.path
+            $report.build_venv_report_sha256 = $buildEvidence.sha256
+            $report.gates.BUILD_VENV_EVIDENCE = 'PASS'
+
+            $gatewayStagingEvidence = Get-VerifiedPythonStagingRuntimeEvidence `
+                'AutomatonGateway' $GatewayPythonStagingRunId $gatewaySid
+            $report.gateway_python_staging_run_id = $gatewayStagingEvidence.record.run_id
+            $report.gateway_python_staging_report = $gatewayStagingEvidence.path
+            $report.gateway_python_staging_report_sha256 = $gatewayStagingEvidence.sha256
+            $report.gates.GATEWAY_STAGING_RUNTIME_EVIDENCE = 'PASS'
+            $agentStagingEvidence = Get-VerifiedPythonStagingRuntimeEvidence `
+                'AutomatonAgent' $AgentPythonStagingRunId $agentSid
+            $report.agent_python_staging_run_id = $agentStagingEvidence.record.run_id
+            $report.agent_python_staging_report = $agentStagingEvidence.path
+            $report.agent_python_staging_report_sha256 = $agentStagingEvidence.sha256
+            $report.gates.AGENT_STAGING_RUNTIME_EVIDENCE = 'PASS'
+            if ($gatewayStagingEvidence.staging_tree_count -ne $agentStagingEvidence.staging_tree_count) {
+                throw 'STAGING_RUNTIME_EVIDENCE_TREE_COUNT=FAIL: identity reports disagree.'
+            }
+
+            Assert-FinalVerifiedMachineRuntimeInventory $inventory
+            Assert-MachineInstallationInventory $inventory
+            $report.runtime_verification = $inventory.runtime_verification
+            $report.gates.LIVE_RUNTIME_VERIFICATION = 'PASS'
+            $report.gates.COMPLETED_TARGET_RUNTIME = 'PRESENT_VERIFIED'
+            $report.gates.RUNTIME_VERIFICATION = 'VERIFIED'
+            $report.gates.PREVALIDATION = 'PASS'
+            [void](Assert-BasePython $basePython)
+            $baseAcl = Assert-ExactBaseAcl $pythonBase
+            Set-MachineRuntimeAclPassGates $baseAcl
+            $wheelhouseState = Assert-Wheelhouse $wheelhousePath
+            Set-WheelhousePassGates $wheelhouseState
+
+            if (-not (Test-Path -LiteralPath $stagingVenvPath -PathType Container)) {
+                throw 'STAGING_LIVE_VALIDATION=FAIL: staging is absent.'
+            }
+            $stagingFingerprintBefore = Get-VenvTreeFingerprint $stagingVenvPath
+            $stagingLive = Assert-ExactVenvLiveReadOnly $stagingVenvPath $true
+            $report.staging_live_validation = [ordered]@{
+                status = 'PASS'
+                fingerprint = $stagingFingerprintBefore
+                metadata = $stagingLive.metadata
+                distributions = $stagingLive.distributions
+                acl = $stagingLive.acl
+            }
+            $report.gates.STAGING_LIVE_VALIDATION = 'PASS'
+            $report.gates.STAGING_VENV_REPARSE_POINTS = $stagingLive.acl.reparse_points
+            if ($stagingLive.acl.scanned_items -ne $gatewayStagingEvidence.staging_tree_count) {
+                throw 'STAGING_LIVE_STRUCTURE_COUNT=FAIL: live tree differs from certified identity reports.'
+            }
+            $report.gates.STAGING_CERTIFIED_TREE_ITEMS = $gatewayStagingEvidence.staging_tree_count
+            $report.gates.STAGING_LIVE_TREE_ITEMS = $stagingLive.acl.scanned_items
+
+            if (-not (Test-Path -LiteralPath $venvPath -PathType Container)) {
+                throw 'ACTIVE_VENV_PRESENT=FAIL'
+            }
+            Assert-NoReparseComponents $venvPath
+            if ($inventory.state.broken_active_venv -ne 'PRESENT') {
+                throw 'ACTIVE_VENV_EXPECTED_BROKEN=FAIL'
+            }
+            $activeAclSddl = (Get-Acl -LiteralPath $venvPath -ErrorAction Stop).
+                GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::All)
+            $report.gates.ACTIVE_VENV_PRESENT = 'PASS'
+            $report.gates.ACTIVE_VENV_EXPECTED_BROKEN = 'PASS'
+            $report.gates.ACTIVE_VENV_REPARSE_POINT = 0
+
+            $processUsers = Get-VenvProcessUsers
+            $report.active_venv_process_users = @($processUsers.active)
+            $report.staging_venv_process_users = @($processUsers.staging)
+            if (@($processUsers.active).Count -ne 0) { throw 'ACTIVE_VENV_PROCESS_USERS=FAIL' }
+            if (@($processUsers.staging).Count -ne 0) { throw 'STAGING_VENV_PROCESS_USERS=FAIL' }
+            $report.gates.ACTIVE_VENV_PROCESS_USERS = 0
+            $report.gates.STAGING_VENV_PROCESS_USERS = 0
+
+            $report.promote_venv_plan = New-PromoteVenvPlan
+            $report.rollback_plan = New-PromoteVenvRollbackPlan $report.promote_venv_plan
+            Assert-PromoteVenvPlan $report.promote_venv_plan
+            Assert-PromotionArtifactsAbsent $report.promote_venv_plan
+            $report.old_venv_backup = $report.promote_venv_plan.backup_path
+            if (-not $Apply) { break }
+            if ((git -C $workspace status --porcelain=v1 | Out-String).Trim()) {
                 throw 'WORKTREE_TRACKED_CHANGES=FAIL: commit reviewed source before promotion.'
             }
-            if (-not $Apply) { break }
-            Initialize-PhaseStorage
-            $backupPath = Join-Path $maintenanceRoot "venv-admin-base-backup-$runId"
-            if (Test-Path -LiteralPath $backupPath) { throw 'VENV_BACKUP_COLLISION=FAIL' }
-            $oldMoved = $false
-            if (Test-Path -LiteralPath $venvPath) {
-                Move-Item -LiteralPath $venvPath -Destination $backupPath
-                $oldMoved = $true
+
+            $preExecutionInventory = Get-ReadOnlyVerifiedMachineRuntimeInventory `
+                (Get-TradingLabPythonInventory)
+            Assert-FinalVerifiedMachineRuntimeInventory $preExecutionInventory
+            Assert-MachineInstallationInventory $preExecutionInventory
+            if ($preExecutionInventory.state.broken_active_venv -ne 'PRESENT' -or
+                -not (Test-Path -LiteralPath $venvPath -PathType Container)) {
+                throw 'PRE_EXECUTION_ACTIVE_VENV_EXPECTED_BROKEN=FAIL'
             }
-            $report.current_run_applied_phase = 'ActiveVenvBackedUp'
+            Assert-NoReparseComponents $venvPath
+            $preExecutionFingerprint = Get-VenvTreeFingerprint $stagingVenvPath
+            if ($preExecutionFingerprint.sha256 -ne $stagingFingerprintBefore.sha256 -or
+                $preExecutionFingerprint.file_count -ne $stagingFingerprintBefore.file_count) {
+                throw 'PRE_EXECUTION_STAGING_VENV_UNCHANGED=FAIL'
+            }
+            $preExecutionProcesses = Get-VenvProcessUsers
+            if (@($preExecutionProcesses.active).Count -ne 0 -or
+                @($preExecutionProcesses.staging).Count -ne 0) {
+                throw 'PRE_EXECUTION_VENV_PROCESS_USERS=FAIL'
+            }
+            Assert-PromotionArtifactsAbsent $report.promote_venv_plan
+            $report.gates.PRE_EXECUTION_PROMOTION_CHECK = 'PASS'
+
+            Initialize-PhaseStorage
+            $tempPath = Initialize-BuildVenvPrivateTemp $report.promote_venv_plan.temp_path
+            $backupCompleted = $false
             try {
-                Move-Item -LiteralPath $stagingVenvPath -Destination $venvPath
-                [void](Assert-Venv $venvPath)
+                $report.current_run_applied_phase = 'PromoteVenvRequested'
+                [System.IO.Directory]::Move($venvPath, $report.promote_venv_plan.backup_path)
+                $backupCompleted = $true
+                $report.backup_created = $true
+                $report.active_venv_modified = $true
+                $report.active_venv_renamed = $true
+                $report.current_run_applied_phase = 'ActiveVenvBackedUp'
+                if ((Test-Path -LiteralPath $venvPath) -or
+                    -not (Test-Path -LiteralPath $report.promote_venv_plan.backup_path -PathType Container)) {
+                    throw 'ACTIVE_VENV_BACKUP_VERIFICATION=FAIL'
+                }
+                Assert-NoReparseComponents $report.promote_venv_plan.backup_path
+                $backupAclSddl = (Get-Acl -LiteralPath $report.promote_venv_plan.backup_path -ErrorAction Stop).
+                    GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::All)
+                if (-not $backupAclSddl.Equals($activeAclSddl, [System.StringComparison]::Ordinal)) {
+                    throw 'BACKUP_ACL_PRESERVED=FAIL'
+                }
+                foreach ($backupItem in Get-VenvReadOnlyTreeSnapshot $report.promote_venv_plan.backup_path) {
+                    Assert-NoUntrustedModify $backupItem.FullName @($gatewaySid, $agentSid)
+                }
+                $report.gates.BACKUP_ACL_PRESERVED = 'PASS'
+                $createStep = $report.promote_venv_plan.steps[1]
+                [void](Invoke-BuildVenvProcess $createStep.executable `
+                    @($createStep.arguments) 'promote-create-final' $tempPath)
+                $report.final_venv_created = Test-Path -LiteralPath $venvPath -PathType Container
+                if (-not $report.final_venv_created) { throw 'FINAL_VENV_CREATED=FAIL' }
+                $installStep = $report.promote_venv_plan.steps[2]
+                [void](Invoke-BuildVenvProcess $installStep.executable `
+                    @($installStep.arguments) 'promote-install-final' $tempPath)
+                $finalLive = Assert-ExactVenvLiveReadOnly $venvPath $false
+                $report.final_venv_validation = $finalLive
+                $report.final_venv_validated = $true
+                $nonRelocation = Get-FinalNonRelocationAudit $venvPath
+                $report.final_non_relocation_validation = $nonRelocation
+                if (-not $nonRelocation.valid) { throw 'FINAL_NON_RELOCATION_VALIDATION=FAIL' }
+                $report.final_acl_validation = $finalLive.acl
+                $report.gates.FINAL_STAGING_PATH_REFERENCES = 0
+                $report.gates.FINAL_REFERENCE_READ_ERRORS = 0
+                $report.gates.FINAL_VENV_ACL = 'PASS'
+                $report.gates.FINAL_GATEWAY_MUTATION_RIGHTS = 0
+                $report.gates.FINAL_AGENT_MUTATION_RIGHTS = 0
+                $stagingFingerprintAfter = Get-VenvTreeFingerprint $stagingVenvPath
+                if ($stagingFingerprintAfter.sha256 -ne $stagingFingerprintBefore.sha256 -or
+                    $stagingFingerprintAfter.file_count -ne $stagingFingerprintBefore.file_count) {
+                    $report.staging_venv_modified = $true
+                    throw 'STAGING_VENV_MODIFIED=FAIL'
+                }
                 $report.current_run_applied_phase = 'PromoteVenv'
                 $report.venv_promoted = $true
+                $report.staging_promoted = $false
+                $report.backup_preserved = $true
+                $report.staging_preserved = $true
             } catch {
-                if (Test-Path -LiteralPath $venvPath) {
-                    $failedPath = Join-Path $maintenanceRoot "venv-failed-$runId"
-                    Move-Item -LiteralPath $venvPath -Destination $failedPath
-                    Protect-AdministrativeMaintenanceTree $failedPath
+                $promotionError = $_
+                Invoke-PromoteVenvRollback $report.promote_venv_plan $backupCompleted
+                throw $promotionError
+            } finally {
+                if (-not (Clear-BuildVenvPrivateTemp $tempPath)) {
+                    Write-Warning 'PromoteVenv private TEMP cleanup failed; runtime artifacts were preserved.'
                 }
-                if ($oldMoved -and -not (Test-Path -LiteralPath $venvPath)) {
-                    Move-Item -LiteralPath $backupPath -Destination $venvPath
-                    $report.current_run_applied_phase = 'PromotionRolledBack'
-                }
-                throw
             }
-            if ($oldMoved) {
-                Protect-AdministrativeMaintenanceTree $backupPath
-                $report.old_venv_backup = $backupPath
-            }
-            $report.gates.PYTHON_BASE_MACHINE_WIDE = 'PASS'
-            $report.gates.PYTHON_BASE_OUTSIDE_USER_PROFILE = 'PASS'
-            $report.gates.VENV_BASE_OUTSIDE_USER_PROFILE = 'PASS'
-            $report.gates.VENV_LOCK_MATCH = 'PASS'
-            $report.gates.META_TRADER5_PACKAGE_PRESENT = 'PASS'
-            $report.gates.GATEWAY_TEMP_OPERATIONAL_ONLY = 'PENDING_RUNTIME_IDENTITY_TEST'
         }
     }
 
@@ -2159,6 +2941,7 @@ try {
         Write-UninstallPreflightSummary
         Write-InstallMachineRuntimePreflightSummary
         Write-BuildVenvPreflightSummary
+        Write-PromoteVenvPreflightSummary
         Write-Output "PYTHON_RECOVERY_PHASE=$Phase"
         Write-Output "MUST_NOT_EXECUTE_INSTALLER=$($report.must_not_execute_installer.ToString().ToLowerInvariant())"
         Write-Output "INSTALLER_REEXECUTED=$($report.installer_reexecuted.ToString().ToLowerInvariant())"
@@ -2170,6 +2953,7 @@ try {
     Write-Report
     Write-Gates
     Write-BuildVenvPreflightSummary
+    Write-PromoteVenvPreflightSummary
     Write-Output "PYTHON_RECOVERY_PHASE=$Phase"
     Write-Output "MUST_NOT_EXECUTE_INSTALLER=$($report.must_not_execute_installer.ToString().ToLowerInvariant())"
     Write-Output "INSTALLER_REEXECUTED=$($report.installer_reexecuted.ToString().ToLowerInvariant())"

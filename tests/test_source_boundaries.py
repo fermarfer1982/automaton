@@ -43,6 +43,7 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn('"scripts/Install-TradingLabPythonRuntime.ps1"', source)
         self.assertIn('"scripts/TradingLabPythonInventory.ps1"', source)
         self.assertIn('"scripts/TradingLabBuildVenvGate.ps1"', source)
+        self.assertIn('"scripts/TradingLabPromoteVenvGate.ps1"', source)
         self.assertIn('"scripts/Initialize-GatewayPythonEnvironment.ps1"', source)
         self.assertIn('"scripts/Resolve-TradingLabNode.ps1"', source)
         self.assertIn('"docs/SECURITY_INVARIANTS.md"', source)
@@ -283,6 +284,7 @@ class SourceBoundaryTests(unittest.TestCase):
                 "Install-TradingLabPythonRuntime.ps1",
                 "TradingLabPythonInventory.ps1",
                 "TradingLabBuildVenvGate.ps1",
+                "TradingLabPromoteVenvGate.ps1",
                 "TradingLabPythonAclPlan.ps1",
                 "TradingLabFileSystemRights.ps1",
                 "Initialize-GatewayPythonEnvironment.ps1",
@@ -347,7 +349,7 @@ class SourceBoundaryTests(unittest.TestCase):
         inventory = (ROOT / "scripts" / "TradingLabPythonInventory.ps1").read_text(
             encoding="utf-8"
         )
-        self.assertIn("$startInfo.Arguments = '-I -'", inventory)
+        self.assertIn("$startInfo.Arguments = '-B -I -'", inventory)
         self.assertIn("RedirectStandardInput = $true", inventory)
         self.assertIn("$process.StandardInput.Write($Source)", inventory)
         self.assertIn("Invoke-TradingLabPythonRuntimeValidationMetadata", inventory)
@@ -359,8 +361,12 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn("acl_modified = $false", inventory)
         self.assertIn("reports_written = $false", inventory)
         self.assertNotIn("-I -c", installer + inventory)
+        self.assertNotIn("$startInfo.Arguments = '-I -'", inventory)
+        self.assertIn("@('-B', '-I', '-m', 'venv', $stagingVenvPath)", installer)
+        self.assertIn("@('-B', '-I', '-m', 'venv', $venvPath)", installer)
+        self.assertIn("@('-B', '-I', '-')", installer)
         self.assertNotIn("Invoke-Expression", installer + inventory)
-        self.assertIn("if ($Phase -in @('Inventory', 'BuildVenv'))", installer)
+        self.assertIn("if ($Phase -in @('Inventory', 'BuildVenv', 'PromoteVenv'))", installer)
         self.assertIn("Get-ReadOnlyVerifiedMachineRuntimeInventory", installer)
         self.assertIn("Assert-FinalVerifiedMachineRuntimeInventory", installer)
         inventory_start = installer.index("if ($Phase -eq 'Inventory')")
@@ -412,6 +418,58 @@ class SourceBoundaryTests(unittest.TestCase):
             "Set-Acl",
         ):
             self.assertNotIn(forbidden, build_gate)
+        promote_gate = (ROOT / "scripts" / "TradingLabPromoteVenvGate.ps1").read_text(
+            encoding="utf-8"
+        )
+        for required in (
+            "Test-TradingLabBuildVenvEvidenceRecord",
+            "Test-TradingLabPythonStagingEvidenceRecord",
+            "Resolve-TradingLabPromoteArtifactState",
+            "Test-TradingLabProcessUsesVenv",
+            "Resolve-TradingLabPromoteVenvPlanState",
+            "Resolve-TradingLabRollbackExpectation",
+            "REBUILD_AT_FINAL_PATH_TRANSACTIONALLY",
+            "PRESERVE_READ_ONLY",
+            "--no-index",
+            "--require-hashes",
+            "--only-binary=:all:",
+        ):
+            self.assertIn(required, promote_gate)
+        for forbidden in (
+            "import MetaTrader5",
+            ".initialize(",
+            ".login(",
+            ".order_check(",
+            ".order_send(",
+            "https://",
+            "Set-Acl",
+            "Remove-Item",
+        ):
+            self.assertNotIn(forbidden, promote_gate)
+        promote = installer[installer.index("'PromoteVenv' {") :]
+        self.assertIn("REBUILD_AT_FINAL_PATH_TRANSACTIONALLY", promote)
+        self.assertIn("Get-VerifiedBuildVenvEvidence", promote)
+        self.assertIn("Get-VerifiedPythonStagingRuntimeEvidence", promote)
+        self.assertIn("Assert-ExactVenvLiveReadOnly", promote)
+        self.assertIn("Assert-PromotionArtifactsAbsent", promote)
+        self.assertIn("Get-FinalNonRelocationAudit", promote)
+        self.assertIn("Invoke-PromoteVenvRollback", promote)
+        dry_stop = promote.index("if (-not $Apply) { break }")
+        self.assertLess(dry_stop, promote.index("Initialize-PhaseStorage"))
+        self.assertLess(
+            dry_stop,
+            promote.index(
+                "[System.IO.Directory]::Move($venvPath, $report.promote_venv_plan.backup_path)"
+            ),
+        )
+        self.assertNotIn(
+            "[System.IO.Directory]::Move($stagingVenvPath", promote
+        )
+        self.assertNotIn("[System.IO.Directory]::Delete", promote)
+        self.assertNotIn("Set-Acl", promote)
+        self.assertNotIn("import MetaTrader5", promote)
+        self.assertNotIn("Start-Service", promote)
+        self.assertNotIn("Start-LoggedInstaller", promote)
         self.assertIn("Assert-PythonManagerPreserved", installer)
         self.assertNotIn("WriteAllText((Join-Path $Root 'pyvenv.cfg')", installer)
         setup = service_files[0].read_text(encoding="utf-8")

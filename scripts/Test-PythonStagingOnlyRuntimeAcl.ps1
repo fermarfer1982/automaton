@@ -417,7 +417,7 @@ function Invoke-PythonStagingOnlyProcess(
     try {
         $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
         $startInfo.FileName = $script:PythonStagingOnlyExecutable
-        $startInfo.Arguments = '-I -'
+        $startInfo.Arguments = '-B -I -'
         $startInfo.WorkingDirectory = $env:TEMP
         $startInfo.UseShellExecute = $false
         $startInfo.CreateNoWindow = $true

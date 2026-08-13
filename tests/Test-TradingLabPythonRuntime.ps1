@@ -3,6 +3,7 @@ $root = Split-Path $PSScriptRoot -Parent
 $installerPath = Join-Path $root 'scripts\Install-TradingLabPythonRuntime.ps1'
 $inventoryPath = Join-Path $root 'scripts\TradingLabPythonInventory.ps1'
 $buildVenvGatePath = Join-Path $root 'scripts\TradingLabBuildVenvGate.ps1'
+$promoteVenvGatePath = Join-Path $root 'scripts\TradingLabPromoteVenvGate.ps1'
 $aclPlanPath = Join-Path $root 'scripts\TradingLabPythonAclPlan.ps1'
 $rightsPath = Join-Path $root 'scripts\TradingLabFileSystemRights.ps1'
 $aclGatePath = Join-Path $root 'scripts\Apply-TradingLabAclGate.ps1'
@@ -17,7 +18,7 @@ function Assert-True([bool] $Condition, [string] $Message) {
 }
 
 foreach ($path in @(
-    $installerPath, $inventoryPath, $buildVenvGatePath, $aclPlanPath, $rightsPath, $aclGatePath,
+    $installerPath, $inventoryPath, $buildVenvGatePath, $promoteVenvGatePath, $aclPlanPath, $rightsPath, $aclGatePath,
     $setupPath, $gatewayPath, $collectorPath,
     $gatewayEnvironmentPath, $gatewayStartPath
 )) {
@@ -32,6 +33,7 @@ foreach ($path in @(
 $installer = [System.IO.File]::ReadAllText($installerPath)
 $inventorySource = [System.IO.File]::ReadAllText($inventoryPath)
 $buildVenvGateSource = [System.IO.File]::ReadAllText($buildVenvGatePath)
+$promoteVenvGateSource = [System.IO.File]::ReadAllText($promoteVenvGatePath)
 $aclPlanSource = [System.IO.File]::ReadAllText($aclPlanPath)
 $rightsSource = [System.IO.File]::ReadAllText($rightsPath)
 $aclGateSource = [System.IO.File]::ReadAllText($aclGatePath)
@@ -68,7 +70,8 @@ foreach ($required in @(
     "'--no-index', '--find-links', `$wheelhousePath",
     'importlib.metadata.version("MetaTrader5")',
     'TARGET_RUNTIME_ALREADY_INSTALLED_VALIDATION_PENDING',
-    'PromoteVenvAlreadyComplete', 'PromotionRolledBack', 'current_run_applied_phase',
+    'REBUILD_AT_FINAL_PATH_TRANSACTIONALLY', 'PromotionFailedRolledBack',
+    'CriticalRecoveryRequired', 'current_run_applied_phase',
     "required_previous_phase = `$null", "previous_phase_verified = `$false",
     "previous_phase_report = `$null", 'Get-VerifiedPrepareWheelhouseEvidence',
     'Get-VerifiedUninstallTraditionalEvidence',
@@ -168,7 +171,7 @@ foreach ($required in @(
     'Test-TradingLabInstalledRuntimePendingReportRecord',
     'Find-TradingLabInstalledRuntimePendingReport',
     'Resolve-TradingLabMachineMsiComponentState',
-    'Invoke-TradingLabPythonStdinJson',
+    'Invoke-TradingLabPythonStdinJson', "`$startInfo.Arguments = '-B -I -'",
     'Test-TradingLabManagerExcludedFromUninstallPlan',
     'Resolve-TradingLabMsiComponentSetState',
     'PYTHON_MANAGER_RUNTIME', 'TRADITIONAL_BUNDLE', 'TRADITIONAL_MSI_COMPONENT',
@@ -209,6 +212,27 @@ foreach ($forbidden in @(
     Assert-True (-not $buildVenvGateSource.Contains($forbidden)) "BuildVenv evidence helper contains forbidden action: $forbidden"
 }
 
+foreach ($required in @(
+    'Test-TradingLabBuildVenvEvidenceRecord',
+    'Test-TradingLabPythonStagingEvidenceRecord',
+    'Resolve-TradingLabPromoteArtifactState',
+    'Test-TradingLabProcessUsesVenv',
+    'Resolve-TradingLabPromoteVenvPlanState',
+    'Resolve-TradingLabRollbackExpectation',
+    'REBUILD_AT_FINAL_PATH_TRANSACTIONALLY',
+    'PRESERVE_READ_ONLY', '--no-index', '--require-hashes', '--only-binary=:all:',
+    'PIP_CONFIG_FILE', 'PIP_NO_INDEX', 'PIP_NO_CACHE_DIR', 'PYTHONNOUSERSITE'
+)) {
+    Assert-True ($promoteVenvGateSource.Contains($required)) "PromoteVenv evidence gate lacks invariant: $required"
+}
+foreach ($forbidden in @(
+    'import MetaTrader5', '.initialize(', '.login(', '.account_info(', '.terminal_info(',
+    '.symbol_info(', '.order_check(', '.order_send(', 'Set-Acl', 'Start-Service',
+    'Invoke-WebRequest', 'https://', 'http://', 'Remove-Item'
+)) {
+    Assert-True (-not $promoteVenvGateSource.Contains($forbidden)) "PromoteVenv evidence helper contains forbidden action: $forbidden"
+}
+
 foreach ($forbidden in @(
     'Invoke-WebRequest', 'Start-BitsTransfer', 'curl.exe', 'msizap', 'Win32_Product',
     'Remove-Item', 'reg.exe delete', 'Package Cache', 'WriteAllText((Join-Path $Root ''pyvenv.cfg'')',
@@ -235,12 +259,12 @@ foreach ($forbiddenInventoryMutation in @(
 )) {
     Assert-True (-not $inventoryPhaseBlock.Contains($forbiddenInventoryMutation)) "Inventory phase contains forbidden mutation: $forbiddenInventoryMutation"
 }
-Assert-True ($installer.Contains("if (`$Phase -in @('Inventory', 'BuildVenv'))")) 'Inventory and BuildVenv must obtain the same live read-only verification snapshot.'
+Assert-True ($installer.Contains("if (`$Phase -in @('Inventory', 'BuildVenv', 'PromoteVenv'))")) 'Inventory, BuildVenv, and PromoteVenv must obtain the same live read-only verification snapshot.'
 Assert-True ($installer.IndexOf('Assert-InstallMachinePreconditions $inventory') -lt $installer.IndexOf('Start-LoggedInstaller $plan.executable')) 'Current runtime state must block install execution.'
 Assert-True ($installer.IndexOf('$report.previous_phase_verified = $true') -lt $installer.IndexOf("Start-LoggedInstaller `$bundleExecutable")) 'Durable previous-phase verification must precede supported uninstall.'
 Assert-True ($installer.IndexOf('Assert-PythonManagerPreserved $inventory $plan') -lt $installer.IndexOf("Start-LoggedInstaller `$bundleExecutable")) 'Manager preservation proof must precede supported uninstall.'
 Assert-True ($installer.IndexOf('Assert-UninstallPlanHasNoDirectCleanup $plan') -lt $installer.IndexOf("Start-LoggedInstaller `$bundleExecutable")) 'No-direct-cleanup proof must precede supported uninstall.'
-Assert-True ($installer.IndexOf('Assert-Venv $stagingVenvPath') -lt $installer.LastIndexOf('Move-Item -LiteralPath $stagingVenvPath -Destination $venvPath')) 'Staging validation must precede promotion.'
+Assert-True (-not $installer.Contains('Move-Item -LiteralPath $stagingVenvPath -Destination $venvPath')) 'PromoteVenv must never relocate staging into the final path.'
 Assert-True (-not $installer.Contains('[System.IO.Directory]::Delete($stagingVenvPath')) 'Recovery must retain failed staging for diagnosis.'
 Assert-True (-not $installer.Contains('last_applied_phase')) 'Current executions must not expose stale continuity semantics.'
 $uninstallStart = $installer.IndexOf("'UninstallTraditional' {")
@@ -293,7 +317,7 @@ Assert-True ($installer.Contains('Assert-ExactRuntimeTarget $Root')) 'ACL applic
 Assert-True ($installer.Contains('[System.IO.Directory]::EnumerateFileSystemEntries')) 'ACL tree walk must avoid following reparse points recursively.'
 Assert-True ($installer.IndexOf('Assert-InMemoryRuntimeSecurity $directorySecurity $Plan') -lt $installer.IndexOf('Set-Acl -LiteralPath $item.FullName')) 'In-memory directory ACL validation must precede filesystem mutation.'
 Assert-True ($installer.IndexOf('Assert-InMemoryRuntimeSecurity $fileSecurity $Plan') -lt $installer.IndexOf('Set-Acl -LiteralPath $item.FullName')) 'In-memory file ACL validation must precede filesystem mutation.'
-Assert-True ($inventorySource.Contains("`$startInfo.Arguments = '-I -'")) 'Python metadata must execute stdin source with python -.'
+Assert-True ($inventorySource.Contains("`$startInfo.Arguments = '-B -I -'")) 'Python metadata must execute stdin source with -B -I and python -.'
 Assert-True ($inventorySource.Contains('RedirectStandardInput = $true')) 'Python stdin must be redirected explicitly.'
 Assert-True ($inventorySource.Contains('$process.StandardInput.Write($Source)')) 'Python source must be written verbatim to stdin.'
 Assert-True (-not $inventorySource.Contains("-I -c")) 'Python metadata must not use fragile -c quoting.'
@@ -313,9 +337,36 @@ Assert-True ($buildDryReturn -lt $buildBlock.IndexOf('Invoke-BuildVenvProcess $c
 foreach ($forbiddenBuildBoundary in @('Set-Acl', 'Move-Item -LiteralPath $venvPath', 'import MetaTrader5', 'Start-Service')) {
     Assert-True (-not $buildBlock.Contains($forbiddenBuildBoundary)) "BuildVenv crosses forbidden boundary: $forbiddenBuildBoundary"
 }
+$promoteStart = $installer.IndexOf("'PromoteVenv' {")
+Assert-True ($promoteStart -ge 0) 'PromoteVenv phase boundary is absent.'
+$promoteBlock = $installer.Substring($promoteStart)
+foreach ($requiredPromoteBoundary in @(
+    "`$report.promotion_strategy = 'REBUILD_AT_FINAL_PATH_TRANSACTIONALLY'",
+    'Get-VerifiedBuildVenvEvidence', 'Get-VerifiedPythonStagingRuntimeEvidence',
+    'Assert-ExactVenvLiveReadOnly', 'Get-VenvProcessUsers',
+    'Assert-PromotionArtifactsAbsent', 'New-PromoteVenvPlan',
+    'Assert-PromoteVenvPlan', 'Get-VenvTreeFingerprint',
+    'Get-FinalNonRelocationAudit', 'Invoke-PromoteVenvRollback',
+    "`$report.staging_promoted = `$false", "`$report.must_not_call_set_acl = `$true"
+)) {
+    Assert-True ($promoteBlock.Contains($requiredPromoteBoundary)) "PromoteVenv phase lacks boundary: $requiredPromoteBoundary"
+}
+$promoteDryReturn = $promoteBlock.IndexOf('if (-not $Apply) { break }')
+Assert-True ($promoteDryReturn -ge 0 -and $promoteDryReturn -lt $promoteBlock.IndexOf('Initialize-PhaseStorage')) 'PromoteVenv dry-run must stop before runtime storage mutation.'
+Assert-True ($promoteDryReturn -lt $promoteBlock.IndexOf('[System.IO.Directory]::Move($venvPath, $report.promote_venv_plan.backup_path)')) 'PromoteVenv dry-run must stop before active backup.'
+Assert-True (-not $promoteBlock.Contains('[System.IO.Directory]::Move($stagingVenvPath')) 'PromoteVenv must never move or rename staging.'
+Assert-True (-not $promoteBlock.Contains('[System.IO.Directory]::Delete')) 'PromoteVenv must preserve active failure artifacts, backups, and staging.'
+foreach ($forbiddenPromoteBoundary in @(
+    'Set-Acl', 'import MetaTrader5', '.initialize(', '.login(', '.terminal_info(',
+    '.account_info(', '.symbol_info(', '.order_check(', '.order_send(',
+    'Start-Service', 'Stop-Service', 'Start-LoggedInstaller'
+)) {
+    Assert-True (-not $promoteBlock.Contains($forbiddenPromoteBoundary)) "PromoteVenv crosses forbidden boundary: $forbiddenPromoteBoundary"
+}
 
 . $inventoryPath
 . $buildVenvGatePath
+. $promoteVenvGatePath
 . $aclPlanPath
 . $rightsPath
 
@@ -446,8 +497,8 @@ $validBuildPlan = [pscustomobject]@{
     staging_venv=$planStaging; lock_file=$planLock; wheelhouse=$planWheelhouse
     temp_path='C:\ProgramData\AutomatonMT5Lab\maintenance\runtime-tmp\build-venv-test'
     steps=@(
-        [pscustomobject]@{ executable=$basePlanPython; arguments=@('-I','-m','venv',$planStaging); use_shell=$false; environment=$planEnvironment },
-        [pscustomobject]@{ executable=(Join-Path $planStaging 'Scripts\python.exe'); arguments=@('-I','-m','pip','install','--disable-pip-version-check','--no-input','--no-index','--find-links',$planWheelhouse,'--require-hashes','--only-binary=:all:','-r',$planLock); use_shell=$false; environment=$planEnvironment }
+        [pscustomobject]@{ executable=$basePlanPython; arguments=@('-B','-I','-m','venv',$planStaging); use_shell=$false; environment=$planEnvironment },
+        [pscustomobject]@{ executable=(Join-Path $planStaging 'Scripts\python.exe'); arguments=@('-B','-I','-m','pip','install','--disable-pip-version-check','--no-input','--no-index','--find-links',$planWheelhouse,'--require-hashes','--only-binary=:all:','-r',$planLock); use_shell=$false; environment=$planEnvironment }
     )
 }
 Assert-True (Resolve-TradingLabBuildVenvPlanState $validBuildPlan $basePlanPython $planStaging $planLock $planWheelhouse $planActive).valid 'Exact offline BuildVenv plan must pass.'
@@ -471,6 +522,180 @@ $missingDistributionState = Resolve-TradingLabStagingDistributionState $lockedDi
 Assert-True (-not $missingDistributionState.valid -and $missingDistributionState.missing_requirements.Count -eq 1) 'Missing staging distribution must fail closed.'
 $unexpectedDistributionState = Resolve-TradingLabStagingDistributionState $lockedDistributions @($installedDistributions + [pscustomobject]@{name='unexpected';version='1.0'}) @('pip')
 Assert-True (-not $unexpectedDistributionState.valid -and $unexpectedDistributionState.unexpected_distributions.Count -eq 1) 'Unexpected staging distribution must fail closed.'
+
+$promoteRunId = '00000000-0000-0000-0000-000000000201'
+$promoteGatewayRunId = '00000000-0000-0000-0000-000000000202'
+$promoteAgentRunId = '00000000-0000-0000-0000-000000000203'
+$promoteBase = 'C:\Program Files\AutomatonPython\3.14.5'
+$promoteBasePython = Join-Path $promoteBase 'python.exe'
+$promoteActive = 'C:\automaton\.venv'
+$promoteStaging = 'C:\automaton\.venv.new'
+$promoteBackup = "C:\automaton\.venv.backup.$promoteRunId"
+$promoteFailed = "C:\automaton\.venv.failed.$promoteRunId"
+$promoteWheelhouse = 'C:\ProgramData\AutomatonMT5Lab\maintenance\wheelhouse\cp314-win_amd64'
+$promoteLock = 'C:\automaton\requirements-gateway-win-py314.lock'
+$promoteTemp = "C:\ProgramData\AutomatonMT5Lab\maintenance\runtime-tmp\promote-venv-$promoteRunId"
+
+$buildEvidence = [pscustomobject]@{
+    schema_version=3; run_id=$promoteRunId; phase='BuildVenv'; status='PASS'; apply_requested=$true
+    current_run_applied_phase='BuildVenv'; trading_mode='OBSERVE_ONLY'; python_base=$promoteBase
+    active_venv=$promoteActive; staging_venv=$promoteStaging; wheelhouse=$promoteWheelhouse; lock_file=$promoteLock
+    staging_venv_created=$true; staging_build_failed=$false; venv_rebuilt=$true; venv_promoted=$false
+    mt5_package_installed=$true; must_not_call_set_acl=$true; must_not_execute_installer=$true
+    active_venv_modified=$false; active_venv_deleted=$false; active_venv_renamed=$false; active_venv_executed=$false
+    installer_executed=$false; installer_reexecuted=$false; mt5_imported=$false; mt5_accessed=$false
+    order_check_called=$false; order_send_called=$false; gateway_started=$false; automaton_started=$false
+    acl_modified=$false; set_acl_call_count=0
+}
+Assert-True (Test-TradingLabBuildVenvEvidenceRecord $buildEvidence $promoteRunId $promoteBase $promoteActive $promoteStaging $promoteWheelhouse $promoteLock) 'Exact BuildVenv evidence must pass.'
+Assert-True (-not (Test-TradingLabBuildVenvEvidenceRecord $null $promoteRunId $promoteBase $promoteActive $promoteStaging $promoteWheelhouse $promoteLock)) 'Missing BuildVenv evidence must fail closed.'
+foreach ($case in @(
+    [pscustomobject]@{ Name='wrong RunId'; Property='run_id'; Value='00000000-0000-0000-0000-000000000999' },
+    [pscustomobject]@{ Name='wrong phase'; Property='phase'; Value='Inventory' },
+    [pscustomobject]@{ Name='failed status'; Property='status'; Value='FAIL' },
+    [pscustomobject]@{ Name='staging absent'; Property='staging_venv_created'; Value=$false },
+    [pscustomobject]@{ Name='already promoted'; Property='venv_promoted'; Value=$true },
+    [pscustomobject]@{ Name='active modified'; Property='active_venv_modified'; Value=$true },
+    [pscustomobject]@{ Name='MT5 imported'; Property='mt5_imported'; Value=$true },
+    [pscustomobject]@{ Name='MT5 accessed'; Property='mt5_accessed'; Value=$true }
+)) {
+    $record = Copy-TestFixture $buildEvidence
+    $record.($case.Property) = $case.Value
+    Assert-True (-not (Test-TradingLabBuildVenvEvidenceRecord $record $promoteRunId $promoteBase $promoteActive $promoteStaging $promoteWheelhouse $promoteLock)) "BuildVenv evidence $($case.Name) must fail closed."
+}
+
+function New-PythonStagingEvidenceFixture([string] $Role, [string] $RunId, [string] $Sid) {
+    $tests = [ordered]@{}
+    foreach ($name in Get-TradingLabStagingCriticalTests $Role) {
+        $expectation = if ($name -eq 'IDENTITY') { $Sid }
+            elseif ($name -in @('STAGING_PYTHON_READ','STAGING_SITE_PACKAGES_READ')) { 'ALLOW' }
+            elseif ($name -in @(
+                'STAGING_CREATE_FILE_DENY','STAGING_CREATE_DIRECTORY_DENY','STAGING_WRITE_DENY',
+                'STAGING_APPEND_DENY','STAGING_TRUNCATE_DENY','STAGING_RENAME_DENY',
+                'STAGING_DELETE_DENY','STAGING_WRITE_ATTRIBUTES_DENY','STAGING_CHANGE_ACL_DENY',
+                'STAGING_TAKE_OWNERSHIP_DENY','STAGING_PYTHON_FUNCTIONAL_EXECUTION_DENY'
+            )) { 'DENY' }
+            elseif ($name -eq 'STAGING_METATRADER5_IMPORTED') { 'false' }
+            else { 'PASS' }
+        $evidence = if ($name -eq 'STAGING_ENUMERATE') { 'ITEMS_ENUMERATED_5406' } else { 'SYNTHETIC' }
+        $tests[$name] = [pscustomobject]@{ passed=$true; expected=$expectation; observed=$expectation; evidence=$evidence }
+    }
+    $exitCode = if ($Role -eq 'AutomatonGateway') { 0 } else { 103 }
+    return [pscustomobject]@{
+        schema_version=1; mode='PYTHON_STAGING_ONLY'; role=$Role; run_id=$RunId
+        effective_sid=$Sid; status='PASS'; runtime_error=$null; tests=[pscustomobject]$tests
+        execution=[pscustomobject]@{ process_started=$true; exit_code=$exitCode; success_marker_observed=$false }
+        boundaries=[pscustomobject]@{
+            trading_mode='OBSERVE_ONLY'; build_venv=$false; promote_venv=$false
+            active_venv_accessed=$false; active_venv_modified=$false
+            mt5_imported=$false; mt5_accessed=$false; order_check_called=$false; order_send_called=$false
+            gateway_started=$false; automaton_started=$false; acl_modified=$false; filesystem_staging_modified=$false
+        }
+    }
+}
+$promoteGatewaySid = 'S-1-5-21-1-2-3-1007'
+$promoteAgentSid = 'S-1-5-21-1-2-3-1006'
+$gatewayStagingEvidence = New-PythonStagingEvidenceFixture 'AutomatonGateway' $promoteGatewayRunId $promoteGatewaySid
+$agentStagingEvidence = New-PythonStagingEvidenceFixture 'AutomatonAgent' $promoteAgentRunId $promoteAgentSid
+Assert-True (Test-TradingLabPythonStagingEvidenceRecord $gatewayStagingEvidence 'AutomatonGateway' $promoteGatewayRunId $promoteGatewaySid) 'Exact Gateway staging evidence must pass.'
+Assert-True (Test-TradingLabPythonStagingEvidenceRecord $agentStagingEvidence 'AutomatonAgent' $promoteAgentRunId $promoteAgentSid) 'Exact Agent staging evidence must pass.'
+Assert-True ((Get-TradingLabStagingEvidenceTreeCount $gatewayStagingEvidence) -eq 5406) 'Gateway staging evidence tree count must be exact and parseable.'
+Assert-True (-not (Test-TradingLabPythonStagingEvidenceRecord $null 'AutomatonGateway' $promoteGatewayRunId $promoteGatewaySid)) 'Missing Gateway staging evidence must fail closed.'
+Assert-True (-not (Test-TradingLabPythonStagingEvidenceRecord $null 'AutomatonAgent' $promoteAgentRunId $promoteAgentSid)) 'Missing Agent staging evidence must fail closed.'
+foreach ($roleCase in @(
+    [pscustomobject]@{ Role='AutomatonGateway'; RunId=$promoteGatewayRunId; Sid=$promoteGatewaySid; Fixture=$gatewayStagingEvidence },
+    [pscustomobject]@{ Role='AutomatonAgent'; RunId=$promoteAgentRunId; Sid=$promoteAgentSid; Fixture=$agentStagingEvidence }
+)) {
+    foreach ($case in @(
+        [pscustomobject]@{ Name='wrong UUID'; Property='run_id'; Value='00000000-0000-0000-0000-000000000999' },
+        [pscustomobject]@{ Name='wrong SID'; Property='effective_sid'; Value='S-1-5-21-wrong' },
+        [pscustomobject]@{ Name='wrong role'; Property='role'; Value='WrongRole' },
+        [pscustomobject]@{ Name='wrong mode'; Property='mode'; Value='PYTHON_BASE_ONLY' },
+        [pscustomobject]@{ Name='failed status'; Property='status'; Value='FAIL' }
+    )) {
+        $record = Copy-TestFixture $roleCase.Fixture; $record.($case.Property) = $case.Value
+        Assert-True (-not (Test-TradingLabPythonStagingEvidenceRecord $record $roleCase.Role $roleCase.RunId $roleCase.Sid)) "$($roleCase.Role) staging $($case.Name) must fail closed."
+    }
+    $testFailure = Copy-TestFixture $roleCase.Fixture
+    $criticalName = (Get-TradingLabStagingCriticalTests $roleCase.Role)[-1]
+    $testFailure.tests.$criticalName.passed = $false
+    Assert-True (-not (Test-TradingLabPythonStagingEvidenceRecord $testFailure $roleCase.Role $roleCase.RunId $roleCase.Sid)) "$($roleCase.Role) critical test failure must fail closed."
+    $mutationAllow = Copy-TestFixture $roleCase.Fixture
+    $mutationAllow.tests.STAGING_WRITE_DENY.passed = $false
+    Assert-True (-not (Test-TradingLabPythonStagingEvidenceRecord $mutationAllow $roleCase.Role $roleCase.RunId $roleCase.Sid)) "$($roleCase.Role) unexpected mutation allow must fail closed."
+    $boundaryViolation = Copy-TestFixture $roleCase.Fixture
+    $boundaryViolation.boundaries.filesystem_staging_modified = $true
+    Assert-True (-not (Test-TradingLabPythonStagingEvidenceRecord $boundaryViolation $roleCase.Role $roleCase.RunId $roleCase.Sid)) "$($roleCase.Role) staging boundary violation must fail closed."
+    $structuralEvidenceInvalid = Copy-TestFixture $roleCase.Fixture
+    $structuralEvidenceInvalid.tests.STAGING_ENUMERATE.evidence = 'ITEMS_ENUMERATED_INVALID'
+    Assert-True (-not (Test-TradingLabPythonStagingEvidenceRecord $structuralEvidenceInvalid $roleCase.Role $roleCase.RunId $roleCase.Sid)) "$($roleCase.Role) malformed staging tree evidence must fail closed."
+}
+$agentUnexpectedExecution = Copy-TestFixture $agentStagingEvidence
+$agentUnexpectedExecution.execution.exit_code = 0; $agentUnexpectedExecution.execution.success_marker_observed = $true
+Assert-True (-not (Test-TradingLabPythonStagingEvidenceRecord $agentUnexpectedExecution 'AutomatonAgent' $promoteAgentRunId $promoteAgentSid)) 'Agent functional execution unexpectedly allowed must fail closed.'
+
+Assert-True (Test-TradingLabProcessUsesVenv 'C:\automaton\.venv\Scripts\python.exe' '' $promoteActive) 'Process executable under active venv must be detected.'
+Assert-True (Test-TradingLabProcessUsesVenv '' 'worker C:\automaton\.venv.new\Scripts\python.exe' $promoteStaging) 'Process command line under staging venv must be detected.'
+Assert-True (-not (Test-TradingLabProcessUsesVenv 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' 'safe-worker' $promoteActive)) 'Unrelated process must not be attributed to active venv.'
+
+Assert-True (Resolve-TradingLabPromoteArtifactState $false $false 0 0).valid 'Absent promotion artifacts must pass.'
+foreach ($artifactCase in @(
+    @( $true, $false, 0, 0 ), @( $false, $true, 0, 0 ),
+    @( $false, $false, 1, 0 ), @( $false, $false, 0, 1 )
+)) {
+    Assert-True (-not (Resolve-TradingLabPromoteArtifactState @artifactCase).valid) 'Any preexisting promotion artifact must fail closed.'
+}
+
+$promoteEnvironment = [pscustomobject]@{
+    PIP_CONFIG_FILE='NUL'; PIP_NO_INDEX='1'; PIP_DISABLE_PIP_VERSION_CHECK='1'; PIP_NO_CACHE_DIR='1'
+    PYTHONNOUSERSITE='1'; PYTHONDONTWRITEBYTECODE='1'; TEMP=$promoteTemp; TMP=$promoteTemp
+}
+$validPromotePlan = [pscustomobject]@{
+    promotion_strategy='REBUILD_AT_FINAL_PATH_TRANSACTIONALLY'; active_venv=$promoteActive
+    staging_venv_read_only=$promoteStaging; staging_action='PRESERVE_READ_ONLY'
+    backup_path=$promoteBackup; failed_path=$promoteFailed; base_python=$promoteBasePython
+    lock_file=$promoteLock; wheelhouse=$promoteWheelhouse
+    temp_path=$promoteTemp
+    steps=@(
+        [pscustomobject]@{ phase='BACKUP'; operation='RENAME_DIRECTORY_SAME_VOLUME'; source=$promoteActive; destination=$promoteBackup; copy=$false; delete=$false; call_set_acl=$false },
+        [pscustomobject]@{ phase='CREATE_FINAL'; operation='CREATE_VENV_AT_FINAL_PATH'; executable=$promoteBasePython; arguments=@('-B','-I','-m','venv',$promoteActive); target=$promoteActive; use_shell=$false; environment=$promoteEnvironment },
+        [pscustomobject]@{ phase='INSTALL_FINAL'; operation='INSTALL_HASH_LOCKED_WHEELS_OFFLINE'; executable=(Join-Path $promoteActive 'Scripts\python.exe'); arguments=@('-B','-I','-m','pip','install','--disable-pip-version-check','--no-input','--no-index','--find-links',$promoteWheelhouse,'--require-hashes','--only-binary=:all:','-r',$promoteLock); target=$promoteActive; use_shell=$false; environment=$promoteEnvironment },
+        [pscustomobject]@{ phase='VALIDATE_FINAL'; operation='VALIDATE_READ_ONLY'; executable=(Join-Path $promoteActive 'Scripts\python.exe'); arguments=@('-B','-I','-'); source_transport='STDIN'; target=$promoteActive; import_allowlist=@('fastapi','pydantic','yaml','uvicorn'); metatrader5_validation='IMPORTLIB_METADATA_ONLY'; use_shell=$false },
+        [pscustomobject]@{ phase='NON_RELOCATION'; operation='SCAN_FINAL_ASCII_UTF16LE_READ_ONLY'; target=$promoteActive; forbidden_reference=$promoteStaging; expected_references=0; expected_read_errors=0 },
+        [pscustomobject]@{ phase='ACL'; operation='VALIDATE_READ_ONLY'; target=$promoteActive; inherit_from='C:\automaton'; call_set_acl=$false }
+    )
+}
+Assert-True (Resolve-TradingLabPromoteVenvPlanState $validPromotePlan $promoteBasePython $promoteActive $promoteStaging $promoteBackup $promoteFailed $promoteLock $promoteWheelhouse $promoteTemp).valid 'Exact transactional PromoteVenv plan must pass.'
+foreach ($planCase in @(
+    [pscustomobject]@{ Name='relocates staging'; Mutate={ param($p) $p.steps[0].source=$promoteStaging } },
+    [pscustomobject]@{ Name='deletes staging'; Mutate={ param($p) $p.steps[4].operation='DELETE'; $p.steps[4].target=$promoteStaging } },
+    [pscustomobject]@{ Name='wrong final path'; Mutate={ param($p) $p.steps[1].arguments[-1]='C:\automaton\.venv.other' } },
+    [pscustomobject]@{ Name='user-profile Python'; Mutate={ param($p) $p.base_python='C:\Users\Admin\python.exe'; $p.steps[1].executable=$p.base_python } },
+    [pscustomobject]@{ Name='PyPI URL'; Mutate={ param($p) $p.steps[2].arguments += 'https://pypi.invalid/package.whl' } },
+    [pscustomobject]@{ Name='Set-Acl'; Mutate={ param($p) $p.steps[5].operation='Set-Acl' } },
+    [pscustomobject]@{ Name='MetaTrader5 import'; Mutate={ param($p) $p.steps[3].operation='import MetaTrader5' } },
+    [pscustomobject]@{ Name='service startup'; Mutate={ param($p) $p.steps[5].operation='Start-Service' } }
+)) {
+    $bad = Copy-TestFixture $validPromotePlan; & $planCase.Mutate $bad
+    Assert-True (-not (Resolve-TradingLabPromoteVenvPlanState $bad $promoteBasePython $promoteActive $promoteStaging $promoteBackup $promoteFailed $promoteLock $promoteWheelhouse $promoteTemp).valid) "Promote plan that $($planCase.Name) must fail closed."
+}
+foreach ($missingArgument in @('--no-index','--require-hashes','--only-binary=:all:')) {
+    $bad = Copy-TestFixture $validPromotePlan
+    $bad.steps[2].arguments = @($bad.steps[2].arguments | Where-Object { $_ -ne $missingArgument })
+    Assert-True (-not (Resolve-TradingLabPromoteVenvPlanState $bad $promoteBasePython $promoteActive $promoteStaging $promoteBackup $promoteFailed $promoteLock $promoteWheelhouse $promoteTemp).valid) "Promote pip without $missingArgument must fail closed."
+}
+
+$beforeBackup = Resolve-TradingLabRollbackExpectation $false $false $false $false
+Assert-True ($beforeBackup.action -eq 'ACTIVE_UNTOUCHED' -and $beforeBackup.active_restored) 'Failure before backup must leave active untouched.'
+$afterBackup = Resolve-TradingLabRollbackExpectation $true $false $false $true
+Assert-True ($afterBackup.action -eq 'PROMOTION_FAILED_ROLLED_BACK' -and $afterBackup.active_restored) 'Failure after backup must restore backup.'
+$partialFinal = Resolve-TradingLabRollbackExpectation $true $true $true $true
+Assert-True ($partialFinal.move_partial_to_failed -and $partialFinal.active_restored -and -not $partialFinal.delete_failed) 'Partial final must move to failed and restore backup without deletion.'
+$rollbackFailure = Resolve-TradingLabRollbackExpectation $true $true $false $false
+Assert-True ($rollbackFailure.critical -and $rollbackFailure.action -eq 'FAIL_CLOSED_CRITICAL_RECOVERY_REQUIRED') 'Rollback failure must require critical recovery.'
+foreach ($rollback in @($beforeBackup,$afterBackup,$partialFinal,$rollbackFailure)) {
+    Assert-True (-not $rollback.delete_failed -and -not $rollback.delete_staging) 'Rollback must never delete failed artifacts or staging.'
+}
 
 Assert-True ((Resolve-TradingLabInstallerExit 0) -eq 'SUCCESS') 'Installer exit 0 classification regressed.'
 Assert-True ((Resolve-TradingLabInstallerExit 1603) -eq 'INSTALLER_MAINTENANCE_COLLISION') 'Bootstrapper 1603 must be classified as a maintenance collision.'
@@ -1184,4 +1409,13 @@ foreach ($gate in @(
     BUILD_VENV_ACTIVE_VENV_ISOLATED = 'PASS'
     BUILD_VENV_STAGING_DISTRIBUTIONS_EXACT = 'PASS'
     BUILD_VENV_FAILED_STAGING_PRESERVED = 'PASS'
+    PROMOTE_VENV_EVIDENCE_CHAIN = 'PASS'
+    PROMOTE_VENV_STAGING_EVIDENCE_FAIL_CLOSED = 'PASS'
+    PROMOTE_VENV_PROCESS_USERS_FAIL_CLOSED = 'PASS'
+    PROMOTE_VENV_ARTIFACTS_FAIL_CLOSED = 'PASS'
+    PROMOTE_VENV_TRANSACTIONAL_PLAN = 'PASS'
+    PROMOTE_VENV_STAGING_NON_RELOCATABLE = 'PASS'
+    PROMOTE_VENV_OFFLINE_FINAL_BUILD = 'PASS'
+    PROMOTE_VENV_ROLLBACK = 'PASS'
+    PROMOTE_VENV_DRY_RUN_NO_MUTATION = 'PASS'
 } | ConvertTo-Json

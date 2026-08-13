@@ -586,7 +586,9 @@ function Invoke-TradingLabPythonStdinJson([string] $Python, [string] $Source) {
     }
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $Python
-    $startInfo.Arguments = '-I -'
+    # -I ignores PYTHON* environment variables, so -B is mandatory to make this
+    # machine-runtime probe genuinely read-only (no stdlib __pycache__ writes).
+    $startInfo.Arguments = '-B -I -'
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardInput = $true
