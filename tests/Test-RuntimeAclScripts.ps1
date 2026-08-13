@@ -6,8 +6,9 @@ $workspace = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $agentPath = Join-Path $workspace 'scripts\Test-AgentRuntimeAcl.ps1'
 $gatewayPath = Join-Path $workspace 'scripts\Test-GatewayRuntimeAcl.ps1'
 $pythonBaseOnlyPath = Join-Path $workspace 'scripts\Test-PythonBaseOnlyRuntimeAcl.ps1'
+$pythonStagingOnlyPath = Join-Path $workspace 'scripts\Test-PythonStagingOnlyRuntimeAcl.ps1'
 $collectorPath = Join-Path $workspace 'scripts\Collect-RuntimeAclResults.ps1'
-$paths = @($agentPath, $gatewayPath, $pythonBaseOnlyPath, $collectorPath)
+$paths = @($agentPath, $gatewayPath, $pythonBaseOnlyPath, $pythonStagingOnlyPath, $collectorPath)
 
 function Assert-True([bool] $Condition, [string] $Message) {
     if (-not $Condition) { throw $Message }
@@ -39,6 +40,7 @@ foreach ($path in $paths) {
 $agent = $sources[$agentPath]
 $gateway = $sources[$gatewayPath]
 $pythonBaseOnly = $sources[$pythonBaseOnlyPath]
+$pythonStagingOnly = $sources[$pythonStagingOnlyPath]
 $collector = $sources[$collectorPath]
 
 Assert-True `
@@ -49,19 +51,29 @@ Assert-True `
     'Gateway script is not bound to the exact authorized SID.'
 Assert-True ($agent.Contains('[switch] $PythonBaseOnly')) 'Agent harness lacks the isolated PythonBaseOnly switch.'
 Assert-True ($gateway.Contains('[switch] $PythonBaseOnly')) 'Gateway harness lacks the isolated PythonBaseOnly switch.'
+Assert-True ($agent.Contains('[switch] $PythonStagingOnly')) 'Agent harness lacks the isolated PythonStagingOnly switch.'
+Assert-True ($gateway.Contains('[switch] $PythonStagingOnly')) 'Gateway harness lacks the isolated PythonStagingOnly switch.'
 foreach ($entry in @(
     [pscustomobject]@{ Source = $gateway; DefaultMarker = "`$labRoot = 'C:\ProgramData\AutomatonMT5Lab'"; Role = 'AutomatonGateway' },
     [pscustomobject]@{ Source = $agent; DefaultMarker = "`$agentStatePath = 'C:\Users\AutomatonAgent\.automaton'"; Role = 'AutomatonAgent' }
 )) {
     $branchStart = $entry.Source.IndexOf('if ($PythonBaseOnly)')
+    $stagingBranchStart = $entry.Source.IndexOf('if ($PythonStagingOnly)')
     $defaultStart = $entry.Source.IndexOf($entry.DefaultMarker)
-    Assert-True ($branchStart -ge 0 -and $defaultStart -gt $branchStart) "$($entry.Role) PythonBaseOnly branch must precede the default harness."
-    $branch = $entry.Source.Substring($branchStart, $defaultStart - $branchStart)
+    Assert-True ($branchStart -ge 0 -and $stagingBranchStart -gt $branchStart) "$($entry.Role) PythonBaseOnly branch must precede PythonStagingOnly."
+    Assert-True ($defaultStart -gt $stagingBranchStart) "$($entry.Role) PythonStagingOnly branch must precede the default harness."
+    $branch = $entry.Source.Substring($branchStart, $stagingBranchStart - $branchStart)
     Assert-True ($branch.Contains("-Role '$($entry.Role)'")) "$($entry.Role) PythonBaseOnly branch uses the wrong role."
     Assert-True ($branch.Contains(". (Join-Path `$PSScriptRoot 'Test-PythonBaseOnlyRuntimeAcl.ps1')")) "$($entry.Role) PythonBaseOnly helper boundary is absent."
     Assert-True ($branch.Contains('return')) "$($entry.Role) PythonBaseOnly mode must return before the default harness."
     Assert-True (-not $branch.Contains('C:\automaton\.venv')) "$($entry.Role) PythonBaseOnly branch references the active venv."
     Assert-True (-not $branch.Contains('.venv.new')) "$($entry.Role) PythonBaseOnly branch references the staging venv."
+    $stagingBranch = $entry.Source.Substring($stagingBranchStart, $defaultStart - $stagingBranchStart)
+    Assert-True ($stagingBranch.Contains("-Role '$($entry.Role)'")) "$($entry.Role) PythonStagingOnly branch uses the wrong role."
+    Assert-True ($stagingBranch.Contains(". (Join-Path `$PSScriptRoot 'Test-PythonStagingOnlyRuntimeAcl.ps1')")) "$($entry.Role) PythonStagingOnly helper boundary is absent."
+    Assert-True ($stagingBranch.Contains('return')) "$($entry.Role) PythonStagingOnly mode must return before the default harness."
+    Assert-True (-not $stagingBranch.Contains(".venv\Scripts")) "$($entry.Role) PythonStagingOnly branch references the active venv."
+    Assert-True ($entry.Source.Contains('if ($PythonBaseOnly -and $PythonStagingOnly)')) "$($entry.Role) isolated modes are not mutually exclusive."
 }
 Assert-True ($gateway.Contains("`$pythonExe = Join-Path `$workspace '.venv\Scripts\python.exe'")) 'Default Gateway harness no longer preserves its existing venv behavior.'
 Assert-True ($agent.Contains("Add-AgentStateCanaryTest `$agentStatePath")) 'Default Agent harness no longer preserves its existing behavior.'
@@ -278,6 +290,120 @@ Assert-True (-not (Test-PythonBaseOnlyIdentity 'S-1-5-21-wrong' $script:PythonBa
 Assert-True (-not (Test-PythonBaseOnlyExactPath 'C:\Program Files\OtherPython' $script:PythonBaseOnlyRoot)) 'A different Python path must fail closed.'
 Assert-True (-not (Test-PythonBaseOnlyReparseAttributes ([System.IO.FileAttributes]::Directory -bor [System.IO.FileAttributes]::ReparsePoint))) 'A reparse point must fail closed.'
 
+foreach ($forbiddenStagingOnly in @(
+    'import MetaTrader5', 'importlib.import_module("MetaTrader5")',
+    '.order_check(', '.order_send(', 'initialize()', 'login()',
+    'Set-Acl', 'SetAccessRule', 'SetOwner', 'takeown', 'icacls',
+    'Start-Service', 'New-Service', 'runas.exe', 'Start-Process'
+)) {
+    Assert-True (-not $pythonStagingOnly.Contains($forbiddenStagingOnly)) "PythonStagingOnly isolation violation: $forbiddenStagingOnly"
+}
+Assert-True `
+    (-not [regex]::IsMatch($pythonStagingOnly, 'C:\\automaton\\\.venv(?!\.new)')) `
+    'PythonStagingOnly references the active venv.'
+foreach ($requiredStagingOnly in @(
+    "`$script:PythonStagingOnlyRoot = 'C:\automaton\.venv.new'",
+    "`$script:PythonStagingOnlyExecutable = 'C:\automaton\.venv.new\Scripts\python.exe'",
+    "`$script:PythonStagingOnlyBase = 'C:\Program Files\AutomatonPython\3.14.5'",
+    'Test-PythonStagingOnlyExactPath', 'Test-PythonStagingOnlyTargetPresent',
+    'Test-PythonStagingOnlyIdentity', 'Test-PythonStagingOnlyReparseAttributes',
+    'Test-PythonStagingOnlyPathConfined', 'PYTHON_STAGING_REPARSE_POINT_FAIL_CLOSED',
+    'Resolve-PythonStagingOnlyAccessExpectation', 'Resolve-AgentPythonStagingExecutionExpectation',
+    '[System.Diagnostics.ProcessStartInfo]::new()', "`$startInfo.Arguments = '-I -'",
+    'RedirectStandardInput = $true', '$process.StandardInput.Write($Source)',
+    'UseShellExecute = $false', 'importlib.metadata.version("MetaTrader5")',
+    'can_import("fastapi")', 'can_import("pydantic")',
+    'can_import("yaml")', 'can_import("uvicorn")',
+    'STAGING_PATH_EXACT', 'STAGING_ENUMERATE', 'STAGING_PYTHON_READ',
+    'STAGING_PYTHON_PATH_EXACT', 'STAGING_BASE_REFERENCE_EXACT',
+    'STAGING_SITE_PACKAGES_READ', 'STAGING_PYTHON_EXECUTE',
+    'STAGING_FASTAPI_IMPORT', 'STAGING_PYDANTIC_IMPORT',
+    'STAGING_PYYAML_IMPORT', 'STAGING_UVICORN_IMPORT',
+    'STAGING_METATRADER5_METADATA', 'STAGING_METATRADER5_IMPORTED',
+    'STAGING_PYTHON_FUNCTIONAL_EXECUTION_DENY',
+    'STAGING_CREATE_FILE_DENY', 'STAGING_CREATE_DIRECTORY_DENY', 'STAGING_CREATE_DENY',
+    'STAGING_WRITE_DENY', 'STAGING_APPEND_DENY', 'STAGING_TRUNCATE_DENY',
+    'STAGING_RENAME_DENY', 'STAGING_DELETE_DENY', 'STAGING_WRITE_ATTRIBUTES_DENY',
+    'STAGING_CHANGE_ACL_DENY', 'STAGING_TAKE_OWNERSHIP_DENY',
+    "mode = 'PYTHON_STAGING_ONLY'", "trading_mode = 'OBSERVE_ONLY'",
+    'build_venv = $false', 'promote_venv = $false',
+    'active_venv_accessed = $false', 'active_venv_modified = $false',
+    'mt5_imported = $false', 'mt5_accessed = $false',
+    'order_check_called = $false', 'order_send_called = $false',
+    'gateway_started = $false', 'automaton_started = $false',
+    'acl_modified = $false', 'filesystem_staging_modified ='
+)) {
+    Assert-True ($pythonStagingOnly.Contains($requiredStagingOnly)) "PythonStagingOnly invariant missing: $requiredStagingOnly"
+}
+Assert-True ($pythonStagingOnly.Contains("`$roleStem = if (`$Role -eq 'AutomatonGateway') { 'gateway' } else { 'agent' }")) 'Staging report role stem is not canonical.'
+Assert-True ($pythonStagingOnly.Contains('"$roleStem-python-staging-$RunId.json"')) 'Staging report filename is not canonical.'
+Assert-True ($pythonStagingOnly.Contains('[System.IO.FileMode]::CreateNew')) 'PythonStagingOnly reports/canaries must be collision-resistant.'
+Assert-True ($pythonStagingOnly.Contains('public static extern bool CreateDirectory(')) 'PythonStagingOnly directory canaries must use atomic Win32 creation.'
+Assert-True (-not $pythonStagingOnly.Contains('[System.IO.FileMode]::Truncate')) 'PythonStagingOnly must not truncate real files.'
+Assert-True (-not $pythonStagingOnly.Contains('[System.IO.FileMode]::OpenOrCreate')) 'PythonStagingOnly must not reuse canaries.'
+
+. $pythonStagingOnlyPath
+Assert-True (Test-PythonStagingOnlyExactPath 'C:\automaton\.venv.new' $script:PythonStagingOnlyRoot) 'Exact staging path should pass.'
+Assert-True (-not (Test-PythonStagingOnlyExactPath 'C:\automaton\.venv.other' $script:PythonStagingOnlyRoot)) 'A different staging path must fail.'
+Assert-True (-not (Test-PythonStagingOnlyTargetPresent 'C:\automaton\.python-staging-only-definitely-absent')) 'A missing staging target must fail.'
+Assert-True (-not (Test-PythonStagingOnlyReparseAttributes ([System.IO.FileAttributes]::Directory -bor [System.IO.FileAttributes]::ReparsePoint))) 'A staging reparse point must fail.'
+Assert-True (-not (Test-PythonStagingOnlyIdentity 'S-1-5-21-wrong' $script:PythonStagingOnlyGatewaySid)) 'A wrong Gateway SID must fail.'
+Assert-True (-not (Test-PythonStagingOnlyIdentity 'S-1-5-21-wrong' $script:PythonStagingOnlyAgentSid)) 'A wrong Agent SID must fail.'
+Assert-True (-not (Test-PythonStagingOnlyPathConfined 'C:\automaton\outside.canary' $script:PythonStagingOnlyRoot)) 'A canary path outside staging must fail.'
+$validConfig = @(
+    'home = C:\Program Files\AutomatonPython\3.14.5',
+    'include-system-site-packages = false',
+    'version = 3.14.5',
+    'executable = C:\Program Files\AutomatonPython\3.14.5\python.exe'
+)
+Assert-True (Test-PythonStagingOnlyConfigRecord $validConfig) 'Exact machine-base pyvenv.cfg should pass.'
+$wrongConfig = @(
+    'home = C:\Users\unexpected\Python',
+    'include-system-site-packages = false',
+    'version = 3.14.5',
+    'executable = C:\Users\unexpected\Python\python.exe'
+)
+Assert-True (-not (Test-PythonStagingOnlyConfigRecord $wrongConfig)) 'A user-profile pyvenv.cfg must fail.'
+
+$gatewayRead = Resolve-PythonStagingOnlyAccessExpectation $true 0 $true
+Assert-True $gatewayRead.passed 'Expected staging read success must pass.'
+$gatewayExecute = Resolve-PythonStagingOnlyAccessExpectation $true 0 $true
+Assert-True $gatewayExecute.passed 'Expected Gateway staging execution success must pass.'
+$mutationAllowed = Resolve-PythonStagingOnlyAccessExpectation $true 0 $false
+Assert-True (-not $mutationAllowed.passed -and $mutationAllowed.critical) 'Any staging mutation success must be critical.'
+
+$validMetadata = [pscustomobject]@{
+    imports = [pscustomobject]@{ fastapi = $true; pydantic = $true; yaml = $true; uvicorn = $true }
+    mt5_metadata = '5.0.6090'
+    mt5_imported = $false
+}
+foreach ($property in @('fastapi', 'pydantic', 'yaml', 'uvicorn')) {
+    Assert-True (Test-PythonStagingOnlyImportGate $validMetadata $property) "Valid $property import should pass."
+    $failedMetadata = [pscustomobject]@{
+        imports = [pscustomobject]@{ fastapi = $true; pydantic = $true; yaml = $true; uvicorn = $true }
+        mt5_metadata = '5.0.6090'
+        mt5_imported = $false
+    }
+    $failedMetadata.imports.$property = $false
+    Assert-True (-not (Test-PythonStagingOnlyImportGate $failedMetadata $property)) "Failed $property import must fail."
+}
+Assert-True (Test-PythonStagingOnlyMt5Metadata $validMetadata) 'Exact MetaTrader5 metadata should pass.'
+$wrongMt5 = [pscustomobject]@{ mt5_metadata = '0.0.0'; mt5_imported = $false }
+Assert-True (-not (Test-PythonStagingOnlyMt5Metadata $wrongMt5)) 'Wrong MetaTrader5 metadata must fail.'
+$importedMt5 = [pscustomobject]@{ mt5_metadata = '5.0.6090'; mt5_imported = $true }
+Assert-True (-not (Test-PythonStagingOnlyMt5NotImported $importedMt5)) 'A loaded MetaTrader5 module must fail.'
+
+$agentAccessDenied = Resolve-AgentPythonStagingExecutionExpectation $false $null $false 5
+Assert-True $agentAccessDenied.passed 'Agent process-start AccessDenied must pass the denial gate.'
+$agentNonzero = Resolve-AgentPythonStagingExecutionExpectation $true 1 $false 0
+Assert-True $agentNonzero.passed 'Agent nonzero execution without marker must pass the denial gate.'
+$agentExitZero = Resolve-AgentPythonStagingExecutionExpectation $true 0 $false 0
+Assert-True (-not $agentExitZero.passed -and $agentExitZero.critical) 'Agent exit code zero must fail critically.'
+$agentMarker = Resolve-AgentPythonStagingExecutionExpectation $true 1 $true 0
+Assert-True (-not $agentMarker.passed -and $agentMarker.critical) 'Agent success marker must fail critically.'
+$agentStartError = Resolve-AgentPythonStagingExecutionExpectation $false $null $false 2
+Assert-True (-not $agentStartError.passed -and $agentStartError.infrastructure_error) 'Unexpected Agent process-start errors must be infrastructure failures.'
+
 Assert-True ($collector.Contains('#Requires -RunAsAdministrator')) 'Collector must require elevation.'
 foreach ($required in @(
     'before_sha256', 'append_sha256', 'PREFIX_OR_SUFFIX_HASH_MISMATCH',
@@ -332,4 +458,15 @@ Assert-True `
     PYTHON_BASE_ONLY_NO_ACL_OR_SERVICE_MUTATION = 'PASS'
     PYTHON_BASE_ONLY_CRITICAL_FAIL_STOP = 'PASS'
     PYTHON_BASE_ONLY_ATOMIC_DIRECTORY_CANARY = 'PASS'
+    PYTHON_STAGING_ONLY_DEFAULT_GATEWAY_UNCHANGED = 'PASS'
+    PYTHON_STAGING_ONLY_DEFAULT_AGENT_UNCHANGED = 'PASS'
+    PYTHON_STAGING_ONLY_BASE_MODE_UNCHANGED = 'PASS'
+    PYTHON_STAGING_ONLY_ACTIVE_VENV_ISOLATED = 'PASS'
+    PYTHON_STAGING_ONLY_IDENTITY_PATH_REPARSE_FAIL_CLOSED = 'PASS'
+    PYTHON_STAGING_ONLY_GATEWAY_READ_EXECUTE = 'PASS'
+    PYTHON_STAGING_ONLY_GATEWAY_IMPORTS = 'PASS'
+    PYTHON_STAGING_ONLY_MT5_METADATA_WITHOUT_IMPORT = 'PASS'
+    PYTHON_STAGING_ONLY_AGENT_DENIAL_SEMANTICS = 'PASS'
+    PYTHON_STAGING_ONLY_MUTATION_FAIL_CLOSED = 'PASS'
+    PYTHON_STAGING_ONLY_NO_ACL_SERVICE_MT5_ORDERS = 'PASS'
 } | ConvertTo-Json

@@ -38,6 +38,7 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn('"scripts/Test-AgentRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Test-GatewayRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Test-PythonBaseOnlyRuntimeAcl.ps1"', source)
+        self.assertIn('"scripts/Test-PythonStagingOnlyRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Collect-RuntimeAclResults.ps1"', source)
         self.assertIn('"scripts/Install-TradingLabPythonRuntime.ps1"', source)
         self.assertIn('"scripts/TradingLabPythonInventory.ps1"', source)
@@ -237,16 +238,22 @@ class SourceBoundaryTests(unittest.TestCase):
         base_only = (ROOT / "scripts" / "Test-PythonBaseOnlyRuntimeAcl.ps1").read_text(
             encoding="utf-8"
         )
+        staging_only = (
+            ROOT / "scripts" / "Test-PythonStagingOnlyRuntimeAcl.ps1"
+        ).read_text(encoding="utf-8")
         collector = (ROOT / "scripts" / "Collect-RuntimeAclResults.ps1").read_text(encoding="utf-8")
         pattern = re.compile(r"\$(?:\w+Source|source)\s*=\s*@'\n(.*?)\n'@", re.DOTALL)
         gateway_blocks = pattern.findall(gateway)
         base_only_blocks = pattern.findall(base_only)
+        staging_only_blocks = pattern.findall(staging_only)
         collector_blocks = pattern.findall(collector)
         self.assertEqual(6, len(gateway_blocks))
         self.assertEqual(1, len(base_only_blocks))
+        self.assertEqual(1, len(staging_only_blocks))
         self.assertEqual(1, len(collector_blocks))
         for index, block in enumerate(
-            [*gateway_blocks, *base_only_blocks, *collector_blocks], start=1
+            [*gateway_blocks, *base_only_blocks, *staging_only_blocks, *collector_blocks],
+            start=1,
         ):
             compile(block, f"<runtime-acl-inline-{index}>", "exec")
         self.assertNotIn("2>&1", gateway)
@@ -271,6 +278,7 @@ class SourceBoundaryTests(unittest.TestCase):
                 "disable_trading.ps1",
                 "Test-GatewayRuntimeAcl.ps1",
                 "Test-PythonBaseOnlyRuntimeAcl.ps1",
+                "Test-PythonStagingOnlyRuntimeAcl.ps1",
                 "Collect-RuntimeAclResults.ps1",
                 "Install-TradingLabPythonRuntime.ps1",
                 "TradingLabPythonInventory.ps1",
@@ -425,6 +433,47 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn("$env:TMP = $canonicalTemp", environment)
         self.assertIn("$env:PYTHONDONTWRITEBYTECODE = '1'", environment)
         self.assertNotIn("Windows\\TEMP", environment)
+
+    def test_python_staging_runtime_gate_has_strict_boundaries(self) -> None:
+        staging = (
+            ROOT / "scripts" / "Test-PythonStagingOnlyRuntimeAcl.ps1"
+        ).read_text(encoding="utf-8")
+        gateway = (ROOT / "scripts" / "Test-GatewayRuntimeAcl.ps1").read_text(
+            encoding="utf-8"
+        )
+        agent = (ROOT / "scripts" / "Test-AgentRuntimeAcl.ps1").read_text(
+            encoding="utf-8"
+        )
+        for harness, role in ((gateway, "AutomatonGateway"), (agent, "AutomatonAgent")):
+            self.assertIn("[switch] $PythonStagingOnly", harness)
+            self.assertIn("if ($PythonBaseOnly -and $PythonStagingOnly)", harness)
+            self.assertIn("Test-PythonStagingOnlyRuntimeAcl.ps1", harness)
+            self.assertIn(f"-Role '{role}'", harness)
+        self.assertIn("C:\\automaton\\.venv.new\\Scripts\\python.exe", staging)
+        self.assertIsNone(re.search(r"C:\\automaton\\\.venv(?!\.new)", staging))
+        self.assertIn("UseShellExecute = $false", staging)
+        self.assertIn("RedirectStandardInput = $true", staging)
+        self.assertIn('importlib.metadata.version("MetaTrader5")', staging)
+        self.assertNotIn("import MetaTrader5", staging)
+        self.assertNotIn('importlib.import_module("MetaTrader5")', staging)
+        self.assertNotIn("Set-Acl", staging)
+        self.assertNotIn("Start-Service", staging)
+        self.assertNotIn(".order_check(", staging)
+        self.assertNotIn(".order_send(", staging)
+        for boundary in (
+            "build_venv = $false",
+            "promote_venv = $false",
+            "active_venv_accessed = $false",
+            "active_venv_modified = $false",
+            "mt5_imported = $false",
+            "mt5_accessed = $false",
+            "order_check_called = $false",
+            "order_send_called = $false",
+            "gateway_started = $false",
+            "automaton_started = $false",
+            "acl_modified = $false",
+        ):
+            self.assertIn(boundary, staging)
 
     def test_machine_runtime_acl_resume_is_exact_target_and_dry_run_safe(self) -> None:
         installer = (ROOT / "scripts" / "Install-TradingLabPythonRuntime.ps1").read_text(

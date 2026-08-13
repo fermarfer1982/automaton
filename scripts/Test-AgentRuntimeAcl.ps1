@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
     [string] $RunId,
-    [switch] $PythonBaseOnly
+    [switch] $PythonBaseOnly,
+    [switch] $PythonStagingOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,6 +22,9 @@ if ($principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administ
 }
 
 $normalizedRunId = $RunId.ToLowerInvariant()
+if ($PythonBaseOnly -and $PythonStagingOnly) {
+    throw 'Select only one isolated runtime ACL mode.'
+}
 if ($PythonBaseOnly) {
     . (Join-Path $PSScriptRoot 'Test-PythonBaseOnlyRuntimeAcl.ps1')
     $baseOnlyResult = Invoke-TradingLabPythonBaseOnlyRuntimeAcl `
@@ -29,6 +33,16 @@ if ($PythonBaseOnly) {
             [System.Security.Principal.WindowsBuiltInRole]::Administrator
         )
     if ($baseOnlyResult.exit_code -ne 0) { exit $baseOnlyResult.exit_code }
+    return
+}
+if ($PythonStagingOnly) {
+    . (Join-Path $PSScriptRoot 'Test-PythonStagingOnlyRuntimeAcl.ps1')
+    $stagingOnlyResult = Invoke-TradingLabPythonStagingOnlyRuntimeAcl `
+        -Role 'AutomatonAgent' -RunId $normalizedRunId `
+        -EffectiveSid $effectiveSid -AdministrativeToken $principal.IsInRole(
+            [System.Security.Principal.WindowsBuiltInRole]::Administrator
+        )
+    if ($stagingOnlyResult.exit_code -ne 0) { exit $stagingOnlyResult.exit_code }
     return
 }
 $agentStatePath = 'C:\Users\AutomatonAgent\.automaton'
