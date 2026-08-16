@@ -858,6 +858,40 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertNotIn("MetaTrader5", sources)
         self.assertNotIn("DEMO_EXECUTION", (ROOT / "src" / "self-mod" / "code.ts").read_text(encoding="utf-8"))
 
+    def test_gateway_acl_verifier_uses_read_only_per_target_maintenance_policy(self) -> None:
+        verifier = (ROOT / "trading_lab" / "windows_acl.py").read_text(encoding="utf-8")
+        bootstrap = (ROOT / "scripts" / "TradingLabAclBootstrap.ps1").read_text(
+            encoding="utf-8"
+        )
+        initializer = (ROOT / "scripts" / "Initialize-TradingLabAcl.ps1").read_text(
+            encoding="utf-8"
+        )
+        policy = json.loads(
+            (ROOT / "config" / "windows-acl-policy.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            {
+                "automaton_state",
+                "gateway_logs",
+                "lab_root",
+                "logs_root",
+                "operational",
+                "security_logs",
+            },
+            set(policy["maintenance_targets"]),
+        )
+        self.assertNotIn("S-1-5-21-568964486-193631783-1609210587-1001", verifier)
+        self.assertNotIn("Proyecto IA", verifier)
+        self.assertIn("maintenance_identity", verifier)
+        self.assertIn("maintenance_sid not in admin_members", verifier)
+        self.assertIn("maintenance_policy.maintenance_targets.get(policy_key)", verifier)
+        self.assertIn("Read-TradingLabWindowsAclPolicy", bootstrap)
+        self.assertIn("config\\windows-acl-policy.json", initializer)
+        for forbidden in ("Set-Acl", "icacls", "/grant", "/reset"):
+            self.assertNotIn(forbidden, verifier)
+        for mt5_boundary in ("MetaTrader5", "order_check", "order_send"):
+            self.assertNotIn(mt5_boundary, verifier)
+
 
 if __name__ == "__main__":
     unittest.main()

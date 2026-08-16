@@ -1,5 +1,56 @@
 Set-StrictMode -Version 2.0
 
+function Read-TradingLabWindowsAclPolicy([string] $PolicyPath) {
+    if (-not [System.IO.Path]::IsPathRooted($PolicyPath) -or
+        -not (Test-Path -LiteralPath $PolicyPath -PathType Leaf)) {
+        throw 'Windows ACL policy must be an existing absolute file.'
+    }
+    $item = Get-Item -LiteralPath $PolicyPath -Force
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint -or $item.Length -gt 32768) {
+        throw 'Windows ACL policy path is unsafe.'
+    }
+    $policy = [System.IO.File]::ReadAllText($PolicyPath, [System.Text.Encoding]::UTF8) |
+        ConvertFrom-Json
+    $topLevel = @($policy.PSObject.Properties.Name | Sort-Object)
+    if (($topLevel -join ',') -ne 'maintenance_identity,maintenance_targets,schema_version' -or
+        $policy.schema_version -ne 1 -or
+        -not ($policy.maintenance_identity -is [string]) -or
+        [string]::IsNullOrWhiteSpace($policy.maintenance_identity) -or
+        $policy.maintenance_identity -match '^S-' -or
+        $policy.maintenance_identity -notmatch '\\') {
+        throw 'Windows ACL policy schema or maintenance identity is invalid.'
+    }
+    $expectedTargets = @(
+        'automaton_state', 'gateway_logs', 'lab_root',
+        'logs_root', 'operational', 'security_logs'
+    )
+    $actualTargets = @($policy.maintenance_targets.PSObject.Properties.Name | Sort-Object)
+    if (($actualTargets -join ',') -ne (($expectedTargets | Sort-Object) -join ',')) {
+        throw 'Windows ACL maintenance target allowlist is invalid.'
+    }
+    foreach ($target in $actualTargets) {
+        $entry = $policy.maintenance_targets.$target
+        $entryFields = @($entry.PSObject.Properties.Name | Sort-Object)
+        $inheritance = @($entry.inheritance_flags | Sort-Object)
+        if (($entryFields -join ',') -ne 'inheritance_flags,propagation_flags,rights' -or
+            $entry.rights -ne 'FullControl' -or
+            ($inheritance -join ',') -ne 'ContainerInherit,ObjectInherit' -or
+            @($entry.propagation_flags).Count -ne 0) {
+            throw "Windows ACL maintenance policy is malformed for $target."
+        }
+    }
+    return $policy
+}
+
+function Resolve-TradingLabAclIdentitySid([string] $Identity) {
+    if ($Identity -match '^S-\d(-\d+)+$') {
+        return [System.Security.Principal.SecurityIdentifier]::new($Identity)
+    }
+    return ([System.Security.Principal.NTAccount]::new($Identity)).Translate(
+        [System.Security.Principal.SecurityIdentifier]
+    )
+}
+
 function Test-ByteArrayEqual([byte[]] $First, [byte[]] $Second) {
     if ($First.Length -ne $Second.Length) { return $false }
     for ($index = 0; $index -lt $First.Length; $index++) {

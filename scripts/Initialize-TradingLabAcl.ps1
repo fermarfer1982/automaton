@@ -5,6 +5,7 @@ param(
     [string] $LabRoot = 'C:\ProgramData\AutomatonMT5Lab',
     [Parameter(Mandatory = $true)] [string] $AutomatonStateDir,
     [string] $WorkspaceRoot = 'C:\automaton',
+    [string] $AclPolicyPath,
     [string] $ProgressPath,
     [switch] $Apply
 )
@@ -27,12 +28,7 @@ function Test-PathOverlap([string] $First, [string] $Second) {
 }
 
 function Resolve-Sid([string] $Identity) {
-    if ($Identity -match '^S-\d(-\d+)+$') {
-        return [System.Security.Principal.SecurityIdentifier]::new($Identity)
-    }
-    return ([System.Security.Principal.NTAccount]::new($Identity)).Translate(
-        [System.Security.Principal.SecurityIdentifier]
-    )
+    return Resolve-TradingLabAclIdentitySid $Identity
 }
 
 function Test-IsElevated {
@@ -44,6 +40,13 @@ function Test-IsElevated {
 $root = Get-CanonicalPath $LabRoot
 $state = Get-CanonicalPath $AutomatonStateDir
 $workspace = Get-CanonicalPath $WorkspaceRoot
+$policyPath = if ([string]::IsNullOrWhiteSpace($AclPolicyPath)) {
+    Join-Path $workspace 'config\windows-acl-policy.json'
+} else { Get-CanonicalPath $AclPolicyPath }
+if ($policyPath -ne (Join-Path $workspace 'config\windows-acl-policy.json')) {
+    throw 'Windows ACL policy must be the reviewed workspace policy.'
+}
+$aclPolicy = Read-TradingLabWindowsAclPolicy $policyPath
 $control = Join-Path $root 'control'
 $configFile = Join-Path $control 'trading.yaml'
 $killSwitchFile = Join-Path $control 'STOP_TRADING'
@@ -78,8 +81,14 @@ $automatonSid = Resolve-Sid $AutomatonIdentity
 $systemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
 $administratorsSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
 $usersGroupSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+$maintenanceSid = Resolve-Sid $aclPolicy.maintenance_identity
 if ($gatewaySid.Value -eq $automatonSid.Value) {
     throw 'Gateway and Automaton identities must be distinct.'
+}
+if ($maintenanceSid.Value -in @(
+    $gatewaySid.Value, $automatonSid.Value, $systemSid.Value, $administratorsSid.Value
+)) {
+    throw 'Maintenance identity conflicts with a protected principal.'
 }
 function Get-DirectLocalGroupSids(
     [System.Security.Principal.SecurityIdentifier] $UserSid
@@ -119,6 +128,28 @@ $administratorMembers = @(Get-LocalGroupMember -SID $administratorsSid | ForEach
 if ($administratorMembers -contains $gatewaySid.Value -or $administratorMembers -contains $automatonSid.Value) {
     throw 'Gateway and Automaton identities must be non-administrators.'
 }
+$maintenanceUser = Get-LocalUser -SID $maintenanceSid -ErrorAction Stop
+if (-not $maintenanceUser.Enabled -or $maintenanceUser.PrincipalSource.ToString() -ne 'Local' -or
+    $administratorMembers -notcontains $maintenanceSid.Value) {
+    throw 'Maintenance identity must be an enabled local direct Administrator.'
+}
+$maintenanceTargetKeys = [System.Collections.Generic.HashSet[string]]::new(
+    [string[]]@($aclPolicy.maintenance_targets.PSObject.Properties.Name),
+    [System.StringComparer]::Ordinal
+)
+
+function Get-MaintenanceTargetKey([string] $Path) {
+    $canonical = Get-CanonicalPath $Path
+    $byPath = @{}
+    $byPath[(Get-CanonicalPath $root)] = 'lab_root'
+    $byPath[(Get-CanonicalPath $operational)] = 'operational'
+    $byPath[(Get-CanonicalPath $logs)] = 'logs_root'
+    $byPath[(Get-CanonicalPath $gatewayLogs)] = 'gateway_logs'
+    $byPath[(Get-CanonicalPath $securityLogs)] = 'security_logs'
+    $byPath[(Get-CanonicalPath $state)] = 'automaton_state'
+    if ($byPath.ContainsKey($canonical)) { return $byPath[$canonical] }
+    return $null
+}
 
 function New-AclProposal(
     [string] $Path,
@@ -128,6 +159,7 @@ function New-AclProposal(
     [string] $ChildPropagation,
     [string[]] $RepresentativeTargets
 ) {
+    $policyKey = Get-MaintenanceTargetKey $Path
     $entries = [System.Collections.Generic.List[object]]::new()
     $entries.Add([pscustomobject]@{
         principal = 'NT AUTHORITY\SYSTEM'; sid = $systemSid.Value
@@ -137,6 +169,12 @@ function New-AclProposal(
         principal = 'BUILTIN\Administrators'; sid = $administratorsSid.Value
         rights = 'FullControl'; type = 'Allow'
     })
+    if ($null -ne $policyKey -and $maintenanceTargetKeys.Contains($policyKey)) {
+        $entries.Add([pscustomobject]@{
+            principal = $aclPolicy.maintenance_identity; sid = $maintenanceSid.Value
+            rights = 'FullControl'; type = 'Allow'
+        })
+    }
     for ($index = 0; $index -lt $Principals.Count; $index++) {
         $entries.Add([pscustomobject]@{
             principal = $Principals[$index].Value; sid = $Principals[$index].Value
@@ -145,6 +183,7 @@ function New-AclProposal(
     }
     return [pscustomobject]@{
         path = $Path
+        policy_key = $policyKey
         domain = $Domain
         inheritance_protected = $true
         inherited_aces_preserved = $false
@@ -228,6 +267,8 @@ $plan = [pscustomobject]@{
     apply = [bool]$Apply
     gateway_sid = $gatewaySid.Value
     automaton_sid = $automatonSid.Value
+    maintenance_identity = $aclPolicy.maintenance_identity
+    maintenance_sid = $maintenanceSid.Value
     identity_checks = @($identityChecks)
     owner = 'BUILTIN\Administrators'
     inheritance = 'protected; inherited ACEs removed; explicit Allow ACEs only'
@@ -313,7 +354,8 @@ function Set-ExactAcl(
     [System.Security.Principal.SecurityIdentifier[]] $Principals,
     [System.Security.AccessControl.FileSystemRights[]] $Rights,
     [bool] $Directory,
-    [bool] $RuntimeRulesPropagate
+    [bool] $RuntimeRulesPropagate,
+    [string] $MaintenancePolicyKey = ''
 ) {
     $security = if ($Directory) {
         [System.Security.AccessControl.DirectorySecurity]::new()
@@ -324,6 +366,12 @@ function Set-ExactAcl(
     $security.SetAccessRuleProtection($true, $false)
     $security.AddAccessRule((New-AccessRule $systemSid ([System.Security.AccessControl.FileSystemRights]::FullControl) $Directory $Directory))
     $security.AddAccessRule((New-AccessRule $administratorsSid ([System.Security.AccessControl.FileSystemRights]::FullControl) $Directory $Directory))
+    if ($MaintenancePolicyKey) {
+        if (-not $maintenanceTargetKeys.Contains($MaintenancePolicyKey)) {
+            throw "Unknown maintenance ACL policy key: $MaintenancePolicyKey"
+        }
+        $security.AddAccessRule((New-AccessRule $maintenanceSid ([System.Security.AccessControl.FileSystemRights]::FullControl) $Directory $Directory))
+    }
     for ($index = 0; $index -lt $Principals.Count; $index++) {
         $security.AddAccessRule((New-AccessRule $Principals[$index] $Rights[$index] $Directory $RuntimeRulesPropagate))
     }
@@ -344,11 +392,12 @@ function Set-ExactAcl(
 function Set-ExactTreeAcl(
     [string] $Path,
     [System.Security.Principal.SecurityIdentifier[]] $Principals,
-    [System.Security.AccessControl.FileSystemRights[]] $Rights
+    [System.Security.AccessControl.FileSystemRights[]] $Rights,
+    [string] $MaintenancePolicyKey = ''
 ) {
-    Set-ExactAcl $Path $Principals $Rights $true $true
+    Set-ExactAcl $Path $Principals $Rights $true $true $MaintenancePolicyKey
     foreach ($item in Get-ChildItem -LiteralPath $Path -Force -Recurse) {
-        Set-ExactAcl $item.FullName $Principals $Rights ([bool]$item.PSIsContainer) ([bool]$item.PSIsContainer)
+        Set-ExactAcl $item.FullName $Principals $Rights ([bool]$item.PSIsContainer) ([bool]$item.PSIsContainer) $MaintenancePolicyKey
     }
 }
 
@@ -361,7 +410,7 @@ $appendOnly = [System.Security.AccessControl.FileSystemRights](
     [int][System.Security.AccessControl.FileSystemRights]::Synchronize
 )
 
-Set-ExactAcl $root @($gatewaySid, $automatonSid) @($readExecute, $readExecute) $true $false
+Set-ExactAcl $root @($gatewaySid, $automatonSid) @($readExecute, $readExecute) $true $false 'lab_root'
 Set-ExactAcl $workspace @($gatewaySid, $automatonSid) @($readExecute, $readExecute) $true $true
 foreach ($protectedSourceDirectory in $protectedSourceDirectories) {
     Set-ExactTreeAcl $protectedSourceDirectory @($gatewaySid, $automatonSid) @($readExecute, $readExecute)
@@ -388,16 +437,16 @@ if (Test-Path -LiteralPath $demoAuthorizationFile -PathType Leaf) {
 }
 Set-ExactAcl $ipc @($gatewaySid, $automatonSid) @($readExecute, $readExecute) $true $false
 Set-ExactAcl $apiKeyFile @($gatewaySid, $automatonSid) @($read, $read) $false $false
-Set-ExactTreeAcl $operational @($gatewaySid) @($modify)
+Set-ExactTreeAcl $operational @($gatewaySid) @($modify) 'operational'
 Set-ExactTreeAcl $research @($gatewaySid) @($modify)
 Set-ExactAcl $audit @($gatewaySid) @($readExecute) $true $false
 Set-ExactTreeAcl $auditSqlite @($gatewaySid) @($modify)
 Set-ExactAcl $auditJournal @($gatewaySid) @($readExecute) $true $false
 Set-ExactAcl $auditJournalFile @($gatewaySid) @($appendOnly) $false $false
-Set-ExactAcl $logs @($gatewaySid) @($readExecute) $true $false
-Set-ExactTreeAcl $gatewayLogs @($gatewaySid) @($modify)
-Set-ExactAcl $securityLogs @($gatewaySid) @($readExecute) $true $false
+Set-ExactAcl $logs @($gatewaySid) @($readExecute) $true $false 'logs_root'
+Set-ExactTreeAcl $gatewayLogs @($gatewaySid) @($modify) 'gateway_logs'
+Set-ExactAcl $securityLogs @($gatewaySid) @($readExecute) $true $false 'security_logs'
 Set-ExactAcl $securityLogFile @($gatewaySid) @($appendOnly) $false $false
-Set-ExactTreeAcl $state @($automatonSid) @($modify)
+Set-ExactTreeAcl $state @($automatonSid) @($modify) 'automaton_state'
 
 Write-Host 'Least-privilege ACLs applied. DEMO_EXECUTION remains disabled.'

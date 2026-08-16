@@ -36,6 +36,8 @@ $report = [ordered]@{
     demo_execution_enabled = $false
     trading_mode = 'OBSERVE_ONLY'
     account_configured = $false
+    maintenance_identity = $null
+    maintenance_sid = $null
     paths_created = @()
     prepared_state_verified = $false
     ipc_secret_created = $false
@@ -49,6 +51,9 @@ $report = [ordered]@{
     error = $null
 }
 . (Join-Path $PSScriptRoot 'TradingLabAclBootstrap.ps1')
+$aclPolicyPath = Join-Path $workspace 'config\windows-acl-policy.json'
+$aclPolicy = $null
+$maintenanceSid = $null
 $progressPath = $ReportPath + '.acl-progress.jsonl'
 
 function Get-CanonicalPath([string] $Value) {
@@ -179,6 +184,19 @@ function Assert-NoUnexpectedAllow($Snapshot, [string[]] $AllowedSids) {
     }
 }
 
+function Assert-ExactMaintenanceAllow($Snapshot) {
+    $rules = @($Snapshot.rules | Where-Object {
+        $_.sid -eq $maintenanceSid -and $_.type -eq 'Allow'
+    })
+    if ($rules.Count -ne 1 -or
+        [int64]$rules[0].rights -ne $fullControl -or
+        [bool]$rules[0].inherited -or
+        $rules[0].inheritance_flags -ne 'ContainerInherit, ObjectInherit' -or
+        $rules[0].propagation_flags -ne 'None') {
+        throw "Maintenance ACE does not match the exact per-target policy on $($Snapshot.path)."
+    }
+}
+
 function Invoke-Test([string] $Name, [scriptblock] $Command, [string] $LogPath) {
     try {
         & $Command *> $LogPath
@@ -200,6 +218,20 @@ try {
     if (-not $currentPrincipal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
         throw 'ACL gate requires an elevated Administrator token.'
     }
+    $aclPolicy = Read-TradingLabWindowsAclPolicy $aclPolicyPath
+    $maintenanceSid = (Resolve-TradingLabAclIdentitySid $aclPolicy.maintenance_identity).Value
+    if ($maintenanceSid -in @($systemSid, $administratorsSid, $gatewaySid, $agentSid)) {
+        throw 'Maintenance identity conflicts with a protected principal.'
+    }
+    $maintenanceUser = Get-LocalUser -SID $([System.Security.Principal.SecurityIdentifier]::new($maintenanceSid)) -ErrorAction Stop
+    $administratorMembers = @(Get-LocalGroupMember -SID $([System.Security.Principal.SecurityIdentifier]::new($administratorsSid)) |
+        ForEach-Object { $_.SID.Value })
+    if (-not $maintenanceUser.Enabled -or $maintenanceUser.PrincipalSource.ToString() -ne 'Local' -or
+        $administratorMembers -notcontains $maintenanceSid) {
+        throw 'Maintenance identity must be an enabled local direct Administrator.'
+    }
+    $report.maintenance_identity = $aclPolicy.maintenance_identity
+    $report.maintenance_sid = $maintenanceSid
     if ((Get-CanonicalPath $workspace) -ne 'C:\automaton') {
         throw 'Unexpected workspace path.'
     }
@@ -273,6 +305,7 @@ try {
         audit_journal_directory = (Join-Path $labRoot 'audit\journal')
         audit_journal = (Join-Path $labRoot 'audit\journal\audit.jsonl')
         gateway_logs = (Join-Path $labRoot 'logs\gateway')
+        logs = (Join-Path $labRoot 'logs')
         security_logs_directory = (Join-Path $labRoot 'logs\security')
         security_log = (Join-Path $labRoot 'logs\security\security.log')
         agent_state = $agentState
@@ -288,14 +321,20 @@ try {
     }
 
     Assert-NoUnexpectedAllow $snapshots.workspace @($systemSid, $administratorsSid, $gatewaySid, $agentSid)
-    Assert-NoUnexpectedAllow $snapshots.programdata @($systemSid, $administratorsSid, $gatewaySid, $agentSid)
-    foreach ($name in @('control', 'config', 'demo_authorization', 'operational', 'research', 'audit_sqlite', 'audit_journal_directory', 'audit_journal', 'gateway_logs', 'security_logs_directory', 'security_log')) {
+    Assert-NoUnexpectedAllow $snapshots.programdata @($systemSid, $administratorsSid, $maintenanceSid, $gatewaySid, $agentSid)
+    foreach ($name in @('control', 'config', 'demo_authorization', 'research', 'audit_sqlite', 'audit_journal_directory', 'audit_journal', 'security_log')) {
         Assert-NoUnexpectedAllow $snapshots[$name] @($systemSid, $administratorsSid, $gatewaySid)
+    }
+    foreach ($name in @('operational', 'logs', 'gateway_logs', 'security_logs_directory')) {
+        Assert-NoUnexpectedAllow $snapshots[$name] @($systemSid, $administratorsSid, $maintenanceSid, $gatewaySid)
+        Assert-ExactMaintenanceAllow $snapshots[$name]
     }
     foreach ($name in @('ipc', 'ipc_key')) {
         Assert-NoUnexpectedAllow $snapshots[$name] @($systemSid, $administratorsSid, $gatewaySid, $agentSid)
     }
-    Assert-NoUnexpectedAllow $snapshots.agent_state @($systemSid, $administratorsSid, $agentSid)
+    Assert-NoUnexpectedAllow $snapshots.agent_state @($systemSid, $administratorsSid, $maintenanceSid, $agentSid)
+    Assert-ExactMaintenanceAllow $snapshots.programdata
+    Assert-ExactMaintenanceAllow $snapshots.agent_state
 
     $workspaceAgent = Get-AllowRights $snapshots.workspace $agentSid
     $workspaceGateway = Get-AllowRights $snapshots.workspace $gatewaySid

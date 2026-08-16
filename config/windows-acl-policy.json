@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "maintenance_identity": "DESKTOP-QPK9UQ5\\Proyecto IA",
+  "maintenance_targets": {
+    "automaton_state": {
+      "rights": "FullControl",
+      "inheritance_flags": ["ContainerInherit", "ObjectInherit"],
+      "propagation_flags": []
+    },
+    "gateway_logs": {
+      "rights": "FullControl",
+      "inheritance_flags": ["ContainerInherit", "ObjectInherit"],
+      "propagation_flags": []
+    },
+    "lab_root": {
+      "rights": "FullControl",
+      "inheritance_flags": ["ContainerInherit", "ObjectInherit"],
+      "propagation_flags": []
+    },
+    "logs_root": {
+      "rights": "FullControl",
+      "inheritance_flags": ["ContainerInherit", "ObjectInherit"],
+      "propagation_flags": []
+    },
+    "operational": {
+      "rights": "FullControl",
+      "inheritance_flags": ["ContainerInherit", "ObjectInherit"],
+      "propagation_flags": []
+    },
+    "security_logs": {
+      "rights": "FullControl",
+      "inheritance_flags": ["ContainerInherit", "ObjectInherit"],
+      "propagation_flags": []
+    }
+  }
+}

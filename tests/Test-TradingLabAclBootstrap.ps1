@@ -2,6 +2,7 @@ $ErrorActionPreference = 'Stop'
 $workspace = Split-Path $PSScriptRoot -Parent
 $helperPath = Join-Path $workspace 'scripts\TradingLabAclBootstrap.ps1'
 $templatePath = Join-Path $workspace 'config\trading.bootstrap-observe-only.yaml'
+$aclPolicyPath = Join-Path $workspace 'config\windows-acl-policy.json'
 . $helperPath
 
 $helperSource = [System.IO.File]::ReadAllText($helperPath)
@@ -138,6 +139,15 @@ try {
 if ((Resolve-AclApplyFailureStatus 'NOT_RUN' 0) -ne 'NOT_RUN') {
     throw 'Case F pre-apply failure status is incorrect.'
 }
+
+$aclPolicy = Read-TradingLabWindowsAclPolicy $aclPolicyPath
+$maintenanceTargets = @($aclPolicy.maintenance_targets.PSObject.Properties.Name | Sort-Object)
+if (
+    $aclPolicy.maintenance_identity -ne 'DESKTOP-QPK9UQ5\Proyecto IA' -or
+    ($maintenanceTargets -join ',') -ne 'automaton_state,gateway_logs,lab_root,logs_root,operational,security_logs'
+) {
+    throw 'Canonical maintenance identity or per-target ACL policy is invalid.'
+}
 $caseG = New-TestRoot 'g'
 try {
     $progress = Join-Path $caseG 'progress.jsonl'
@@ -167,4 +177,6 @@ try {
     CASE_E_INVALID_SECRET_FAIL_CLOSED = 'PASS'
     CASE_F_PRE_APPLY_STATUS = 'PASS'
     CASE_G_PARTIAL_APPLY_STATUS = 'PASS'
+    MAINTENANCE_POLICY_CANONICAL = 'PASS'
+    MAINTENANCE_TARGET_ALLOWLIST_EXACT = 'PASS'
 } | ConvertTo-Json

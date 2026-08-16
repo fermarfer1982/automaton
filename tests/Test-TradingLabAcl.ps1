@@ -70,10 +70,31 @@ foreach ($required in @(
     "Protected source tree contains a reparse point",
     "sqlite_immutable = `$false",
     "deny_aces_used = `$false"
+    'Read-TradingLabWindowsAclPolicy'
+    'Maintenance identity must be an enabled local direct Administrator.'
+    "'lab_root'"
+    "'operational'"
+    "'logs_root'"
+    "'gateway_logs'"
+    "'security_logs'"
+    "'automaton_state'"
 )) {
     if (-not $source.Contains($required)) {
         throw "ACL source is missing required invariant: $required"
     }
+}
+foreach ($requiredPolicyBoundary in @(
+    'config\windows-acl-policy.json',
+    'Resolve-TradingLabAclIdentitySid',
+    '$maintenanceTargetKeys.Contains($MaintenancePolicyKey)',
+    'New-AccessRule $maintenanceSid ([System.Security.AccessControl.FileSystemRights]::FullControl'
+)) {
+    if (-not $source.Contains($requiredPolicyBoundary)) {
+        throw "ACL source does not consume the canonical maintenance policy: $requiredPolicyBoundary"
+    }
+}
+if ($source.Contains('S-1-5-21-568964486-193631783-1609210587-1001')) {
+    throw 'Maintenance SID must be resolved from the configured account name, not hardcoded.'
 }
 if ($source.Contains("gateway_writable_data") -or $source.Contains("Join-Path `$root 'data'")) {
     throw 'ACL source reintroduced a globally writable data domain.'

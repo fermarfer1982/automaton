@@ -19,33 +19,39 @@ permanecer detenidos hasta entonces.
   navegación o control se aplican al directorio; los ficheros nombrados reciben
   ACL exacta propia. Las ACE de recuperación se propagan a los hijos.
 
-| Dominio | Gateway | Agent | Propagación runtime |
-|---|---:|---:|---|
-| `C:\automaton` | RX | RX | contenedores y objetos |
-| raíz `AutomatonMT5Lab` | RX | RX | solo raíz |
-| `control` | RX | ninguna | solo directorio |
-| `control\trading.yaml` | R | ninguna | fichero |
-| `control\STOP_TRADING` | R si existe | ninguna | fichero humano opcional |
-| `control\demo-authorization` | RX | ninguna | solo directorio |
-| `...\authorization.json` | R si existe | ninguna | fichero humano opcional |
-| `ipc` | RX | RX | solo directorio |
-| `ipc\automaton.key` | R | R | fichero; sin execute |
-| `operational` | M | ninguna | contenedores y objetos |
-| `research` | M | ninguna | contenedores y objetos |
-| `audit` | RX | ninguna | solo directorio |
-| `audit\sqlite` | M | ninguna | contenedores y objetos |
-| `audit\journal` | RX | ninguna | solo directorio |
-| `audit\journal\audit.jsonl` | RA | ninguna | fichero precreado |
-| `logs` | RX | ninguna | solo directorio |
-| `logs\gateway` | M | ninguna | contenedores y objetos |
-| `logs\security` | RX | ninguna | solo directorio |
-| `logs\security\security.log` | RA | ninguna | fichero precreado |
-| `C:\Users\AutomatonAgent\.automaton` | ninguna | M | contenedores y objetos |
+| Dominio | Gateway | Agent | Maintenance | Propagación runtime |
+|---|---:|---:|---:|---|
+| `C:\automaton` | RX | RX | ninguna | contenedores y objetos |
+| raíz `AutomatonMT5Lab` | RX | RX | FullControl | solo raíz para runtime |
+| `control` | RX | ninguna | ninguna | solo directorio |
+| `control\trading.yaml` | R | ninguna | ninguna | fichero |
+| `control\STOP_TRADING` | R si existe | ninguna | ninguna | fichero humano opcional |
+| `control\demo-authorization` | RX | ninguna | ninguna | solo directorio |
+| `...\authorization.json` | R si existe | ninguna | ninguna | fichero humano opcional |
+| `ipc` | RX | RX | ninguna | solo directorio |
+| `ipc\automaton.key` | R | R | ninguna | fichero; sin execute |
+| `operational` | M | ninguna | FullControl | contenedores y objetos |
+| `research` | M | ninguna | ninguna | contenedores y objetos |
+| `audit` | RX | ninguna | ninguna | solo directorio |
+| `audit\sqlite` | M | ninguna | ninguna | contenedores y objetos |
+| `audit\journal` | RX | ninguna | ninguna | solo directorio |
+| `audit\journal\audit.jsonl` | RA | ninguna | ninguna | fichero precreado |
+| `logs` | RX | ninguna | FullControl | solo directorio para Gateway |
+| `logs\gateway` | M | ninguna | FullControl | contenedores y objetos |
+| `logs\security` | RX | ninguna | FullControl | solo directorio para Gateway |
+| `logs\security\security.log` | RA | ninguna | ninguna | fichero precreado |
+| `C:\Users\AutomatonAgent\.automaton` | ninguna | M | FullControl | contenedores y objetos |
 
 El ACL exacto de cada fila añade además `SYSTEM: FullControl` y
-`BUILTIN\Administrators: FullControl`, ambos `Allow`. No se concede ninguna ACE
-a `Authenticated Users`, `Everyone`, `BUILTIN\Users` ni al SID humano. El
-mantenimiento requiere una consola elevada y se apoya en Administrators/SYSTEM.
+`BUILTIN\Administrators: FullControl`, ambos `Allow`. La identidad humana de
+mantenimiento procede exclusivamente de `config/windows-acl-policy.json`, se
+configura por nombre de cuenta Windows y se resuelve a SID en runtime. Debe ser
+un usuario local habilitado y miembro directo de `BUILTIN\Administrators`; no
+puede coincidir con SYSTEM, Administrators, Gateway ni Agent. Su ACE explícita
+`FullControl` con `ContainerInherit,ObjectInherit` solo es válida en las filas
+marcadas en la tabla. En cualquier otro target, incluso otro usuario humano,
+es un principal inesperado y la verificación falla cerrada. No se concede
+ninguna ACE a `Authenticated Users`, `Everyone` ni `BUILTIN\Users`.
 El bootstrap no crea `STOP_TRADING` ni `authorization.json`: su ausencia no
 autoriza trading; solo indica que esas dos señales humanas opcionales no han
 sido afirmadas. Si un administrador las crea posteriormente, debe reaplicar o
