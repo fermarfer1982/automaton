@@ -42,6 +42,7 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn('"scripts/Test-PythonStagingOnlyRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Test-PythonFinalOnlyRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Test-GatewayHealthOnly.ps1"', source)
+        self.assertIn('"scripts/Test-SecurityAppendOnly.ps1"', source)
         self.assertIn('"scripts/Collect-RuntimeAclResults.ps1"', source)
         self.assertIn('"scripts/Install-TradingLabPythonRuntime.ps1"', source)
         self.assertIn('"scripts/TradingLabPythonInventory.ps1"', source)
@@ -245,18 +246,29 @@ class SourceBoundaryTests(unittest.TestCase):
         staging_only = (
             ROOT / "scripts" / "Test-PythonStagingOnlyRuntimeAcl.ps1"
         ).read_text(encoding="utf-8")
+        security_append_only = (
+            ROOT / "scripts" / "Test-SecurityAppendOnly.ps1"
+        ).read_text(encoding="utf-8")
         collector = (ROOT / "scripts" / "Collect-RuntimeAclResults.ps1").read_text(encoding="utf-8")
         pattern = re.compile(r"\$(?:\w+Source|source)\s*=\s*@'\n(.*?)\n'@", re.DOTALL)
         gateway_blocks = pattern.findall(gateway)
         base_only_blocks = pattern.findall(base_only)
         staging_only_blocks = pattern.findall(staging_only)
+        security_append_only_blocks = pattern.findall(security_append_only)
         collector_blocks = pattern.findall(collector)
         self.assertEqual(6, len(gateway_blocks))
         self.assertEqual(1, len(base_only_blocks))
         self.assertEqual(1, len(staging_only_blocks))
+        self.assertEqual(1, len(security_append_only_blocks))
         self.assertEqual(1, len(collector_blocks))
         for index, block in enumerate(
-            [*gateway_blocks, *base_only_blocks, *staging_only_blocks, *collector_blocks],
+            [
+                *gateway_blocks,
+                *base_only_blocks,
+                *staging_only_blocks,
+                *security_append_only_blocks,
+                *collector_blocks,
+            ],
             start=1,
         ):
             compile(block, f"<runtime-acl-inline-{index}>", "exec")
@@ -284,6 +296,7 @@ class SourceBoundaryTests(unittest.TestCase):
                 "Test-PythonBaseOnlyRuntimeAcl.ps1",
                 "Test-PythonStagingOnlyRuntimeAcl.ps1",
                 "Test-PythonFinalOnlyRuntimeAcl.ps1",
+                "Test-SecurityAppendOnly.ps1",
                 "Collect-RuntimeAclResults.ps1",
                 "Install-TradingLabPythonRuntime.ps1",
                 "TradingLabPythonInventory.ps1",

@@ -853,28 +853,31 @@ import json
 import logging
 import os
 import pathlib
-import time
+import sys
 
 path = pathlib.Path(os.environ["AUTOMATON_RUNTIME_TEST_SECURITY_LOG"])
 run_id = os.environ["AUTOMATON_RUNTIME_TEST_RUN_ID"]
+workspace = pathlib.Path(os.environ["AUTOMATON_RUNTIME_TEST_WORKSPACE"])
+if str(workspace) != r"C:\automaton" or workspace.is_symlink():
+    raise RuntimeError("WORKSPACE_IMPORT_ROOT_INVALID")
+sys.path.insert(0, str(workspace))
+from trading_lab.windows_append_log import WindowsAppendOnlyFileHandler
+
 before = path.read_bytes()
 logger = logging.getLogger("automaton.runtime_acl_canary." + run_id)
 logger.setLevel(logging.WARNING)
 logger.propagate = False
-handler = logging.FileHandler(path, mode="a", encoding="utf-8")
-formatter = logging.Formatter("%(asctime)sZ %(levelname)s %(name)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
-formatter.converter = time.gmtime
-handler.setFormatter(formatter)
+handler = WindowsAppendOnlyFileHandler()
+handler.setFormatter(logging.Formatter("%(message)s"))
 try:
     logger.addHandler(handler)
-    logger.warning("RUNTIME_ACL_CANARY run_id=%s", run_id)
-    handler.flush()
-    os.fsync(handler.stream.fileno())
+    logger.warning("SECURITY_APPEND_PROBE %s", run_id)
 finally:
     logger.removeHandler(handler)
     handler.close()
 after = path.read_bytes()
-if after[:len(before)] != before or len(after) <= len(before):
+expected = ("SECURITY_APPEND_PROBE " + run_id + "\n").encode("utf-8")
+if after[:len(before)] != before or after[len(before):] != expected:
     raise RuntimeError("IMMEDIATE_PREFIX_OR_SUFFIX_MISMATCH")
 appended = after[len(before):]
 result = {
@@ -888,9 +891,10 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
     $invocation = Invoke-LocalPythonJson $source @{
         AUTOMATON_RUNTIME_TEST_SECURITY_LOG = $securityLogPath
         AUTOMATON_RUNTIME_TEST_RUN_ID = $normalizedRunId
+        AUTOMATON_RUNTIME_TEST_WORKSPACE = $workspace
     } 'security-log-append'
     $script:securityLogEvidence = Assert-PythonInvocation `
-        'SECURITY_APPEND' $invocation 'PYTHON_FILEHANDLER_APPEND_FLUSH_FSYNC_SUCCEEDED'
+        'SECURITY_APPEND' $invocation 'WIN32_APPEND_ONLY_HANDLER_SUCCEEDED'
 }
 
 function Write-ExclusiveJsonReport([string] $Path, [object] $Value) {
@@ -966,6 +970,7 @@ try {
     Add-DeniedRightTest 'SECURITY_TRUNCATE' $securityLogPath $FILE_WRITE_DATA $false $true
     Add-DeniedRightTest 'SECURITY_DELETE' $securityLogPath $DELETE $false $true
     Add-DeniedRightTest 'SECURITY_RENAME' $securityLogPath $DELETE $false $true
+    Add-DeniedRightTest 'SECURITY_CREATE_OTHER' (Split-Path $securityLogPath -Parent) $FILE_ADD_FILE $true $true
     Add-DeniedRightTest 'SECURITY_REPLACE' (Split-Path $securityLogPath -Parent) $FILE_ADD_FILE $true $true
 
     Add-DeniedRightTest 'AGENT_STATE_READ' $agentStatePath $FILE_LIST_DIRECTORY $true $false

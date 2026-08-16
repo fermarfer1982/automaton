@@ -4,14 +4,22 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
+from trading_lab.windows_append_log import (
+    SECURITY_LOG_DIRECTORY,
+    WindowsAppendOnlyFileHandler,
+)
+
 
 def configure_gateway_logging(log_dir: Path | None, security_log_dir: Path | None) -> None:
     if log_dir is None or security_log_dir is None:
         raise RuntimeError("Separated external gateway and security log directories are required")
     if log_dir.is_symlink() or security_log_dir.is_symlink():
         raise RuntimeError("Gateway log directories cannot be symlinks")
+    if security_log_dir.absolute() != SECURITY_LOG_DIRECTORY:
+        raise RuntimeError("Security log directory is not the exact protected path")
     log_dir.mkdir(parents=True, exist_ok=True)
-    security_log_dir.mkdir(parents=True, exist_ok=True)
+    if not security_log_dir.exists() or not security_log_dir.is_dir():
+        raise RuntimeError("Pre-created security log directory is required")
     formatter = logging.Formatter(
         "%(asctime)sZ %(levelname)s %(name)s %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
@@ -41,12 +49,6 @@ def configure_gateway_logging(log_dir: Path | None, security_log_dir: Path | Non
     security_logger.setLevel(logging.INFO)
     security_logger.propagate = False
     if not security_logger.handlers:
-        # The file is pre-created by the elevated ACL setup.  Append mode avoids
-        # rotation/rename and is compatible with the proposed NTFS AppendData ACE.
-        security_handler = logging.FileHandler(
-            security_log_dir / "security.log",
-            mode="a",
-            encoding="utf-8",
-        )
+        security_handler = WindowsAppendOnlyFileHandler()
         security_handler.setFormatter(formatter)
         security_logger.addHandler(security_handler)

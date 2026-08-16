@@ -9,10 +9,11 @@ $pythonBaseOnlyPath = Join-Path $workspace 'scripts\Test-PythonBaseOnlyRuntimeAc
 $pythonStagingOnlyPath = Join-Path $workspace 'scripts\Test-PythonStagingOnlyRuntimeAcl.ps1'
 $pythonFinalOnlyPath = Join-Path $workspace 'scripts\Test-PythonFinalOnlyRuntimeAcl.ps1'
 $gatewayHealthOnlyPath = Join-Path $workspace 'scripts\Test-GatewayHealthOnly.ps1'
+$securityAppendOnlyPath = Join-Path $workspace 'scripts\Test-SecurityAppendOnly.ps1'
 $collectorPath = Join-Path $workspace 'scripts\Collect-RuntimeAclResults.ps1'
 $paths = @(
     $agentPath, $gatewayPath, $pythonBaseOnlyPath, $pythonStagingOnlyPath,
-    $pythonFinalOnlyPath, $collectorPath
+    $pythonFinalOnlyPath, $securityAppendOnlyPath, $collectorPath
 )
 
 function Assert-True([bool] $Condition, [string] $Message) {
@@ -56,6 +57,27 @@ $healthAst = [System.Management.Automation.Language.Parser]::ParseFile(
 )
 Assert-True ($healthParseErrors.Count -eq 0) 'Gateway health-only harness has AST errors.'
 $gatewayHealthOnly = [System.IO.File]::ReadAllText($gatewayHealthOnlyPath)
+$securityAppendOnly = $sources[$securityAppendOnlyPath]
+
+foreach ($required in @(
+    "mode = 'SECURITY_APPEND_ONLY'",
+    "`$securityLog = 'C:\ProgramData\AutomatonMT5Lab\logs\security\security.log'",
+    'SECURITY_APPEND_PROBE ',
+    'from trading_lab.windows_append_log import WindowsAppendOnlyFileHandler',
+    'FILE_WRITE_DATA | SYNCHRONIZE', 'DELETE | SYNCHRONIZE',
+    'FILE_LIST_DIRECTORY | FILE_ADD_FILE | SYNCHRONIZE',
+    'OPEN_EXISTING = 3', 'security_directory_other_files_modified = $false',
+    'mt5_imported = $false', 'acl_modified = $false'
+)) {
+    Assert-True ($securityAppendOnly.Contains($required)) "Security append-only probe is missing: $required"
+}
+foreach ($forbidden in @(
+    'Set-Acl', 'icacls', 'takeown', 'MetaTrader5.initialize',
+    'MetaTrader5.login', '.order_check(', '.order_send(', 'TRUNCATE_EXISTING',
+    '[System.IO.File]::Delete', '[System.IO.File]::Move'
+)) {
+    Assert-True (-not $securityAppendOnly.Contains($forbidden)) "Forbidden security append probe mutation: $forbidden"
+}
 
 Assert-True `
     ($agent.Contains('S-1-5-21-568964486-193631783-1609210587-1006')) `
@@ -181,7 +203,7 @@ foreach ($required in @(
     'OPERATIONAL_MODIFY', 'RESEARCH_MODIFY', 'SQLITE_WAL',
     'JOURNAL_APPEND', 'JOURNAL_READ', 'JOURNAL_OVERWRITE', 'JOURNAL_TRUNCATE',
     'JOURNAL_CREATE_OVERWRITE', 'JOURNAL_DELETE', 'JOURNAL_RENAME', 'JOURNAL_REPLACE', 'JOURNAL_CHANGE_ACL',
-    'SECURITY_APPEND', 'SECURITY_OVERWRITE', 'SECURITY_TRUNCATE', 'SECURITY_DELETE', 'SECURITY_RENAME', 'SECURITY_REPLACE',
+    'SECURITY_APPEND', 'SECURITY_OVERWRITE', 'SECURITY_TRUNCATE', 'SECURITY_DELETE', 'SECURITY_RENAME', 'SECURITY_CREATE_OTHER', 'SECURITY_REPLACE',
     'AGENT_STATE_READ', 'AGENT_STATE_WRITE', 'DEMO_AUTH_READ', 'DEMO_AUTH_CREATE', 'DEMO_AUTH_MODIFY', 'DEMO_AUTH_DELETE',
     'KILL_SWITCH_DETECT', 'KILL_SWITCH_CREATE', 'KILL_SWITCH_MODIFY', 'KILL_SWITCH_DELETE',
     'RUNTIME_TEMP_PRIVATE', 'RUNTIME_TEMP_CLEANUP'
@@ -191,7 +213,8 @@ foreach ($required in @(
 foreach ($required in @(
     'sqlite3.connect', 'PRAGMA journal_mode=WAL', '"-wal"', '"-shm"',
     'path.open("a", encoding="utf-8", newline="\n")', 'handle.flush()',
-    'os.fsync(handle.fileno())', 'logging.FileHandler(path, mode="a", encoding="utf-8")',
+    'os.fsync(handle.fileno())', 'from trading_lab.windows_append_log import WindowsAppendOnlyFileHandler',
+    'handler = WindowsAppendOnlyFileHandler()', 'SECURITY_APPEND_PROBE %s',
     'CRITICAL_FAIL:', 'PROTECTED_RIGHT_GRANTED_NO_MUTATION_PERFORMED'
 )) {
     Assert-True ($gateway.Contains($required)) "Gateway runtime primitive is missing: $required"
@@ -780,4 +803,8 @@ Assert-True `
     GATEWAY_HEALTH_ONLY_ASYNC_STREAM_CAPTURE = 'PASS'
     GATEWAY_HEALTH_ONLY_EARLY_EXIT_CLASSIFICATION = 'PASS'
     GATEWAY_HEALTH_ONLY_BOUNDED_DIAGNOSTICS = 'PASS'
+    SECURITY_APPEND_ONLY_PROBE_AST = 'PASS'
+    SECURITY_APPEND_ONLY_EXACT_PATH = 'PASS'
+    SECURITY_APPEND_ONLY_REQUIRED_RIGHTS = 'PASS'
+    SECURITY_APPEND_ONLY_NO_MT5_ACL_SERVICES = 'PASS'
 } | ConvertTo-Json
