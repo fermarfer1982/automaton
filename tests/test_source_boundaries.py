@@ -39,6 +39,7 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn('"scripts/Test-GatewayRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Test-PythonBaseOnlyRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Test-PythonStagingOnlyRuntimeAcl.ps1"', source)
+        self.assertIn('"scripts/Test-PythonFinalOnlyRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Collect-RuntimeAclResults.ps1"', source)
         self.assertIn('"scripts/Install-TradingLabPythonRuntime.ps1"', source)
         self.assertIn('"scripts/TradingLabPythonInventory.ps1"', source)
@@ -280,6 +281,7 @@ class SourceBoundaryTests(unittest.TestCase):
                 "Test-GatewayRuntimeAcl.ps1",
                 "Test-PythonBaseOnlyRuntimeAcl.ps1",
                 "Test-PythonStagingOnlyRuntimeAcl.ps1",
+                "Test-PythonFinalOnlyRuntimeAcl.ps1",
                 "Collect-RuntimeAclResults.ps1",
                 "Install-TradingLabPythonRuntime.ps1",
                 "TradingLabPythonInventory.ps1",
@@ -504,11 +506,11 @@ class SourceBoundaryTests(unittest.TestCase):
         )
         for harness, role in ((gateway, "AutomatonGateway"), (agent, "AutomatonAgent")):
             self.assertIn("[switch] $PythonStagingOnly", harness)
-            self.assertIn("if ($PythonBaseOnly -and $PythonStagingOnly)", harness)
+            self.assertIn("$isolatedModeCount -gt 1", harness)
             self.assertIn("Test-PythonStagingOnlyRuntimeAcl.ps1", harness)
             self.assertIn(f"-Role '{role}'", harness)
         self.assertIn("C:\\automaton\\.venv.new\\Scripts\\python.exe", staging)
-        self.assertIsNone(re.search(r"C:\\automaton\\\.venv(?!\.new)", staging))
+        self.assertIn("$script:PythonStagingOnlyIsFinal = $false", staging)
         self.assertIn("UseShellExecute = $false", staging)
         self.assertIn("RedirectStandardInput = $true", staging)
         self.assertIn('importlib.metadata.version("MetaTrader5")', staging)
@@ -532,6 +534,63 @@ class SourceBoundaryTests(unittest.TestCase):
             "acl_modified = $false",
         ):
             self.assertIn(boundary, staging)
+
+    def test_python_final_runtime_gate_has_strict_boundaries(self) -> None:
+        shared = (
+            ROOT / "scripts" / "Test-PythonStagingOnlyRuntimeAcl.ps1"
+        ).read_text(encoding="utf-8")
+        final = (
+            ROOT / "scripts" / "Test-PythonFinalOnlyRuntimeAcl.ps1"
+        ).read_text(encoding="utf-8")
+        implementation = shared + "\n" + final
+        gateway = (ROOT / "scripts" / "Test-GatewayRuntimeAcl.ps1").read_text(
+            encoding="utf-8"
+        )
+        agent = (ROOT / "scripts" / "Test-AgentRuntimeAcl.ps1").read_text(
+            encoding="utf-8"
+        )
+        for harness, role in ((gateway, "AutomatonGateway"), (agent, "AutomatonAgent")):
+            self.assertIn("[switch] $PythonFinalOnly", harness)
+            self.assertIn("if ($PythonFinalOnly)", harness)
+            self.assertIn("Test-PythonFinalOnlyRuntimeAcl.ps1", harness)
+            self.assertIn(f"-Role '{role}'", harness)
+        self.assertIn("$script:PythonStagingOnlyMode = 'PYTHON_FINAL_ONLY'", final)
+        self.assertIn("$script:PythonStagingOnlyRoot = 'C:\\automaton\\.venv'", final)
+        self.assertIn(
+            "$script:PythonStagingOnlyExecutable = "
+            "'C:\\automaton\\.venv\\Scripts\\python.exe'",
+            final,
+        )
+        self.assertNotIn("C:\\automaton\\.venv.new", final)
+        self.assertNotIn("C:\\automaton\\.venv.backup.", final)
+        self.assertIn('importlib.metadata.version("MetaTrader5")', shared)
+        for forbidden in (
+            "import MetaTrader5",
+            'importlib.import_module("MetaTrader5")',
+            "Set-Acl",
+            "Start-Service",
+            ".order_check(",
+            ".order_send(",
+        ):
+            self.assertNotIn(forbidden, implementation)
+        for boundary in (
+            "build_venv = $false",
+            "promote_venv = $false",
+            "cleanup = $false",
+            "staging_venv_accessed = $false",
+            "staging_venv_modified = $false",
+            "backup_venv_accessed = $false",
+            "backup_venv_modified = $false",
+            "mt5_imported = $false",
+            "mt5_accessed = $false",
+            "order_check_called = $false",
+            "order_send_called = $false",
+            "gateway_started = $false",
+            "automaton_started = $false",
+            "acl_modified = $false",
+            "filesystem_final_modified =",
+        ):
+            self.assertIn(boundary, implementation)
 
     def test_machine_runtime_acl_resume_is_exact_target_and_dry_run_safe(self) -> None:
         installer = (ROOT / "scripts" / "Install-TradingLabPythonRuntime.ps1").read_text(

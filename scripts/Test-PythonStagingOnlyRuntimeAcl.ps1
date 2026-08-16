@@ -8,6 +8,64 @@ $script:PythonStagingOnlyConfig = 'C:\automaton\.venv.new\pyvenv.cfg'
 $script:PythonStagingOnlyBase = 'C:\Program Files\AutomatonPython\3.14.5'
 $script:PythonStagingOnlyGatewaySid = 'S-1-5-21-568964486-193631783-1609210587-1007'
 $script:PythonStagingOnlyAgentSid = 'S-1-5-21-568964486-193631783-1609210587-1006'
+$script:PythonStagingOnlyIsFinal = $false
+$script:PythonStagingOnlyMode = 'PYTHON_STAGING_ONLY'
+
+function Get-PythonStagingOnlyGateName([string] $Name) {
+    if ($script:PythonStagingOnlyIsFinal -and
+        $Name.StartsWith('STAGING_', [System.StringComparison]::Ordinal)) {
+        return 'FINAL_' + $Name.Substring('STAGING_'.Length)
+    }
+    return $Name
+}
+
+function Get-PythonStagingOnlyExpectedRoot {
+    if ($script:PythonStagingOnlyIsFinal) { return 'C:\automaton\.venv' }
+    return 'C:\automaton\.venv.new'
+}
+
+function Get-PythonStagingOnlyExpectedExecutable {
+    return Join-Path (Get-PythonStagingOnlyExpectedRoot) 'Scripts\python.exe'
+}
+
+function Get-PythonStagingOnlyReportFileName([string] $Role, [string] $RunId) {
+    $roleStem = if ($Role -eq 'AutomatonGateway') { 'gateway' } else { 'agent' }
+    $reportKind = if ($script:PythonStagingOnlyIsFinal) { 'final' } else { 'staging' }
+    return "$roleStem-python-$reportKind-$RunId.json"
+}
+
+function Get-PythonStagingOnlyReportPath([string] $Role, [string] $RunId) {
+    $authorizedRoot = if ($Role -eq 'AutomatonGateway') {
+        'C:\ProgramData\AutomatonMT5Lab\operational'
+    } else { 'C:\Users\AutomatonAgent\.automaton' }
+    return Join-Path (Join-Path $authorizedRoot 'acl-runtime-results') `
+        (Get-PythonStagingOnlyReportFileName $Role $RunId)
+}
+
+function Test-PythonStagingOnlyForbiddenFinalReference([object] $Metadata) {
+    if (-not $script:PythonStagingOnlyIsFinal) { return $true }
+    try {
+        foreach ($path in @($Metadata.sys_path)) {
+            $value = [string]$path
+            if ($value.StartsWith('C:\automaton\.venv.new', [System.StringComparison]::OrdinalIgnoreCase) -or
+                $value.StartsWith('C:\automaton\.venv.backup.', [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $false
+            }
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Test-PythonStagingOnlyForbiddenFinalConfigReference([string[]] $Lines) {
+    if (-not $script:PythonStagingOnlyIsFinal) { return $true }
+    foreach ($line in $Lines) {
+        if ($line.IndexOf('C:\automaton\.venv.new', [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            $line.IndexOf('C:\automaton\.venv.backup.', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return $false
+        }
+    }
+    return $true
+}
 
 function Get-PythonStagingOnlyCanonicalPath([string] $Path) {
     return [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
@@ -50,6 +108,7 @@ function Test-PythonStagingOnlyMt5NotImported([object] $Metadata) {
 
 function Test-PythonStagingOnlyConfigRecord([string[]] $Lines) {
     try {
+        if (-not (Test-PythonStagingOnlyForbiddenFinalConfigReference $Lines)) { return $false }
         $values = @{}
         foreach ($line in $Lines) {
             $parts = $line -split '=', 2
@@ -105,7 +164,9 @@ function Resolve-AgentPythonStagingExecutionExpectation(
             observed = 'ALLOW'
             critical = $true
             infrastructure_error = $false
-            evidence = 'FUNCTIONAL_STAGING_PYTHON_EXECUTION_ALLOWED'
+            evidence = $(if ($script:PythonStagingOnlyIsFinal) {
+                'FUNCTIONAL_FINAL_PYTHON_EXECUTION_ALLOWED'
+            } else { 'FUNCTIONAL_STAGING_PYTHON_EXECUTION_ALLOWED' })
         }
     }
     if (-not $ProcessStarted) {
@@ -137,7 +198,8 @@ function Resolve-AgentPythonStagingExecutionExpectation(
 
 function Assert-PythonStagingOnlyConfinedPath([string] $Path) {
     if (-not (Test-PythonStagingOnlyPathConfined $Path $script:PythonStagingOnlyRoot)) {
-        throw "PYTHON_STAGING_PATH_OUTSIDE_EXACT_TARGET:$Path"
+        $pathErrorPrefix = if ($script:PythonStagingOnlyIsFinal) { 'PYTHON_FINAL_ONLY' } else { 'PYTHON_STAGING' }
+        throw "${pathErrorPrefix}_PATH_OUTSIDE_EXACT_TARGET:$Path"
     }
 }
 
@@ -145,7 +207,8 @@ function Assert-PythonStagingOnlyNoReparsePoint([string] $Path) {
     Assert-PythonStagingOnlyConfinedPath $Path
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
     if (-not (Test-PythonStagingOnlyReparseAttributes $item.Attributes)) {
-        throw "PYTHON_STAGING_REPARSE_POINT_FAIL_CLOSED:$($item.FullName)"
+        $pathErrorPrefix = if ($script:PythonStagingOnlyIsFinal) { 'PYTHON_FINAL_ONLY' } else { 'PYTHON_STAGING' }
+        throw "${pathErrorPrefix}_REPARSE_POINT_FAIL_CLOSED:$($item.FullName)"
     }
 }
 
@@ -174,10 +237,11 @@ function Initialize-PythonStagingOnlyPrivateTemp(
     [string] $RunId
 ) {
     Assert-PythonStagingOnlyReportDirectory $ReportRoot $AuthorizedRoot
-    $tempPath = Join-Path $ReportRoot ".python-staging-only-tmp-$RunId"
+    $tempKind = if ($script:PythonStagingOnlyIsFinal) { 'final' } else { 'staging' }
+    $tempPath = Join-Path $ReportRoot ".python-$tempKind-only-tmp-$RunId"
     Assert-PythonStagingOnlyReportPath $tempPath $ReportRoot
     if ([System.IO.Directory]::Exists($tempPath) -or [System.IO.File]::Exists($tempPath)) {
-        throw 'PYTHON_STAGING_ONLY_TEMP_COLLISION: inspect it and use a new RunId.'
+        throw "$($script:PythonStagingOnlyMode)_TEMP_COLLISION: inspect it and use a new RunId."
     }
     [void][System.IO.Directory]::CreateDirectory($tempPath)
     $item = Get-Item -LiteralPath $tempPath -Force -ErrorAction Stop
@@ -219,6 +283,7 @@ function Add-PythonStagingOnlyResult(
     [bool] $Critical = $false,
     [bool] $InfrastructureError = $false
 ) {
+    $Name = Get-PythonStagingOnlyGateName $Name
     $passed = $Expected -eq $Observed
     $Context.tests[$Name] = [ordered]@{
         expected = $Expected
@@ -436,8 +501,14 @@ function Invoke-PythonStagingOnlyProcess(
                 SuccessMarkerObserved = $false; Value = $null; StandardErrorPresent = $false
             }
         }
-        $process.StandardInput.Write($Source)
-        $process.StandardInput.Close()
+        try {
+            $process.StandardInput.Write($Source)
+        } catch [System.IO.IOException] {
+            # A denied service identity may start the venv redirector and have it
+            # exit before consuming stdin. Its exit code/marker remain authoritative.
+        } finally {
+            try { $process.StandardInput.Close() } catch [System.IO.IOException] {}
+        }
         $stdout = $process.StandardOutput.ReadToEnd()
         $stderr = $process.StandardError.ReadToEnd()
         $process.WaitForExit()
@@ -471,9 +542,12 @@ function Invoke-PythonStagingOnlyProcess(
 }
 
 function Add-PythonStagingOnlyReadAndPathTests([object] $Context) {
-    $pathExact = Test-PythonStagingOnlyExactPath $script:PythonStagingOnlyRoot 'C:\automaton\.venv.new'
+    $expectedRoot = Get-PythonStagingOnlyExpectedRoot
+    $expectedExecutable = Get-PythonStagingOnlyExpectedExecutable
+    $pathExact = Test-PythonStagingOnlyExactPath $script:PythonStagingOnlyRoot $expectedRoot
     Add-PythonStagingOnlyResult $Context 'STAGING_PATH_EXACT' 'PASS' `
-        $(if ($pathExact) { 'PASS' } else { 'FAIL' }) 'EXACT_STAGING_TARGET_REQUIRED'
+        $(if ($pathExact) { 'PASS' } else { 'FAIL' }) `
+        $(if ($script:PythonStagingOnlyIsFinal) { 'EXACT_FINAL_TARGET_REQUIRED' } else { 'EXACT_STAGING_TARGET_REQUIRED' })
     if (-not $pathExact) { return }
     foreach ($requiredPath in @(
         $script:PythonStagingOnlyRoot,
@@ -488,15 +562,39 @@ function Add-PythonStagingOnlyReadAndPathTests([object] $Context) {
     Add-PythonStagingOnlyResult $Context 'STAGING_ENUMERATE' 'PASS' `
         $(if ($treeCount -gt 0) { 'PASS' } else { 'FAIL' }) "ITEMS_ENUMERATED_$treeCount"
     $pythonPathExact = Test-PythonStagingOnlyExactPath `
-        $script:PythonStagingOnlyExecutable 'C:\automaton\.venv.new\Scripts\python.exe'
+        $script:PythonStagingOnlyExecutable $expectedExecutable
     Add-PythonStagingOnlyResult $Context 'STAGING_PYTHON_PATH_EXACT' 'PASS' `
-        $(if ($pythonPathExact) { 'PASS' } else { 'FAIL' }) 'EXACT_STAGING_PYTHON_REQUIRED'
+        $(if ($pythonPathExact) { 'PASS' } else { 'FAIL' }) `
+        $(if ($script:PythonStagingOnlyIsFinal) { 'EXACT_FINAL_PYTHON_REQUIRED' } else { 'EXACT_STAGING_PYTHON_REQUIRED' })
     $configRecord = [System.IO.File]::ReadAllLines($script:PythonStagingOnlyConfig)
     $configPass = Test-PythonStagingOnlyConfigRecord $configRecord
     Add-PythonStagingOnlyResult $Context 'STAGING_BASE_REFERENCE_EXACT' 'PASS' `
         $(if ($configPass) { 'PASS' } else { 'FAIL' }) 'PYVENV_CFG_MACHINE_BASE_NO_SYSTEM_SITE_PACKAGES'
+    if ($script:PythonStagingOnlyIsFinal) {
+        $noForbiddenConfigReference = Test-PythonStagingOnlyForbiddenFinalConfigReference $configRecord
+        Add-PythonStagingOnlyResult $Context 'STAGING_NO_STAGING_CONFIG_REFERENCE' 'PASS' `
+            $(if ($noForbiddenConfigReference) { 'PASS' } else { 'FAIL' }) `
+            'PYVENV_CFG_HAS_NO_STAGING_OR_BACKUP_REFERENCE'
+    }
     Add-PythonStagingOnlyFileReadTest $Context 'STAGING_PYTHON_READ' $script:PythonStagingOnlyExecutable
     Add-PythonStagingOnlyFileReadTest $Context 'STAGING_SITE_PACKAGES_READ' $script:PythonStagingOnlyFastApiFile
+}
+
+function Test-PythonStagingOnlyExecutionMetadata([object] $Execution, [object] $Metadata) {
+    try {
+        $forbiddenProfile = 'C:' + '\' + 'Users' + '\' + 'Proyecto IA'
+        $noUserProfilePath = @($Metadata.sys_path | Where-Object {
+            ([string]$_).StartsWith($forbiddenProfile, [System.StringComparison]::OrdinalIgnoreCase)
+        }).Count -eq 0
+        return [bool]$Execution.ProcessStarted -and $Execution.ExitCode -eq 0 -and
+            -not [bool]$Execution.StandardErrorPresent -and $null -ne $Metadata -and
+            $Metadata.version -eq '3.14.5' -and $Metadata.architecture_bits -eq 64 -and
+            (Test-PythonStagingOnlyExactPath $Metadata.executable $script:PythonStagingOnlyExecutable) -and
+            (Test-PythonStagingOnlyExactPath $Metadata.prefix $script:PythonStagingOnlyRoot) -and
+            (Test-PythonStagingOnlyExactPath $Metadata.base_prefix $script:PythonStagingOnlyBase) -and
+            -not [bool]$Metadata.user_site_enabled -and $noUserProfilePath -and
+            [bool]$Metadata.venv_import -and (Test-PythonStagingOnlyForbiddenFinalReference $Metadata)
+    } catch { return $false }
 }
 
 function Add-GatewayPythonStagingOnlyExecutionTests([object] $Context) {
@@ -542,23 +640,16 @@ print(json.dumps({
         success_marker_observed = [bool]$execution.SuccessMarkerObserved
     }
     $value = $execution.Value
-    $noUserProfilePath = $false
-    if ($null -ne $value) {
-        $forbiddenProfile = 'C:' + '\' + 'Users' + '\' + 'Proyecto IA'
-        $noUserProfilePath = @($value.sys_path | Where-Object {
-            ([string]$_).StartsWith($forbiddenProfile, [System.StringComparison]::OrdinalIgnoreCase)
-        }).Count -eq 0
-    }
-    $executePass = $execution.ProcessStarted -and $execution.ExitCode -eq 0 -and
-        -not $execution.StandardErrorPresent -and $null -ne $value -and
-        $value.version -eq '3.14.5' -and $value.architecture_bits -eq 64 -and
-        (Test-PythonStagingOnlyExactPath $value.executable $script:PythonStagingOnlyExecutable) -and
-        (Test-PythonStagingOnlyExactPath $value.prefix $script:PythonStagingOnlyRoot) -and
-        (Test-PythonStagingOnlyExactPath $value.base_prefix $script:PythonStagingOnlyBase) -and
-        -not [bool]$value.user_site_enabled -and $noUserProfilePath -and [bool]$value.venv_import
+    $executePass = Test-PythonStagingOnlyExecutionMetadata $execution $value
     Add-PythonStagingOnlyResult $Context 'STAGING_PYTHON_EXECUTE' 'PASS' `
         $(if ($executePass) { 'PASS' } else { 'FAIL' }) `
-        $(if ($executePass) { 'PYTHON_3_14_5_X64_ISOLATED_EXACT_STAGING_AND_BASE' } else { 'STAGING_PYTHON_EXECUTION_OR_METADATA_MISMATCH' }) `
+        $(if ($executePass) {
+            if ($script:PythonStagingOnlyIsFinal) { 'PYTHON_3_14_5_X64_ISOLATED_EXACT_FINAL_AND_BASE' }
+            else { 'PYTHON_3_14_5_X64_ISOLATED_EXACT_STAGING_AND_BASE' }
+        } else {
+            if ($script:PythonStagingOnlyIsFinal) { 'FINAL_PYTHON_EXECUTION_OR_METADATA_MISMATCH' }
+            else { 'STAGING_PYTHON_EXECUTION_OR_METADATA_MISMATCH' }
+        }) `
         $false (-not $execution.ProcessStarted -and $execution.StartErrorCode -ne 5)
 
     foreach ($importGate in @(
@@ -577,13 +668,21 @@ print(json.dumps({
     $notImported = Test-PythonStagingOnlyMt5NotImported $value
     Add-PythonStagingOnlyResult $Context 'STAGING_METATRADER5_IMPORTED' 'false' `
         $(if ($notImported) { 'false' } else { 'true' }) 'SYS_MODULES_OBSERVATION'
+    if ($script:PythonStagingOnlyIsFinal) {
+        $noForbiddenFunctionalReference = Test-PythonStagingOnlyForbiddenFinalReference $value
+        Add-PythonStagingOnlyResult $Context 'STAGING_NO_STAGING_FUNCTIONAL_REFERENCE' 'PASS' `
+            $(if ($noForbiddenFunctionalReference) { 'PASS' } else { 'FAIL' }) `
+            'SYS_PATH_HAS_NO_STAGING_OR_BACKUP_REFERENCE'
+    }
 }
 
 function Add-AgentPythonStagingOnlyExecutionTest(
     [object] $Context,
     [string] $RunId
 ) {
-    $marker = "AUTOMATON_STAGING_AGENT_SUCCESS_$RunId"
+    $marker = if ($script:PythonStagingOnlyIsFinal) {
+        "AUTOMATON_FINAL_AGENT_SUCCESS_$RunId"
+    } else { "AUTOMATON_STAGING_AGENT_SUCCESS_$RunId" }
     $agentSource = "print('$marker')`n"
     $execution = Invoke-PythonStagingOnlyProcess $agentSource $marker $false
     $Context.execution = [ordered]@{
@@ -603,14 +702,17 @@ function Add-PythonStagingOnlyMutationTests(
     [string] $Role
 ) {
     $stem = if ($Role -eq 'AutomatonGateway') { 'gateway' } else { 'agent' }
-    $fileCanary = Join-Path $script:PythonStagingOnlyRoot ".python-staging-$stem-$RunId.canary"
-    $directoryCanary = Join-Path $script:PythonStagingOnlyRoot ".python-staging-$stem-$RunId.directory"
+    $canaryKind = if ($script:PythonStagingOnlyIsFinal) { 'final' } else { 'staging' }
+    $fileCanary = Join-Path $script:PythonStagingOnlyRoot ".python-$canaryKind-$stem-$RunId.canary"
+    $directoryCanary = Join-Path $script:PythonStagingOnlyRoot ".python-$canaryKind-$stem-$RunId.directory"
     Add-PythonStagingOnlyDeniedFileCreateTest $Context 'STAGING_CREATE_FILE_DENY' $fileCanary
     if ($Context.critical_unexpected_allow) { return }
     Add-PythonStagingOnlyDeniedDirectoryCreateTest $Context 'STAGING_CREATE_DIRECTORY_DENY' $directoryCanary
     if ($Context.critical_unexpected_allow) { return }
-    $createDenied = $Context.tests.STAGING_CREATE_FILE_DENY.passed -and
-        $Context.tests.STAGING_CREATE_DIRECTORY_DENY.passed
+    $createFileGate = Get-PythonStagingOnlyGateName 'STAGING_CREATE_FILE_DENY'
+    $createDirectoryGate = Get-PythonStagingOnlyGateName 'STAGING_CREATE_DIRECTORY_DENY'
+    $createDenied = $Context.tests[$createFileGate].passed -and
+        $Context.tests[$createDirectoryGate].passed
     Add-PythonStagingOnlyResult $Context 'STAGING_CREATE_DENY' 'PASS' `
         $(if ($createDenied) { 'PASS' } else { 'FAIL' }) 'FILE_AND_DIRECTORY_CREATE_DENIED'
 
@@ -651,16 +753,30 @@ function Write-PythonStagingOnlySummary([object] $Report, [string] $ReportPath) 
     Write-Output "TRADING_MODE=$($Report.boundaries.trading_mode)"
     Write-Output "BUILD_VENV=$($Report.boundaries.build_venv.ToString().ToLowerInvariant())"
     Write-Output "PROMOTE_VENV=$($Report.boundaries.promote_venv.ToString().ToLowerInvariant())"
-    Write-Output "ACTIVE_VENV_ACCESSED=$($Report.boundaries.active_venv_accessed.ToString().ToLowerInvariant())"
-    Write-Output "ACTIVE_VENV_MODIFIED=$($Report.boundaries.active_venv_modified.ToString().ToLowerInvariant())"
+    if ($Report.mode -eq 'PYTHON_FINAL_ONLY') {
+        Write-Output "CLEANUP=$($Report.boundaries.cleanup.ToString().ToLowerInvariant())"
+        Write-Output "STAGING_VENV_ACCESSED=$($Report.boundaries.staging_venv_accessed.ToString().ToLowerInvariant())"
+        Write-Output "STAGING_VENV_MODIFIED=$($Report.boundaries.staging_venv_modified.ToString().ToLowerInvariant())"
+        Write-Output "BACKUP_VENV_ACCESSED=$($Report.boundaries.backup_venv_accessed.ToString().ToLowerInvariant())"
+        Write-Output "BACKUP_VENV_MODIFIED=$($Report.boundaries.backup_venv_modified.ToString().ToLowerInvariant())"
+    } else {
+        Write-Output "ACTIVE_VENV_ACCESSED=$($Report.boundaries.active_venv_accessed.ToString().ToLowerInvariant())"
+        Write-Output "ACTIVE_VENV_MODIFIED=$($Report.boundaries.active_venv_modified.ToString().ToLowerInvariant())"
+    }
     Write-Output "MT5_IMPORTED=$($Report.boundaries.mt5_imported.ToString().ToLowerInvariant())"
     Write-Output "MT5_ACCESSED=$($Report.boundaries.mt5_accessed.ToString().ToLowerInvariant())"
     Write-Output "ORDER_CHECK=$($Report.boundaries.order_check_called.ToString().ToLowerInvariant())"
     Write-Output "ORDER_SEND=$($Report.boundaries.order_send_called.ToString().ToLowerInvariant())"
     Write-Output "ACL_MODIFIED=$($Report.boundaries.acl_modified.ToString().ToLowerInvariant())"
-    Write-Output "FILESYSTEM_STAGING_MODIFIED=$($Report.boundaries.filesystem_staging_modified.ToString().ToLowerInvariant())"
-    Write-Output "PYTHON_STAGING_ONLY_STATUS=$($Report.status)"
-    Write-Output "PYTHON_STAGING_ONLY_REPORT=$ReportPath"
+    if ($Report.mode -eq 'PYTHON_FINAL_ONLY') {
+        Write-Output "FILESYSTEM_FINAL_MODIFIED=$($Report.boundaries.filesystem_final_modified.ToString().ToLowerInvariant())"
+        Write-Output "PYTHON_FINAL_ONLY_STATUS=$($Report.status)"
+        Write-Output "PYTHON_FINAL_ONLY_REPORT=$ReportPath"
+    } else {
+        Write-Output "FILESYSTEM_STAGING_MODIFIED=$($Report.boundaries.filesystem_staging_modified.ToString().ToLowerInvariant())"
+        Write-Output "PYTHON_STAGING_ONLY_STATUS=$($Report.status)"
+        Write-Output "PYTHON_STAGING_ONLY_REPORT=$ReportPath"
+    }
 }
 
 function Invoke-TradingLabPythonStagingOnlyRuntimeAcl(
@@ -671,26 +787,27 @@ function Invoke-TradingLabPythonStagingOnlyRuntimeAcl(
     [string] $EffectiveSid,
     [bool] $AdministrativeToken
 ) {
+    $modeName = $script:PythonStagingOnlyMode
     $expectedSid = if ($Role -eq 'AutomatonGateway') {
         $script:PythonStagingOnlyGatewaySid
     } else { $script:PythonStagingOnlyAgentSid }
     if (-not (Test-PythonStagingOnlyIdentity $EffectiveSid $expectedSid)) {
-        throw "PYTHON_STAGING_ONLY_WRONG_EFFECTIVE_SID:$EffectiveSid"
+        throw "${modeName}_WRONG_EFFECTIVE_SID:$EffectiveSid"
     }
-    if ($AdministrativeToken) { throw 'PYTHON_STAGING_ONLY_REFUSES_ADMINISTRATIVE_TOKEN' }
-    if (-not (Test-PythonStagingOnlyExactPath $script:PythonStagingOnlyRoot 'C:\automaton\.venv.new')) {
-        throw 'PYTHON_STAGING_ONLY_TARGET_PATH_MISMATCH'
+    if ($AdministrativeToken) { throw "${modeName}_REFUSES_ADMINISTRATIVE_TOKEN" }
+    $expectedRoot = Get-PythonStagingOnlyExpectedRoot
+    if (-not (Test-PythonStagingOnlyExactPath $script:PythonStagingOnlyRoot $expectedRoot)) {
+        throw "${modeName}_TARGET_PATH_MISMATCH"
     }
     if (-not (Test-PythonStagingOnlyTargetPresent $script:PythonStagingOnlyRoot)) {
-        throw 'PYTHON_STAGING_ONLY_TARGET_MISSING'
+        throw "${modeName}_TARGET_MISSING"
     }
 
     $authorizedRoot = if ($Role -eq 'AutomatonGateway') {
         'C:\ProgramData\AutomatonMT5Lab\operational'
     } else { 'C:\Users\AutomatonAgent\.automaton' }
     $reportRoot = Join-Path $authorizedRoot 'acl-runtime-results'
-    $roleStem = if ($Role -eq 'AutomatonGateway') { 'gateway' } else { 'agent' }
-    $reportPath = Join-Path $reportRoot "$roleStem-python-staging-$RunId.json"
+    $reportPath = Get-PythonStagingOnlyReportPath $Role $RunId
     $context = [pscustomobject]@{
         tests = [ordered]@{}
         execution = $null
@@ -706,8 +823,9 @@ function Invoke-TradingLabPythonStagingOnlyRuntimeAcl(
         $tempPath = Initialize-PythonStagingOnlyPrivateTemp $reportRoot $authorizedRoot $RunId
         Initialize-PythonStagingOnlyNativeProbe
         Add-PythonStagingOnlyReadAndPathTests $context
-        if (-not $context.tests.STAGING_PATH_EXACT.passed) {
-            throw 'PYTHON_STAGING_ONLY_TARGET_PATH_MISMATCH'
+        $pathGate = Get-PythonStagingOnlyGateName 'STAGING_PATH_EXACT'
+        if (-not $context.tests[$pathGate].passed) {
+            throw "${modeName}_TARGET_PATH_MISMATCH"
         }
         if ($Role -eq 'AutomatonGateway') {
             Add-GatewayPythonStagingOnlyExecutionTests $context
@@ -736,18 +854,29 @@ function Invoke-TradingLabPythonStagingOnlyRuntimeAcl(
     } elseif (-not $allPassed) {
         'TEST_FAILED_EXPECTATION'
     } else { 'PASS' }
-    $report = [ordered]@{
-        schema_version = 1
-        mode = 'PYTHON_STAGING_ONLY'
-        role = $Role
-        run_id = $RunId
-        effective_sid = $EffectiveSid
-        status = $status
-        completed_at_utc = [DateTime]::UtcNow.ToString('o')
-        runtime_error = $context.runtime_error
-        tests = $context.tests
-        execution = $context.execution
-        boundaries = [ordered]@{
+    $boundaries = if ($script:PythonStagingOnlyIsFinal) {
+        [ordered]@{
+            trading_mode = 'OBSERVE_ONLY'
+            build_venv = $false
+            promote_venv = $false
+            cleanup = $false
+            staging_venv_accessed = $false
+            staging_venv_modified = $false
+            backup_venv_accessed = $false
+            backup_venv_modified = $false
+            mt5_imported = $false
+            mt5_accessed = $false
+            order_check_called = $false
+            order_send_called = $false
+            gateway_started = $false
+            automaton_started = $false
+            acl_modified = $false
+            filesystem_final_modified = [bool]$context.filesystem_staging_modified
+            report_directory_modified = $true
+            report_temp_cleanup_succeeded = $tempCleanupSucceeded
+        }
+    } else {
+        [ordered]@{
             trading_mode = 'OBSERVE_ONLY'
             build_venv = $false
             promote_venv = $false
@@ -764,6 +893,19 @@ function Invoke-TradingLabPythonStagingOnlyRuntimeAcl(
             report_directory_modified = $true
             report_temp_cleanup_succeeded = $tempCleanupSucceeded
         }
+    }
+    $report = [ordered]@{
+        schema_version = 1
+        mode = $modeName
+        role = $Role
+        run_id = $RunId
+        effective_sid = $EffectiveSid
+        status = $status
+        completed_at_utc = [DateTime]::UtcNow.ToString('o')
+        runtime_error = $context.runtime_error
+        tests = $context.tests
+        execution = $context.execution
+        boundaries = $boundaries
     }
     Write-PythonStagingOnlyExclusiveReport $reportPath $report
     Write-PythonStagingOnlySummary $report $reportPath

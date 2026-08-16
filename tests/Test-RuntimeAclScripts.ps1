@@ -7,8 +7,12 @@ $agentPath = Join-Path $workspace 'scripts\Test-AgentRuntimeAcl.ps1'
 $gatewayPath = Join-Path $workspace 'scripts\Test-GatewayRuntimeAcl.ps1'
 $pythonBaseOnlyPath = Join-Path $workspace 'scripts\Test-PythonBaseOnlyRuntimeAcl.ps1'
 $pythonStagingOnlyPath = Join-Path $workspace 'scripts\Test-PythonStagingOnlyRuntimeAcl.ps1'
+$pythonFinalOnlyPath = Join-Path $workspace 'scripts\Test-PythonFinalOnlyRuntimeAcl.ps1'
 $collectorPath = Join-Path $workspace 'scripts\Collect-RuntimeAclResults.ps1'
-$paths = @($agentPath, $gatewayPath, $pythonBaseOnlyPath, $pythonStagingOnlyPath, $collectorPath)
+$paths = @(
+    $agentPath, $gatewayPath, $pythonBaseOnlyPath, $pythonStagingOnlyPath,
+    $pythonFinalOnlyPath, $collectorPath
+)
 
 function Assert-True([bool] $Condition, [string] $Message) {
     if (-not $Condition) { throw $Message }
@@ -41,6 +45,7 @@ $agent = $sources[$agentPath]
 $gateway = $sources[$gatewayPath]
 $pythonBaseOnly = $sources[$pythonBaseOnlyPath]
 $pythonStagingOnly = $sources[$pythonStagingOnlyPath]
+$pythonFinalOnly = $sources[$pythonFinalOnlyPath]
 $collector = $sources[$collectorPath]
 
 Assert-True `
@@ -53,27 +58,36 @@ Assert-True ($agent.Contains('[switch] $PythonBaseOnly')) 'Agent harness lacks t
 Assert-True ($gateway.Contains('[switch] $PythonBaseOnly')) 'Gateway harness lacks the isolated PythonBaseOnly switch.'
 Assert-True ($agent.Contains('[switch] $PythonStagingOnly')) 'Agent harness lacks the isolated PythonStagingOnly switch.'
 Assert-True ($gateway.Contains('[switch] $PythonStagingOnly')) 'Gateway harness lacks the isolated PythonStagingOnly switch.'
+Assert-True ($agent.Contains('[switch] $PythonFinalOnly')) 'Agent harness lacks the isolated PythonFinalOnly switch.'
+Assert-True ($gateway.Contains('[switch] $PythonFinalOnly')) 'Gateway harness lacks the isolated PythonFinalOnly switch.'
 foreach ($entry in @(
     [pscustomobject]@{ Source = $gateway; DefaultMarker = "`$labRoot = 'C:\ProgramData\AutomatonMT5Lab'"; Role = 'AutomatonGateway' },
     [pscustomobject]@{ Source = $agent; DefaultMarker = "`$agentStatePath = 'C:\Users\AutomatonAgent\.automaton'"; Role = 'AutomatonAgent' }
 )) {
     $branchStart = $entry.Source.IndexOf('if ($PythonBaseOnly)')
     $stagingBranchStart = $entry.Source.IndexOf('if ($PythonStagingOnly)')
+    $finalBranchStart = $entry.Source.IndexOf('if ($PythonFinalOnly)')
     $defaultStart = $entry.Source.IndexOf($entry.DefaultMarker)
     Assert-True ($branchStart -ge 0 -and $stagingBranchStart -gt $branchStart) "$($entry.Role) PythonBaseOnly branch must precede PythonStagingOnly."
-    Assert-True ($defaultStart -gt $stagingBranchStart) "$($entry.Role) PythonStagingOnly branch must precede the default harness."
+    Assert-True ($finalBranchStart -gt $stagingBranchStart) "$($entry.Role) PythonStagingOnly branch must precede PythonFinalOnly."
+    Assert-True ($defaultStart -gt $finalBranchStart) "$($entry.Role) PythonFinalOnly branch must precede the default harness."
     $branch = $entry.Source.Substring($branchStart, $stagingBranchStart - $branchStart)
     Assert-True ($branch.Contains("-Role '$($entry.Role)'")) "$($entry.Role) PythonBaseOnly branch uses the wrong role."
     Assert-True ($branch.Contains(". (Join-Path `$PSScriptRoot 'Test-PythonBaseOnlyRuntimeAcl.ps1')")) "$($entry.Role) PythonBaseOnly helper boundary is absent."
     Assert-True ($branch.Contains('return')) "$($entry.Role) PythonBaseOnly mode must return before the default harness."
     Assert-True (-not $branch.Contains('C:\automaton\.venv')) "$($entry.Role) PythonBaseOnly branch references the active venv."
     Assert-True (-not $branch.Contains('.venv.new')) "$($entry.Role) PythonBaseOnly branch references the staging venv."
-    $stagingBranch = $entry.Source.Substring($stagingBranchStart, $defaultStart - $stagingBranchStart)
+    $stagingBranch = $entry.Source.Substring($stagingBranchStart, $finalBranchStart - $stagingBranchStart)
     Assert-True ($stagingBranch.Contains("-Role '$($entry.Role)'")) "$($entry.Role) PythonStagingOnly branch uses the wrong role."
     Assert-True ($stagingBranch.Contains(". (Join-Path `$PSScriptRoot 'Test-PythonStagingOnlyRuntimeAcl.ps1')")) "$($entry.Role) PythonStagingOnly helper boundary is absent."
     Assert-True ($stagingBranch.Contains('return')) "$($entry.Role) PythonStagingOnly mode must return before the default harness."
     Assert-True (-not $stagingBranch.Contains(".venv\Scripts")) "$($entry.Role) PythonStagingOnly branch references the active venv."
-    Assert-True ($entry.Source.Contains('if ($PythonBaseOnly -and $PythonStagingOnly)')) "$($entry.Role) isolated modes are not mutually exclusive."
+    $finalBranch = $entry.Source.Substring($finalBranchStart, $defaultStart - $finalBranchStart)
+    Assert-True ($finalBranch.Contains("-Role '$($entry.Role)'")) "$($entry.Role) PythonFinalOnly branch uses the wrong role."
+    Assert-True ($finalBranch.Contains(". (Join-Path `$PSScriptRoot 'Test-PythonFinalOnlyRuntimeAcl.ps1')")) "$($entry.Role) PythonFinalOnly helper boundary is absent."
+    Assert-True ($finalBranch.Contains('return')) "$($entry.Role) PythonFinalOnly mode must return before the default harness."
+    Assert-True (-not $finalBranch.Contains('.venv.new')) "$($entry.Role) PythonFinalOnly branch references the staging venv."
+    Assert-True ($entry.Source.Contains('$isolatedModeCount -gt 1')) "$($entry.Role) isolated modes are not mutually exclusive."
 }
 Assert-True ($gateway.Contains("`$pythonExe = Join-Path `$workspace '.venv\Scripts\python.exe'")) 'Default Gateway harness no longer preserves its existing venv behavior.'
 Assert-True ($agent.Contains("Add-AgentStateCanaryTest `$agentStatePath")) 'Default Agent harness no longer preserves its existing behavior.'
@@ -298,16 +312,14 @@ foreach ($forbiddenStagingOnly in @(
 )) {
     Assert-True (-not $pythonStagingOnly.Contains($forbiddenStagingOnly)) "PythonStagingOnly isolation violation: $forbiddenStagingOnly"
 }
-Assert-True `
-    (-not [regex]::IsMatch($pythonStagingOnly, 'C:\\automaton\\\.venv(?!\.new)')) `
-    'PythonStagingOnly references the active venv.'
+Assert-True ($pythonStagingOnly.Contains('$script:PythonStagingOnlyIsFinal = $false')) 'PythonStagingOnly must default to staging mode.'
 foreach ($requiredStagingOnly in @(
     "`$script:PythonStagingOnlyRoot = 'C:\automaton\.venv.new'",
     "`$script:PythonStagingOnlyExecutable = 'C:\automaton\.venv.new\Scripts\python.exe'",
     "`$script:PythonStagingOnlyBase = 'C:\Program Files\AutomatonPython\3.14.5'",
     'Test-PythonStagingOnlyExactPath', 'Test-PythonStagingOnlyTargetPresent',
     'Test-PythonStagingOnlyIdentity', 'Test-PythonStagingOnlyReparseAttributes',
-    'Test-PythonStagingOnlyPathConfined', 'PYTHON_STAGING_REPARSE_POINT_FAIL_CLOSED',
+    'Test-PythonStagingOnlyPathConfined', '_REPARSE_POINT_FAIL_CLOSED',
     'Resolve-PythonStagingOnlyAccessExpectation', 'Resolve-AgentPythonStagingExecutionExpectation',
     '[System.Diagnostics.ProcessStartInfo]::new()', "`$startInfo.Arguments = '-B -I -'",
     'RedirectStandardInput = $true', '$process.StandardInput.Write($Source)',
@@ -325,7 +337,7 @@ foreach ($requiredStagingOnly in @(
     'STAGING_WRITE_DENY', 'STAGING_APPEND_DENY', 'STAGING_TRUNCATE_DENY',
     'STAGING_RENAME_DENY', 'STAGING_DELETE_DENY', 'STAGING_WRITE_ATTRIBUTES_DENY',
     'STAGING_CHANGE_ACL_DENY', 'STAGING_TAKE_OWNERSHIP_DENY',
-    "mode = 'PYTHON_STAGING_ONLY'", "trading_mode = 'OBSERVE_ONLY'",
+    "`$script:PythonStagingOnlyMode = 'PYTHON_STAGING_ONLY'", "trading_mode = 'OBSERVE_ONLY'",
     'build_venv = $false', 'promote_venv = $false',
     'active_venv_accessed = $false', 'active_venv_modified = $false',
     'mt5_imported = $false', 'mt5_accessed = $false',
@@ -336,7 +348,7 @@ foreach ($requiredStagingOnly in @(
     Assert-True ($pythonStagingOnly.Contains($requiredStagingOnly)) "PythonStagingOnly invariant missing: $requiredStagingOnly"
 }
 Assert-True ($pythonStagingOnly.Contains("`$roleStem = if (`$Role -eq 'AutomatonGateway') { 'gateway' } else { 'agent' }")) 'Staging report role stem is not canonical.'
-Assert-True ($pythonStagingOnly.Contains('"$roleStem-python-staging-$RunId.json"')) 'Staging report filename is not canonical.'
+Assert-True ($pythonStagingOnly.Contains('"$roleStem-python-$reportKind-$RunId.json"')) 'Staging/final report filename builder is not canonical.'
 Assert-True ($pythonStagingOnly.Contains('[System.IO.FileMode]::CreateNew')) 'PythonStagingOnly reports/canaries must be collision-resistant.'
 Assert-True ($pythonStagingOnly.Contains('public static extern bool CreateDirectory(')) 'PythonStagingOnly directory canaries must use atomic Win32 creation.'
 Assert-True (-not $pythonStagingOnly.Contains('[System.IO.FileMode]::Truncate')) 'PythonStagingOnly must not truncate real files.'
@@ -404,6 +416,146 @@ Assert-True (-not $agentMarker.passed -and $agentMarker.critical) 'Agent success
 $agentStartError = Resolve-AgentPythonStagingExecutionExpectation $false $null $false 2
 Assert-True (-not $agentStartError.passed -and $agentStartError.infrastructure_error) 'Unexpected Agent process-start errors must be infrastructure failures.'
 
+$pythonFinalImplementation = $pythonStagingOnly + [Environment]::NewLine + $pythonFinalOnly
+foreach ($forbiddenFinalOnly in @(
+    'import MetaTrader5', 'importlib.import_module("MetaTrader5")',
+    '.order_check(', '.order_send(', 'initialize()', 'login()',
+    'Set-Acl', 'SetAccessRule', 'SetOwner', 'takeown', 'icacls',
+    'Start-Service', 'New-Service', 'runas.exe', 'Start-Process'
+)) {
+    Assert-True (-not $pythonFinalImplementation.Contains($forbiddenFinalOnly)) "PythonFinalOnly isolation violation: $forbiddenFinalOnly"
+}
+Assert-True (-not $pythonFinalOnly.Contains('C:\automaton\.venv.new')) 'PythonFinalOnly wrapper references the staging venv.'
+Assert-True (-not $pythonFinalOnly.Contains('C:\automaton\.venv.backup.')) 'PythonFinalOnly wrapper references a backup venv.'
+foreach ($requiredFinalOnly in @(
+    "`$script:PythonStagingOnlyMode = 'PYTHON_FINAL_ONLY'",
+    "`$script:PythonStagingOnlyRoot = 'C:\automaton\.venv'",
+    "`$script:PythonStagingOnlyExecutable = 'C:\automaton\.venv\Scripts\python.exe'",
+    "`$script:PythonStagingOnlyBase = 'C:\Program Files\AutomatonPython\3.14.5'",
+    'Invoke-TradingLabPythonFinalOnlyRuntimeAcl', 'Test-PythonFinalOnlyExactPath',
+    'Test-PythonFinalOnlyTargetPresent', 'Test-PythonFinalOnlyIdentity',
+    'Test-PythonFinalOnlyReparseAttributes', 'Test-PythonFinalOnlyPathConfined',
+    'Test-PythonFinalOnlyConfigRecord', 'Test-PythonFinalOnlyExecutionMetadata',
+    'Resolve-AgentPythonFinalExecutionExpectation', 'Test-PythonFinalOnlyBoundaryRecord',
+    'staging_venv_accessed', 'staging_venv_modified',
+    'backup_venv_accessed', 'backup_venv_modified', 'cleanup = $false',
+    'filesystem_final_modified', 'trading_mode = ''OBSERVE_ONLY''',
+    'build_venv = $false', 'promote_venv = $false',
+    'mt5_imported = $false', 'mt5_accessed = $false',
+    'order_check_called = $false', 'order_send_called = $false',
+    'gateway_started = $false', 'automaton_started = $false', 'acl_modified = $false',
+    'importlib.metadata.version("MetaTrader5")', "`$startInfo.Arguments = '-B -I -'"
+)) {
+    Assert-True ($pythonFinalImplementation.Contains($requiredFinalOnly)) "PythonFinalOnly invariant missing: $requiredFinalOnly"
+}
+
+. $pythonFinalOnlyPath
+$finalRunId = '00000000-0000-0000-0000-000000000301'
+foreach ($finalGate in @(
+    'FINAL_PATH_EXACT', 'FINAL_ENUMERATE', 'FINAL_PYTHON_READ',
+    'FINAL_SITE_PACKAGES_READ', 'FINAL_PYTHON_EXECUTE',
+    'FINAL_PYTHON_FUNCTIONAL_EXECUTION_DENY', 'FINAL_CREATE_DENY',
+    'FINAL_WRITE_DENY', 'FINAL_APPEND_DENY', 'FINAL_TRUNCATE_DENY',
+    'FINAL_RENAME_DENY', 'FINAL_DELETE_DENY', 'FINAL_WRITE_ATTRIBUTES_DENY',
+    'FINAL_CHANGE_ACL_DENY', 'FINAL_TAKE_OWNERSHIP_DENY',
+    'FINAL_NO_STAGING_CONFIG_REFERENCE', 'FINAL_NO_STAGING_FUNCTIONAL_REFERENCE'
+)) {
+    $stagingGate = 'STAGING_' + $finalGate.Substring('FINAL_'.Length)
+    Assert-True ((Get-PythonStagingOnlyGateName $stagingGate) -eq $finalGate) "Final gate name mapping failed: $finalGate"
+}
+Assert-True (Test-PythonFinalOnlyExactPath 'C:\automaton\.venv' $script:PythonStagingOnlyRoot) 'Exact final target must pass.'
+Assert-True (-not (Test-PythonFinalOnlyExactPath 'C:\automaton\.venv.other' $script:PythonStagingOnlyRoot)) 'Wrong final target must fail.'
+Assert-True (-not (Test-PythonFinalOnlyExactPath 'C:\automaton\.venv\python.exe' $script:PythonStagingOnlyExecutable)) 'Wrong final Python path must fail.'
+Assert-True (-not (Test-PythonFinalOnlyTargetPresent 'C:\automaton\.python-final-only-definitely-absent')) 'Missing final target must fail.'
+Assert-True (-not (Test-PythonFinalOnlyReparseAttributes ([System.IO.FileAttributes]::Directory -bor [System.IO.FileAttributes]::ReparsePoint))) 'Final reparse point must fail.'
+Assert-True (-not (Test-PythonFinalOnlyIdentity 'S-1-5-21-wrong' $script:PythonStagingOnlyGatewaySid)) 'Wrong final Gateway SID must fail.'
+Assert-True (-not (Test-PythonFinalOnlyIdentity 'S-1-5-21-wrong' $script:PythonStagingOnlyAgentSid)) 'Wrong final Agent SID must fail.'
+Assert-True (-not (Test-PythonFinalOnlyPathConfined 'C:\automaton\.venv.new\outside.canary')) 'Final canary must not escape into staging.'
+Assert-True (-not (Test-PythonFinalOnlyPathConfined 'C:\automaton\.venv.backup.test\outside.canary')) 'Final canary must not escape into backup.'
+Assert-True ((Get-PythonFinalOnlyReportFileName 'AutomatonGateway' $finalRunId) -eq "gateway-python-final-$finalRunId.json") 'Gateway final report filename is not exact.'
+Assert-True ((Get-PythonFinalOnlyReportFileName 'AutomatonAgent' $finalRunId) -eq "agent-python-final-$finalRunId.json") 'Agent final report filename is not exact.'
+Assert-True ((Get-PythonFinalOnlyReportPath 'AutomatonGateway' $finalRunId) -eq "C:\ProgramData\AutomatonMT5Lab\operational\acl-runtime-results\gateway-python-final-$finalRunId.json") 'Gateway final report path is not exact.'
+Assert-True ((Get-PythonFinalOnlyReportPath 'AutomatonAgent' $finalRunId) -eq "C:\Users\AutomatonAgent\.automaton\acl-runtime-results\agent-python-final-$finalRunId.json") 'Agent final report path is not exact.'
+
+$validFinalConfig = @(
+    'home = C:\Program Files\AutomatonPython\3.14.5',
+    'include-system-site-packages = false',
+    'version = 3.14.5',
+    'executable = C:\Program Files\AutomatonPython\3.14.5\python.exe'
+)
+Assert-True (Test-PythonFinalOnlyConfigRecord $validFinalConfig) 'Exact final pyvenv.cfg must pass.'
+$stagingReferenceConfig = @($validFinalConfig) + 'command = C:\automaton\.venv.new\Scripts\python.exe -m venv C:\automaton\.venv'
+Assert-True (-not (Test-PythonFinalOnlyConfigRecord $stagingReferenceConfig)) 'Final pyvenv.cfg staging reference must fail.'
+
+$validFinalExecution = [pscustomobject]@{
+    ProcessStarted = $true; ExitCode = 0; StandardErrorPresent = $false
+}
+$validFinalMetadata = [pscustomobject]@{
+    architecture_bits = 64
+    base_prefix = 'C:\Program Files\AutomatonPython\3.14.5'
+    executable = 'C:\automaton\.venv\Scripts\python.exe'
+    imports = [pscustomobject]@{ fastapi = $true; pydantic = $true; yaml = $true; uvicorn = $true }
+    mt5_metadata = '5.0.6090'
+    mt5_imported = $false
+    prefix = 'C:\automaton\.venv'
+    sys_path = @('C:\Program Files\AutomatonPython\3.14.5\python314.zip', 'C:\automaton\.venv\Lib\site-packages')
+    user_site_enabled = $false
+    venv_import = $true
+    version = '3.14.5'
+}
+Assert-True (Test-PythonFinalOnlyExecutionMetadata $validFinalExecution $validFinalMetadata) 'Gateway final functional execution must pass.'
+foreach ($property in @('fastapi', 'pydantic', 'yaml', 'uvicorn')) {
+    Assert-True (Test-PythonFinalOnlyImportGate $validFinalMetadata $property) "Gateway final $property import must pass."
+}
+$failedFinalImport = $validFinalMetadata | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+$failedFinalImport.imports.fastapi = $false
+Assert-True (-not (Test-PythonFinalOnlyImportGate $failedFinalImport 'fastapi')) 'Gateway final dependency import failure must fail.'
+Assert-True (Test-PythonFinalOnlyMt5Metadata $validFinalMetadata) 'Final MetaTrader5 metadata version must pass.'
+Assert-True (Test-PythonFinalOnlyMt5NotImported $validFinalMetadata) 'Final MetaTrader5 must remain unimported.'
+
+$wrongFinalPrefix = $validFinalMetadata | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+$wrongFinalPrefix.prefix = 'C:\automaton\.venv.new'
+Assert-True (-not (Test-PythonFinalOnlyExecutionMetadata $validFinalExecution $wrongFinalPrefix)) 'Wrong final prefix must fail.'
+$wrongFinalBasePrefix = $validFinalMetadata | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+$wrongFinalBasePrefix.base_prefix = 'C:\Users\Proyecto IA\Python'
+Assert-True (-not (Test-PythonFinalOnlyExecutionMetadata $validFinalExecution $wrongFinalBasePrefix)) 'Wrong final base_prefix must fail.'
+$stagingFunctionalReference = $validFinalMetadata | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+$stagingFunctionalReference.sys_path = @($stagingFunctionalReference.sys_path) + 'C:\automaton\.venv.new\Lib\site-packages'
+Assert-True (-not (Test-PythonFinalOnlyExecutionMetadata $validFinalExecution $stagingFunctionalReference)) 'Functional staging reference from FinalOnly must fail.'
+
+$gatewayFinalMutation = Resolve-PythonFinalOnlyAccessExpectation $true 0 $false
+Assert-True (-not $gatewayFinalMutation.passed -and $gatewayFinalMutation.critical) 'Gateway final mutation success must fail critically.'
+$agentFinalExecution = Resolve-AgentPythonFinalExecutionExpectation $true 0 $false 0
+Assert-True (-not $agentFinalExecution.passed -and $agentFinalExecution.critical) 'Agent final functional execution success must fail critically.'
+$agentFinalMarker = Resolve-AgentPythonFinalExecutionExpectation $true 1 $true 0
+Assert-True (-not $agentFinalMarker.passed -and $agentFinalMarker.critical) 'Agent final success marker must fail critically.'
+$agentFinalNonzero = Resolve-AgentPythonFinalExecutionExpectation $true 1 $false 0
+Assert-True $agentFinalNonzero.passed 'Agent final nonzero/no-marker execution must pass the denial gate.'
+$agentFinalAccessDenied = Resolve-AgentPythonFinalExecutionExpectation $false $null $false 5
+Assert-True $agentFinalAccessDenied.passed 'Agent final AccessDenied must pass the denial gate.'
+$agentFinalMutation = Resolve-PythonFinalOnlyAccessExpectation $true 0 $false
+Assert-True (-not $agentFinalMutation.passed -and $agentFinalMutation.critical) 'Agent final mutation success must fail critically.'
+
+$validFinalBoundaries = [pscustomobject]@{
+    trading_mode = 'OBSERVE_ONLY'; build_venv = $false; promote_venv = $false; cleanup = $false
+    staging_venv_accessed = $false; staging_venv_modified = $false
+    backup_venv_accessed = $false; backup_venv_modified = $false
+    mt5_imported = $false; mt5_accessed = $false
+    order_check_called = $false; order_send_called = $false
+    gateway_started = $false; automaton_started = $false
+    acl_modified = $false; filesystem_final_modified = $false
+}
+Assert-True (Test-PythonFinalOnlyBoundaryRecord $validFinalBoundaries) 'Exact final boundaries must pass.'
+$stagingBoundaryViolation = $validFinalBoundaries | ConvertTo-Json | ConvertFrom-Json
+$stagingBoundaryViolation.staging_venv_accessed = $true
+Assert-True (-not (Test-PythonFinalOnlyBoundaryRecord $stagingBoundaryViolation)) 'Staging access from FinalOnly must fail the boundary.'
+$backupBoundaryViolation = $validFinalBoundaries | ConvertTo-Json | ConvertFrom-Json
+$backupBoundaryViolation.backup_venv_accessed = $true
+Assert-True (-not (Test-PythonFinalOnlyBoundaryRecord $backupBoundaryViolation)) 'Backup access from FinalOnly must fail the boundary.'
+$finalFilesystemMutation = $validFinalBoundaries | ConvertTo-Json | ConvertFrom-Json
+$finalFilesystemMutation.filesystem_final_modified = $true
+Assert-True (-not (Test-PythonFinalOnlyBoundaryRecord $finalFilesystemMutation)) 'Final filesystem mutation must fail the boundary.'
+
 Assert-True ($collector.Contains('#Requires -RunAsAdministrator')) 'Collector must require elevation.'
 foreach ($required in @(
     'before_sha256', 'append_sha256', 'PREFIX_OR_SUFFIX_HASH_MISMATCH',
@@ -469,4 +621,15 @@ Assert-True `
     PYTHON_STAGING_ONLY_AGENT_DENIAL_SEMANTICS = 'PASS'
     PYTHON_STAGING_ONLY_MUTATION_FAIL_CLOSED = 'PASS'
     PYTHON_STAGING_ONLY_NO_ACL_SERVICE_MT5_ORDERS = 'PASS'
+    PYTHON_FINAL_ONLY_DEFAULT_GATEWAY_UNCHANGED = 'PASS'
+    PYTHON_FINAL_ONLY_DEFAULT_AGENT_UNCHANGED = 'PASS'
+    PYTHON_FINAL_ONLY_PRIOR_MODES_UNCHANGED = 'PASS'
+    PYTHON_FINAL_ONLY_EXACT_TARGET_AND_REPORTS = 'PASS'
+    PYTHON_FINAL_ONLY_IDENTITY_PATH_REPARSE_FAIL_CLOSED = 'PASS'
+    PYTHON_FINAL_ONLY_GATEWAY_READ_EXECUTE_IMPORTS = 'PASS'
+    PYTHON_FINAL_ONLY_MT5_METADATA_WITHOUT_IMPORT = 'PASS'
+    PYTHON_FINAL_ONLY_AGENT_DENIAL_SEMANTICS = 'PASS'
+    PYTHON_FINAL_ONLY_MUTATION_FAIL_CLOSED = 'PASS'
+    PYTHON_FINAL_ONLY_STAGING_BACKUP_BOUNDARIES = 'PASS'
+    PYTHON_FINAL_ONLY_NO_ACL_SERVICE_MT5_ORDERS = 'PASS'
 } | ConvertTo-Json
