@@ -27,7 +27,8 @@ if FASTAPI_AVAILABLE:
     from trading_lab.position_sizer import PositionSizer
     from trading_lab.research_store import ResearchStore
     from trading_lab.risk_engine import RiskEngine
-    from tests.fakes import FakeMT5Adapter
+from tests.fakes import FakeMT5Adapter
+from tests.audit_helpers import precreated_audit_path
 
 
 @unittest.skipUnless(FASTAPI_AVAILABLE, "FastAPI hash-locked dependencies are not installed")
@@ -40,7 +41,9 @@ class FastApiServiceTests(unittest.TestCase):
         key_path = directory / "gateway.key"
         key_path.write_text(self.KEY, encoding="ascii")
         self.adapter = FakeMT5Adapter()
-        audit = HashChainAuditLog(directory / "audit.jsonl")
+        audit = HashChainAuditLog(
+            precreated_audit_path(directory / "audit.jsonl")
+        )
         store = ResearchStore(directory / "research.db")
         guard = AccountGuard(12345678, "Broker-Demo")
         limits = RiskLimits(0.0025, 0.1, 30.0, 1, 0.1, 0.01, 20, 300)

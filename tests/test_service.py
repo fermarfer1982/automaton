@@ -6,6 +6,8 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+from tests.audit_helpers import precreated_audit_path
+
 from trading_lab.account_guard import AccountGuard
 from trading_lab.application import GatewayApplication
 from trading_lab.audit import HashChainAuditLog
@@ -25,7 +27,9 @@ class GatewayApplicationTests(unittest.TestCase):
     def test_paper_market_observation_reconciles_without_mt5_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             adapter = FakeMT5Adapter()
-            audit = HashChainAuditLog(Path(directory) / "audit.jsonl")
+            audit = HashChainAuditLog(
+                precreated_audit_path(Path(directory) / "audit.jsonl")
+            )
             guard = AccountGuard(12345678, "Broker-Demo")
             research = ResearchStore(Path(directory) / "research.db")
             paper = PaperEngine(research, audit)
@@ -66,7 +70,9 @@ class GatewayApplicationTests(unittest.TestCase):
     def test_health_and_market_observation_never_execute(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             adapter = FakeMT5Adapter()
-            audit = HashChainAuditLog(Path(directory) / "audit.jsonl")
+            audit = HashChainAuditLog(
+                precreated_audit_path(Path(directory) / "audit.jsonl")
+            )
             guard = AccountGuard(12345678, "Broker-Demo")
             gateway = MT5Gateway(
                 mode=TradingMode.OBSERVE_ONLY,
@@ -115,7 +121,9 @@ class GatewayApplicationTests(unittest.TestCase):
     def test_market_endpoint_rejects_every_other_symbol(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             adapter = FakeMT5Adapter()
-            audit = HashChainAuditLog(Path(directory) / "audit.jsonl")
+            audit = HashChainAuditLog(
+                precreated_audit_path(Path(directory) / "audit.jsonl")
+            )
             guard = AccountGuard(12345678, "Broker-Demo")
             app = GatewayApplication(
                 mode=TradingMode.OBSERVE_ONLY,

@@ -10,6 +10,7 @@ from trading_lab.audit import HashChainAuditLog
 from trading_lab.paper_engine import PaperEngine
 from trading_lab.research_store import ResearchStore
 from tests.fakes import FakeMT5Adapter
+from tests.audit_helpers import precreated_audit_path
 from tests.test_risk_engine import proposal
 
 
@@ -18,7 +19,9 @@ class PaperEngineTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         directory = Path(self.temp.name)
         self.store = ResearchStore(directory / "research.db")
-        self.audit = HashChainAuditLog(directory / "audit.jsonl")
+        self.audit = HashChainAuditLog(
+            precreated_audit_path(directory / "audit.jsonl")
+        )
         self.engine = PaperEngine(self.store, self.audit)
         self.adapter = FakeMT5Adapter()
         self.opened_at = datetime(2026, 8, 11, 10, 0, tzinfo=UTC)

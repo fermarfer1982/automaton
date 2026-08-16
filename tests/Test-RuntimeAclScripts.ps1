@@ -10,10 +10,12 @@ $pythonStagingOnlyPath = Join-Path $workspace 'scripts\Test-PythonStagingOnlyRun
 $pythonFinalOnlyPath = Join-Path $workspace 'scripts\Test-PythonFinalOnlyRuntimeAcl.ps1'
 $gatewayHealthOnlyPath = Join-Path $workspace 'scripts\Test-GatewayHealthOnly.ps1'
 $securityAppendOnlyPath = Join-Path $workspace 'scripts\Test-SecurityAppendOnly.ps1'
+$auditAppendOnlyPath = Join-Path $workspace 'scripts\Test-AuditJournalAppendOnly.ps1'
 $collectorPath = Join-Path $workspace 'scripts\Collect-RuntimeAclResults.ps1'
 $paths = @(
     $agentPath, $gatewayPath, $pythonBaseOnlyPath, $pythonStagingOnlyPath,
-    $pythonFinalOnlyPath, $securityAppendOnlyPath, $collectorPath
+    $pythonFinalOnlyPath, $securityAppendOnlyPath, $auditAppendOnlyPath,
+    $collectorPath
 )
 
 function Assert-True([bool] $Condition, [string] $Message) {
@@ -58,6 +60,7 @@ $healthAst = [System.Management.Automation.Language.Parser]::ParseFile(
 Assert-True ($healthParseErrors.Count -eq 0) 'Gateway health-only harness has AST errors.'
 $gatewayHealthOnly = [System.IO.File]::ReadAllText($gatewayHealthOnlyPath)
 $securityAppendOnly = $sources[$securityAppendOnlyPath]
+$auditAppendOnly = $sources[$auditAppendOnlyPath]
 
 foreach ($required in @(
     "mode = 'SECURITY_APPEND_ONLY'",
@@ -77,6 +80,27 @@ foreach ($forbidden in @(
     '[System.IO.File]::Delete', '[System.IO.File]::Move'
 )) {
     Assert-True (-not $securityAppendOnly.Contains($forbidden)) "Forbidden security append probe mutation: $forbidden"
+}
+
+foreach ($required in @(
+    "mode = 'AUDIT_APPEND_ONLY'",
+    "`$journalPath = 'C:\ProgramData\AutomatonMT5Lab\audit\journal\audit.jsonl'",
+    'from trading_lab.sqlite_audit import DualAuditLog',
+    '"purpose": "AUDIT_APPEND_PROBE"',
+    'FILE_WRITE_DATA | SYNCHRONIZE', 'DELETE | SYNCHRONIZE',
+    'FILE_LIST_DIRECTORY | FILE_ADD_FILE | SYNCHRONIZE',
+    'OPEN_EXISTING = 3', 'journal_directory_other_files_modified = $false',
+    'mt5_imported = $false', 'acl_modified = $false'
+)) {
+    Assert-True ($auditAppendOnly.Contains($required)) "Audit append-only probe is missing: $required"
+}
+foreach ($forbidden in @(
+    'Set-Acl', 'icacls', 'takeown', 'MetaTrader5.initialize',
+    'MetaTrader5.login', '.order_check(', '.order_send(', 'TRUNCATE_EXISTING',
+    '[System.IO.File]::Delete', '[System.IO.File]::Move',
+    'path.open("a"', 'open("a"'
+)) {
+    Assert-True (-not $auditAppendOnly.Contains($forbidden)) "Forbidden audit append probe mutation: $forbidden"
 }
 
 Assert-True `
@@ -212,8 +236,9 @@ foreach ($required in @(
 }
 foreach ($required in @(
     'sqlite3.connect', 'PRAGMA journal_mode=WAL', '"-wal"', '"-shm"',
-    'path.open("a", encoding="utf-8", newline="\n")', 'handle.flush()',
-    'os.fsync(handle.fileno())', 'from trading_lab.windows_append_log import WindowsAppendOnlyFileHandler',
+    'from trading_lab.sqlite_audit import DualAuditLog',
+    'audit = DualAuditLog(path, database_path)',
+    'from trading_lab.windows_append_log import WindowsAppendOnlyFileHandler',
     'handler = WindowsAppendOnlyFileHandler()', 'SECURITY_APPEND_PROBE %s',
     'CRITICAL_FAIL:', 'PROTECTED_RIGHT_GRANTED_NO_MUTATION_PERFORMED'
 )) {
@@ -807,4 +832,8 @@ Assert-True `
     SECURITY_APPEND_ONLY_EXACT_PATH = 'PASS'
     SECURITY_APPEND_ONLY_REQUIRED_RIGHTS = 'PASS'
     SECURITY_APPEND_ONLY_NO_MT5_ACL_SERVICES = 'PASS'
+    AUDIT_APPEND_ONLY_PROBE_AST = 'PASS'
+    AUDIT_APPEND_ONLY_DUAL_CHAIN = 'PASS'
+    AUDIT_APPEND_ONLY_REQUIRED_RIGHTS = 'PASS'
+    AUDIT_APPEND_ONLY_NO_MT5_ACL_SERVICES = 'PASS'
 } | ConvertTo-Json

@@ -26,8 +26,12 @@ FILE_ATTRIBUTE_NORMAL = 0x00000080
 FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
-SECURITY_LOG_DESIRED_ACCESS = FILE_APPEND_DATA | SYNCHRONIZE
-SECURITY_LOG_SHARE_MODE = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+APPEND_ONLY_DESIRED_ACCESS = FILE_APPEND_DATA | SYNCHRONIZE
+APPEND_ONLY_SHARE_MODE = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+# Compatibility names for callers that previously consumed the security-specific
+# constants. Both aliases retain the shared primitive as the single source of truth.
+SECURITY_LOG_DESIRED_ACCESS = APPEND_ONLY_DESIRED_ACCESS
+SECURITY_LOG_SHARE_MODE = APPEND_ONLY_SHARE_MODE
 
 
 class _AppendApi(Protocol):
@@ -78,8 +82,8 @@ class _Win32AppendApi:
     def open_existing_append(self, path: Path) -> object:
         handle = self._create_file(
             str(path),
-            SECURITY_LOG_DESIRED_ACCESS,
-            SECURITY_LOG_SHARE_MODE,
+            APPEND_ONLY_DESIRED_ACCESS,
+            APPEND_ONLY_SHARE_MODE,
             None,
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL,
@@ -89,7 +93,7 @@ class _Win32AppendApi:
             handle if isinstance(handle, int) else ctypes.cast(handle, ctypes.c_void_p).value
         )
         if handle_value == INVALID_HANDLE_VALUE:
-            self._raise_last_error("CreateFileW security log append open failed")
+            self._raise_last_error("CreateFileW append-only open failed")
         return handle
 
     def write(self, handle: object, payload: bytes) -> None:
@@ -102,16 +106,16 @@ class _Win32AppendApi:
             ctypes.byref(bytes_written),
             None,
         ):
-            self._raise_last_error("WriteFile security log append failed")
+            self._raise_last_error("WriteFile append-only write failed")
         if bytes_written.value != len(payload):
             raise OSError(
-                "WriteFile security log append was incomplete: "
+                "WriteFile append-only write was incomplete: "
                 f"{bytes_written.value}/{len(payload)} bytes"
             )
 
     def close(self, handle: object) -> None:
         if not self._close_handle(handle):
-            self._raise_last_error("CloseHandle security log failed")
+            self._raise_last_error("CloseHandle append-only file failed")
 
 
 def _normalized_absolute(path: Path) -> str:
@@ -121,6 +125,57 @@ def _normalized_absolute(path: Path) -> str:
 def _is_reparse_point(path: Path) -> bool:
     attributes = getattr(os.lstat(path), "st_file_attributes", 0)
     return bool(attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def validate_existing_append_only_file(path: str | os.PathLike[str]) -> Path:
+    candidate = Path(path)
+    parent = candidate.parent
+    if not parent.exists() or not parent.is_dir():
+        raise FileNotFoundError(f"append-only directory is missing: {parent}")
+    if parent.is_symlink() or _is_reparse_point(parent):
+        raise OSError("append-only directory must not be a reparse point")
+    if not candidate.exists() or not candidate.is_file():
+        raise FileNotFoundError(
+            f"pre-created append-only file is missing: {candidate}"
+        )
+    if candidate.is_symlink() or _is_reparse_point(candidate):
+        raise OSError("append-only file must not be a reparse point")
+    return candidate
+
+
+class WindowsAppendOnlyFile:
+    """Write bytes to one existing, non-reparse Windows file with append rights."""
+
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        _api: _AppendApi | None = None,
+    ) -> None:
+        self.path = Path(path)
+        self._handle: object | None = None
+        self._api = _api if _api is not None else _Win32AppendApi()
+        self.path = validate_existing_append_only_file(self.path)
+        self._handle = self._api.open_existing_append(self.path)
+
+    def append(self, payload: bytes) -> None:
+        if not isinstance(payload, bytes):
+            raise TypeError("append-only payload must be bytes")
+        if self._handle is None:
+            raise OSError("append-only file handle is closed")
+        self._api.write(self._handle, payload)
+
+    def close(self) -> None:
+        handle = self._handle
+        self._handle = None
+        if handle is not None:
+            self._api.close(handle)
+
+    def __enter__(self) -> WindowsAppendOnlyFile:
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
 
 
 class WindowsAppendOnlyFileHandler(logging.Handler):
@@ -142,37 +197,30 @@ class WindowsAppendOnlyFileHandler(logging.Handler):
         ):
             raise ValueError("security log path is not the exact protected path")
 
-        parent = candidate.parent
-        if not parent.exists() or not parent.is_dir():
-            raise FileNotFoundError(f"security log directory is missing: {parent}")
-        if parent.is_symlink() or _is_reparse_point(parent):
-            raise OSError("security log directory must not be a reparse point")
-        if not candidate.exists() or not candidate.is_file():
-            raise FileNotFoundError(f"pre-created security log is missing: {candidate}")
-        if candidate.is_symlink() or _is_reparse_point(candidate):
-            raise OSError("security log file must not be a reparse point")
-
         self.baseFilename = str(candidate)
         self.mode = "append-only-win32"
         self.encoding = "utf-8"
         self.errors = "strict"
-        self._handle = self._api.open_existing_append(candidate)
+        self._writer: WindowsAppendOnlyFile | None = WindowsAppendOnlyFile(
+            candidate,
+            _api=self._api,
+        )
 
     def emit(self, record: logging.LogRecord) -> None:
-        if self._handle is None:
+        if self._writer is None:
             raise OSError("security log handle is closed")
         message = self.format(record).rstrip("\r\n") + self.terminator
-        self._api.write(self._handle, message.encode(self.encoding, self.errors))
+        self._writer.append(message.encode(self.encoding, self.errors))
 
     def close(self) -> None:
         close_error: BaseException | None = None
         self.acquire()
         try:
-            handle = self._handle
-            self._handle = None
-            if handle is not None:
+            writer = getattr(self, "_writer", None)
+            self._writer = None
+            if writer is not None:
                 try:
-                    self._api.close(handle)
+                    writer.close()
                 except BaseException as exc:  # preserve WinError after local cleanup
                     close_error = exc
         finally:
@@ -183,6 +231,8 @@ class WindowsAppendOnlyFileHandler(logging.Handler):
 
 
 __all__ = [
+    "APPEND_ONLY_DESIRED_ACCESS",
+    "APPEND_ONLY_SHARE_MODE",
     "FILE_APPEND_DATA",
     "FILE_ATTRIBUTE_NORMAL",
     "FILE_SHARE_DELETE",
@@ -194,5 +244,7 @@ __all__ = [
     "SECURITY_LOG_PATH",
     "SECURITY_LOG_SHARE_MODE",
     "SYNCHRONIZE",
+    "WindowsAppendOnlyFile",
     "WindowsAppendOnlyFileHandler",
+    "validate_existing_append_only_file",
 ]

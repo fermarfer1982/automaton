@@ -115,6 +115,8 @@ def serve(
         )
         adapter = None
         health_only = not mt5_access_enabled
+        health_start_audit_completed = False
+        primary_error: BaseException | None = None
         try:
             try:
                 from .fastapi_service import create_fastapi_app
@@ -126,6 +128,7 @@ def serve(
                     runtime_identity_verified=True,
                 )
                 application.record_gateway_started()
+                health_start_audit_completed = True
             else:
                 adapter = acquire_mt5_adapter(config, mt5_access_enabled=True)
                 from .factory import build_application
@@ -141,15 +144,31 @@ def serve(
                 port=port,
                 controlled_stdin_shutdown=controlled_stdin_shutdown,
             )
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            if health_only and "application" in locals():
-                application.record_gateway_stopped()
+            stop_audit_error: BaseException | None = None
+            if health_only and health_start_audit_completed:
+                try:
+                    application.record_gateway_stopped()
+                except BaseException as exc:
+                    if primary_error is None:
+                        stop_audit_error = exc
+                    else:
+                        logger.error(
+                            "gateway_stop_audit_failed primary_error_preserved=true "
+                            "secondary_error_type=%s",
+                            type(exc).__name__,
+                        )
             if adapter is not None:
                 adapter.shutdown()
             logger.info(
                 "gateway_shutdown mt5_shutdown_called=%s",
                 str(adapter is not None).lower(),
             )
+            if stop_audit_error is not None:
+                raise stop_audit_error
 
 
 def main() -> None:

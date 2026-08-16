@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+from tests.audit_helpers import precreated_audit_path
 from trading_lab.config import RiskLimits, SecurityConfig
 from trading_lab.domain import TradingMode
 from trading_lab.readiness import (
@@ -19,6 +20,7 @@ from trading_lab.windows_acl import AclVerification
 
 
 def security_config(directory: Path) -> SecurityConfig:
+    audit_path = precreated_audit_path(directory / "data" / "audit.jsonl")
     return SecurityConfig(
         schema_version=1,
         trading_mode=TradingMode.OBSERVE_ONLY,
@@ -27,7 +29,7 @@ def security_config(directory: Path) -> SecurityConfig:
         allowed_symbol="XAUUSD",
         magic_number=26081101,
         mt5_terminal_path=directory / "terminal64.exe",
-        audit_path=directory / "data" / "audit.jsonl",
+        audit_path=audit_path,
         research_db_path=directory / "data" / "research.db",
         demo_authorization_path=directory / "control" / "demo.authorization",
         kill_switch_path=directory / "control" / "KILL_SWITCH",

@@ -11,6 +11,21 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SourceBoundaryTests(unittest.TestCase):
+    def test_audit_jsonl_uses_only_shared_win32_append_boundary(self) -> None:
+        audit = (ROOT / "trading_lab" / "audit.py").read_text(encoding="utf-8")
+        primitive = (
+            ROOT / "trading_lab" / "windows_append_log.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("with WindowsAppendOnlyFile(self.path) as writer:", audit)
+        self.assertIn("writer.append(encoded_record)", audit)
+        for forbidden in (
+            'self.path.open("a"', 'open("a"', "io.open(", "GENERIC_WRITE",
+            "FILE_WRITE_DATA", "FlushFileBuffers", ".seek(", ".truncate(",
+            ".replace(", ".rename(", ".mkdir(", ".touch(",
+            "MetaTrader5", "Set-Acl", "icacls",
+        ):
+            self.assertNotIn(forbidden, audit + primitive)
+
     def test_automaton_defaults_to_restricted_trading_profile(self) -> None:
         source = (ROOT / "src" / "trading" / "runtime-profile.ts").read_text(encoding="utf-8")
         self.assertIn('return "trading_lab"', source)
@@ -43,6 +58,7 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn('"scripts/Test-PythonFinalOnlyRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Test-GatewayHealthOnly.ps1"', source)
         self.assertIn('"scripts/Test-SecurityAppendOnly.ps1"', source)
+        self.assertIn('"scripts/Test-AuditJournalAppendOnly.ps1"', source)
         self.assertIn('"scripts/Collect-RuntimeAclResults.ps1"', source)
         self.assertIn('"scripts/Install-TradingLabPythonRuntime.ps1"', source)
         self.assertIn('"scripts/TradingLabPythonInventory.ps1"', source)
@@ -249,17 +265,22 @@ class SourceBoundaryTests(unittest.TestCase):
         security_append_only = (
             ROOT / "scripts" / "Test-SecurityAppendOnly.ps1"
         ).read_text(encoding="utf-8")
+        audit_append_only = (
+            ROOT / "scripts" / "Test-AuditJournalAppendOnly.ps1"
+        ).read_text(encoding="utf-8")
         collector = (ROOT / "scripts" / "Collect-RuntimeAclResults.ps1").read_text(encoding="utf-8")
         pattern = re.compile(r"\$(?:\w+Source|source)\s*=\s*@'\n(.*?)\n'@", re.DOTALL)
         gateway_blocks = pattern.findall(gateway)
         base_only_blocks = pattern.findall(base_only)
         staging_only_blocks = pattern.findall(staging_only)
         security_append_only_blocks = pattern.findall(security_append_only)
+        audit_append_only_blocks = pattern.findall(audit_append_only)
         collector_blocks = pattern.findall(collector)
         self.assertEqual(6, len(gateway_blocks))
         self.assertEqual(1, len(base_only_blocks))
         self.assertEqual(1, len(staging_only_blocks))
         self.assertEqual(1, len(security_append_only_blocks))
+        self.assertEqual(1, len(audit_append_only_blocks))
         self.assertEqual(1, len(collector_blocks))
         for index, block in enumerate(
             [
@@ -267,6 +288,7 @@ class SourceBoundaryTests(unittest.TestCase):
                 *base_only_blocks,
                 *staging_only_blocks,
                 *security_append_only_blocks,
+                *audit_append_only_blocks,
                 *collector_blocks,
             ],
             start=1,
@@ -297,6 +319,7 @@ class SourceBoundaryTests(unittest.TestCase):
                 "Test-PythonStagingOnlyRuntimeAcl.ps1",
                 "Test-PythonFinalOnlyRuntimeAcl.ps1",
                 "Test-SecurityAppendOnly.ps1",
+                "Test-AuditJournalAppendOnly.ps1",
                 "Collect-RuntimeAclResults.ps1",
                 "Install-TradingLabPythonRuntime.ps1",
                 "TradingLabPythonInventory.ps1",

@@ -7,6 +7,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
+from tests.audit_helpers import precreated_audit_path
 from trading_lab.sqlite_audit import DualAuditLog
 
 
@@ -14,7 +15,7 @@ class DualAuditTests(unittest.TestCase):
     def test_mirrors_and_verifies_both_append_only_stores(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            audit = DualAuditLog(root / "audit.jsonl", root / "audit.db")
+            audit = DualAuditLog(precreated_audit_path(root / "audit.jsonl"), root / "audit.db")
             audit.append("decision", {"action": "HOLD"})
             audit.append("proposal", {"proposal_id": "p1"})
             result = audit.verify()
@@ -27,16 +28,17 @@ class DualAuditTests(unittest.TestCase):
     def test_detects_missing_sqlite_mirror_tail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            audit = DualAuditLog(root / "audit.jsonl", root / "audit.db")
+            audit_path = precreated_audit_path(root / "audit.jsonl")
+            audit = DualAuditLog(audit_path, root / "audit.db")
             audit.append("decision", {"action": "HOLD"})
             (root / "audit.db").unlink()
-            rebuilt = DualAuditLog(root / "audit.jsonl", root / "audit.db")
+            rebuilt = DualAuditLog(audit_path, root / "audit.db")
             self.assertFalse(rebuilt.verify().valid)
 
     def test_uses_same_redacted_record_in_both_stores(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            audit = DualAuditLog(root / "audit.jsonl", root / "audit.db")
+            audit = DualAuditLog(precreated_audit_path(root / "audit.jsonl"), root / "audit.db")
             audit.append("secret_test", {"api_key": "never-store-this"})
             self.assertNotIn("never-store-this", (root / "audit.jsonl").read_text(encoding="utf-8"))
             with closing(sqlite3.connect(root / "audit.db")) as connection:
@@ -46,7 +48,7 @@ class DualAuditTests(unittest.TestCase):
     def test_materialized_security_projections_are_append_only_and_verified(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            audit = DualAuditLog(root / "audit.jsonl", root / "audit.db")
+            audit = DualAuditLog(precreated_audit_path(root / "audit.jsonl"), root / "audit.db")
             audit.append(
                 "risk_engine_decision",
                 {"stage": "POST_LLM_CHECK", "failed_codes": ["SPREAD_TOO_WIDE"]},

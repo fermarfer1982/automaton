@@ -16,6 +16,7 @@ from trading_lab.paper_engine import PaperEngine
 from trading_lab.research_store import ResearchStore
 from trading_lab.risk_engine import RiskEngine
 from tests.fakes import FakeMT5Adapter
+from tests.audit_helpers import precreated_audit_path
 from tests.test_risk_engine import proposal
 
 
@@ -24,7 +25,9 @@ class GatewayTests(unittest.TestCase):
         adapter = FakeMT5Adapter()
         authorization_path = Path(directory) / "demo.authorization"
         kill_path = Path(directory) / "KILL_SWITCH"
-        audit = audit or HashChainAuditLog(Path(directory) / "audit.jsonl")
+        audit = audit or HashChainAuditLog(
+            precreated_audit_path(Path(directory) / "audit.jsonl")
+        )
         research = ResearchStore(Path(directory) / "research.db")
         paper = PaperEngine(research, audit)
         gateway = MT5Gateway(
@@ -76,7 +79,9 @@ class GatewayTests(unittest.TestCase):
                 return self.delegate.has_recent_entry(window_seconds)
 
         with tempfile.TemporaryDirectory() as directory:
-            audit = FailingAudit(Path(directory) / "audit.jsonl")
+            audit = FailingAudit(
+                precreated_audit_path(Path(directory) / "audit.jsonl")
+            )
             gateway, adapter, authorization_path, _ = self.build_gateway(
                 directory, TradingMode.DEMO_EXECUTION, audit=audit
             )
@@ -254,7 +259,9 @@ class GatewayTests(unittest.TestCase):
                 return self.delegate.has_recent_entry(window_seconds)
 
         with tempfile.TemporaryDirectory() as directory:
-            audit = ResultFailingAudit(Path(directory) / "audit.jsonl")
+            audit = ResultFailingAudit(
+                precreated_audit_path(Path(directory) / "audit.jsonl")
+            )
             gateway, adapter, authorization_path, _ = self.build_gateway(
                 directory, TradingMode.DEMO_EXECUTION, audit=audit
             )

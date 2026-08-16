@@ -10,6 +10,8 @@ from unittest import mock
 
 from trading_lab.logging_config import configure_gateway_logging
 from trading_lab.windows_append_log import (
+    APPEND_ONLY_DESIRED_ACCESS,
+    APPEND_ONLY_SHARE_MODE,
     FILE_APPEND_DATA,
     FILE_ATTRIBUTE_NORMAL,
     FILE_SHARE_DELETE,
@@ -20,6 +22,7 @@ from trading_lab.windows_append_log import (
     SECURITY_LOG_DESIRED_ACCESS,
     SECURITY_LOG_SHARE_MODE,
     SYNCHRONIZE,
+    WindowsAppendOnlyFile,
     WindowsAppendOnlyFileHandler,
     _Win32AppendApi,
 )
@@ -80,6 +83,9 @@ class WindowsAppendOnlyFileHandlerTests(unittest.TestCase):
         ):
             return WindowsAppendOnlyFileHandler(_api=api)
 
+    def _writer(self, path: Path, api: FakeAppendApi) -> WindowsAppendOnlyFile:
+        return WindowsAppendOnlyFile(path, _api=api)
+
     def test_createfilew_uses_exact_append_only_contract(self) -> None:
         api = _Win32AppendApi.__new__(_Win32AppendApi)
         create_file = mock.Mock(return_value=123)
@@ -98,10 +104,12 @@ class WindowsAppendOnlyFileHandlerTests(unittest.TestCase):
             None,
         )
         self.assertEqual(FILE_APPEND_DATA | SYNCHRONIZE, SECURITY_LOG_DESIRED_ACCESS)
+        self.assertEqual(FILE_APPEND_DATA | SYNCHRONIZE, APPEND_ONLY_DESIRED_ACCESS)
         self.assertEqual(
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             SECURITY_LOG_SHARE_MODE,
         )
+        self.assertEqual(SECURITY_LOG_SHARE_MODE, APPEND_ONLY_SHARE_MODE)
         self.assertEqual(0, SECURITY_LOG_DESIRED_ACCESS & 0x0002)
         self.assertEqual(0, SECURITY_LOG_DESIRED_ACCESS & 0x40000000)
 
@@ -123,6 +131,17 @@ class WindowsAppendOnlyFileHandlerTests(unittest.TestCase):
                 handler.close()
             self.assertEqual(b"win32-smoke\n", path.read_bytes())
 
+    @unittest.skipUnless(os.name == "nt", "Win32 primitive smoke test")
+    def test_real_shared_primitive_appends_to_precreated_temporary_file(self) -> None:
+        temporary, path, _ = self._fixture()
+        with temporary:
+            writer = WindowsAppendOnlyFile(path)
+            try:
+                writer.append("audit-España\n".encode("utf-8"))
+            finally:
+                writer.close()
+            self.assertEqual("audit-España\n".encode("utf-8"), path.read_bytes())
+
     def test_invalid_handle_fails_closed_with_winerror(self) -> None:
         api = _Win32AppendApi.__new__(_Win32AppendApi)
         api._create_file = mock.Mock(return_value=INVALID_HANDLE_VALUE)
@@ -137,6 +156,14 @@ class WindowsAppendOnlyFileHandlerTests(unittest.TestCase):
             api = FakeAppendApi()
             with self.assertRaises(FileNotFoundError):
                 self._handler(path, api)
+            self.assertEqual([], api.opened)
+
+    def test_shared_writer_missing_file_fails_before_open(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "audit.jsonl"
+            api = FakeAppendApi()
+            with self.assertRaises(FileNotFoundError):
+                self._writer(path, api)
             self.assertEqual([], api.opened)
 
     def test_missing_directory_fails_before_open(self) -> None:
@@ -166,6 +193,16 @@ class WindowsAppendOnlyFileHandlerTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(OSError, "reparse point"):
                 self._handler(path, api)
+            self.assertEqual([], api.opened)
+
+    def test_shared_writer_reparse_file_fails_before_open(self) -> None:
+        temporary, path, api = self._fixture()
+        with temporary, mock.patch(
+            "trading_lab.windows_append_log._is_reparse_point",
+            side_effect=lambda candidate: candidate == path,
+        ):
+            with self.assertRaisesRegex(OSError, "reparse point"):
+                self._writer(path, api)
             self.assertEqual([], api.opened)
 
     def test_reparse_directory_fails_before_open(self) -> None:
@@ -203,6 +240,18 @@ class WindowsAppendOnlyFileHandlerTests(unittest.TestCase):
                 self.assertEqual([path], api.opened)
             finally:
                 handler.close()
+
+    def test_shared_writer_uses_one_handle_and_one_write_per_append(self) -> None:
+        temporary, path, api = self._fixture()
+        with temporary:
+            writer = self._writer(path, api)
+            writer.append(b"first\n")
+            writer.append(b"second\n")
+            writer.close()
+            writer.close()
+            self.assertEqual([path], api.opened)
+            self.assertEqual([b"first\n", b"second\n"], api.writes)
+            self.assertEqual([api.handle], api.closed)
 
     def test_write_error_propagates_fail_closed(self) -> None:
         temporary, path, api = self._fixture()

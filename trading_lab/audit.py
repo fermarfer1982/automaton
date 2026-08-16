@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import threading
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+from .windows_append_log import (
+    WindowsAppendOnlyFile,
+    validate_existing_append_only_file,
+)
 
 
 _REDACTED_KEYS = {
@@ -70,21 +74,21 @@ class HashChainAuditLog:
         if not event or not isinstance(event, str):
             raise ValueError("audit event must be a non-empty string")
         with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            previous_hash = self._last_hash()
-            unsigned = {
-                "schema_version": 1,
-                "timestamp": datetime.now(UTC).isoformat(),
-                "event": event,
-                "payload": _sanitize(payload),
-                "previous_hash": previous_hash,
-            }
-            record_hash = hashlib.sha256(_canonical(unsigned).encode("utf-8")).hexdigest()
-            record = {**unsigned, "record_hash": record_hash}
-            with self.path.open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(_canonical(record) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            with WindowsAppendOnlyFile(self.path) as writer:
+                previous_hash = self._last_hash()
+                unsigned = {
+                    "schema_version": 1,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "event": event,
+                    "payload": _sanitize(payload),
+                    "previous_hash": previous_hash,
+                }
+                record_hash = hashlib.sha256(
+                    _canonical(unsigned).encode("utf-8")
+                ).hexdigest()
+                record = {**unsigned, "record_hash": record_hash}
+                encoded_record = (_canonical(record) + "\n").encode("utf-8")
+                writer.append(encoded_record)
             return record
 
     def verify(self) -> AuditVerification:
@@ -94,9 +98,8 @@ class HashChainAuditLog:
     def _verify_unlocked(self) -> AuditVerification:
         previous_hash = "0" * 64
         records = 0
-        if not self.path.exists():
-            return AuditVerification(valid=True, records=0)
         try:
+            validate_existing_append_only_file(self.path)
             with self.path.open("r", encoding="utf-8") as handle:
                 for line_number, line in enumerate(handle, start=1):
                     if not line.strip():

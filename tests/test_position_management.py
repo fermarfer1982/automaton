@@ -17,13 +17,16 @@ from trading_lab.paper_engine import PaperEngine
 from trading_lab.research_store import ResearchStore
 from trading_lab.risk_engine import RiskEngine
 from tests.fakes import FakeMT5Adapter
+from tests.audit_helpers import precreated_audit_path
 from tests.test_risk_engine import proposal
 
 
 class PositionManagementTests(unittest.TestCase):
     def build(self, directory: Path, mode: TradingMode, *, authorize: bool = True):
         adapter = FakeMT5Adapter()
-        audit = HashChainAuditLog(directory / "audit.jsonl")
+        audit = HashChainAuditLog(
+            precreated_audit_path(directory / "audit.jsonl")
+        )
         store = ResearchStore(directory / "research.db")
         paper = PaperEngine(store, audit)
         if mode is TradingMode.DEMO_EXECUTION and authorize:

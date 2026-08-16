@@ -220,6 +220,7 @@ $ipcPath = Join-Path $labRoot 'ipc'
 $ipcKeyPath = Join-Path $ipcPath 'automaton.key'
 $researchPath = Join-Path $labRoot 'research'
 $auditSqlitePath = Join-Path $labRoot 'audit\sqlite'
+$auditDbPath = Join-Path $auditSqlitePath 'audit.db'
 $auditJournalPath = Join-Path $labRoot 'audit\journal\audit.jsonl'
 $securityLogPath = Join-Path $labRoot 'logs\security\security.log'
 $agentStatePath = 'C:\Users\AutomatonAgent\.automaton'
@@ -784,47 +785,36 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 function Add-AuditJournalAppendTest {
     Set-TestContext 'AUDIT_JOURNAL' 'JOURNAL_APPEND'
     $source = @'
-import datetime
 import hashlib
 import json
 import os
 import pathlib
+import sys
 
 path = pathlib.Path(os.environ["AUTOMATON_RUNTIME_TEST_JOURNAL"])
+database_path = pathlib.Path(os.environ["AUTOMATON_RUNTIME_TEST_AUDIT_DB"])
 run_id = os.environ["AUTOMATON_RUNTIME_TEST_RUN_ID"]
+workspace = pathlib.Path(os.environ["AUTOMATON_RUNTIME_TEST_WORKSPACE"])
+if str(workspace) != r"C:\automaton" or workspace.is_symlink():
+    raise RuntimeError("WORKSPACE_IMPORT_ROOT_INVALID")
+sys.path.insert(0, str(workspace))
+from trading_lab.audit import _canonical
+from trading_lab.sqlite_audit import DualAuditLog
+
 before = path.read_bytes()
-previous_hash = "0" * 64
-records = 0
-for line_number, raw_line in enumerate(before.splitlines(), start=1):
-    if not raw_line.strip():
-        continue
-    record = json.loads(raw_line.decode("utf-8"))
-    claimed_hash = record.pop("record_hash")
-    if record.get("previous_hash") != previous_hash:
-        raise RuntimeError("PREEXISTING_CHAIN_LINK_INVALID")
-    canonical = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
-    calculated = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    if calculated != claimed_hash:
-        raise RuntimeError("PREEXISTING_CHAIN_HASH_INVALID")
-    previous_hash = claimed_hash
-    records += 1
-unsigned = {
-    "schema_version": 1,
-    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    "event": "runtime_acl_canary",
-    "payload": {"purpose": "runtime_acl_append_probe", "run_id": run_id},
-    "previous_hash": previous_hash,
-}
-canonical_unsigned = json.dumps(unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
-record = dict(unsigned)
-record["record_hash"] = hashlib.sha256(canonical_unsigned.encode("utf-8")).hexdigest()
-line = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False) + "\n"
-with path.open("a", encoding="utf-8", newline="\n") as handle:
-    handle.write(line)
-    handle.flush()
-    os.fsync(handle.fileno())
+audit = DualAuditLog(path, database_path)
+before_verification = audit.verify()
+if not before_verification.valid:
+    raise RuntimeError("PREEXISTING_DUAL_AUDIT_INVALID")
+record = audit.append(
+    "runtime_acl_canary",
+    {"purpose": "runtime_acl_append_probe", "run_id": run_id},
+)
+after_verification = audit.verify()
+if not after_verification.valid:
+    raise RuntimeError("POST_APPEND_DUAL_AUDIT_INVALID")
 after = path.read_bytes()
-encoded_line = line.encode("utf-8")
+encoded_line = (_canonical(record) + "\n").encode("utf-8")
 if after[:len(before)] != before or after[len(before):] != encoded_line:
     raise RuntimeError("IMMEDIATE_PREFIX_OR_SUFFIX_MISMATCH")
 result = {
@@ -832,17 +822,19 @@ result = {
     "before_sha256": hashlib.sha256(before).hexdigest(),
     "append_size": len(encoded_line),
     "append_sha256": hashlib.sha256(encoded_line).hexdigest(),
-    "records_before": records,
+    "records_before": before_verification.records,
     "record_hash": record["record_hash"],
 }
 print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 '@
     $invocation = Invoke-LocalPythonJson $source @{
         AUTOMATON_RUNTIME_TEST_JOURNAL = $auditJournalPath
+        AUTOMATON_RUNTIME_TEST_AUDIT_DB = $auditDbPath
         AUTOMATON_RUNTIME_TEST_RUN_ID = $normalizedRunId
+        AUTOMATON_RUNTIME_TEST_WORKSPACE = $workspace
     } 'audit-journal-append'
     $script:journalEvidence = Assert-PythonInvocation `
-        'JOURNAL_APPEND' $invocation 'CPYTHON_APPEND_FLUSH_FSYNC_SUCCEEDED'
+        'JOURNAL_APPEND' $invocation 'SHARED_WIN32_APPEND_DUAL_AUDIT_SUCCEEDED'
 }
 
 function Add-SecurityLogAppendTest {

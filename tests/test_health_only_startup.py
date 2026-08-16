@@ -189,6 +189,138 @@ class HealthOnlyStartupTests(unittest.TestCase):
             self.assertNotIn(self.KEY.casefold(), serialized_logs)
         self.assertNotIn("MetaTrader5", sys.modules)
 
+    def test_start_audit_failure_preserves_primary_and_skips_stop_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = replace(
+                self._config(root),
+                api_key_path=root / "gateway.key",
+                gateway_lock_path=root / "gateway.lock",
+            )
+            primary = OSError("primary startup audit failure")
+            application = Mock()
+            application.record_gateway_started.side_effect = primary
+            logger = Mock(spec=logging.Logger)
+            with (
+                patch(
+                    "trading_lab.service.load_gateway_bootstrap_config",
+                    return_value=config,
+                ),
+                patch("trading_lab.service.load_mt5_security_config"),
+                patch("trading_lab.service.resolve_mt5_access_enabled", return_value=False),
+                patch(
+                    "trading_lab.service.verify_windows_acl",
+                    return_value=AclVerification(True, "safe"),
+                ),
+                patch("trading_lab.service.configure_gateway_logging"),
+                patch("trading_lab.service.ApiKeyVerifier"),
+                patch("trading_lab.service.GatewayProcessLock") as process_lock,
+                patch(
+                    "trading_lab.service.build_health_only_application",
+                    return_value=application,
+                ),
+                patch("trading_lab.service._run_uvicorn") as run_uvicorn,
+                patch("trading_lab.service.logging.getLogger", return_value=logger),
+            ):
+                process_lock.return_value.__enter__.return_value = process_lock.return_value
+                with self.assertRaises(OSError) as raised:
+                    serve(
+                        root / "security.yaml",
+                        environment={"MT5_ACCESS_ENABLED": "false"},
+                    )
+            self.assertIs(primary, raised.exception)
+            application.record_gateway_stopped.assert_not_called()
+            run_uvicorn.assert_not_called()
+
+    def test_stop_audit_failure_does_not_replace_existing_runtime_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = replace(
+                self._config(root),
+                api_key_path=root / "gateway.key",
+                gateway_lock_path=root / "gateway.lock",
+            )
+            primary = RuntimeError("primary uvicorn failure")
+            secondary = OSError("secondary stop audit failure")
+            application = Mock()
+            application.record_gateway_stopped.side_effect = secondary
+            logger = Mock(spec=logging.Logger)
+            with (
+                patch(
+                    "trading_lab.service.load_gateway_bootstrap_config",
+                    return_value=config,
+                ),
+                patch("trading_lab.service.load_mt5_security_config"),
+                patch("trading_lab.service.resolve_mt5_access_enabled", return_value=False),
+                patch(
+                    "trading_lab.service.verify_windows_acl",
+                    return_value=AclVerification(True, "safe"),
+                ),
+                patch("trading_lab.service.configure_gateway_logging"),
+                patch("trading_lab.service.ApiKeyVerifier"),
+                patch("trading_lab.service.GatewayProcessLock") as process_lock,
+                patch(
+                    "trading_lab.service.build_health_only_application",
+                    return_value=application,
+                ),
+                patch("trading_lab.service._run_uvicorn", side_effect=primary),
+                patch("trading_lab.service.logging.getLogger", return_value=logger),
+            ):
+                process_lock.return_value.__enter__.return_value = process_lock.return_value
+                with self.assertRaises(RuntimeError) as raised:
+                    serve(
+                        root / "security.yaml",
+                        environment={"MT5_ACCESS_ENABLED": "false"},
+                    )
+            self.assertIs(primary, raised.exception)
+            application.record_gateway_started.assert_called_once_with()
+            application.record_gateway_stopped.assert_called_once_with()
+            logger.error.assert_called_once_with(
+                "gateway_stop_audit_failed primary_error_preserved=true "
+                "secondary_error_type=%s",
+                "OSError",
+            )
+
+    def test_stop_audit_failure_without_primary_remains_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = replace(
+                self._config(root),
+                api_key_path=root / "gateway.key",
+                gateway_lock_path=root / "gateway.lock",
+            )
+            stop_error = OSError("stop audit unavailable")
+            application = Mock()
+            application.record_gateway_stopped.side_effect = stop_error
+            with (
+                patch(
+                    "trading_lab.service.load_gateway_bootstrap_config",
+                    return_value=config,
+                ),
+                patch("trading_lab.service.load_mt5_security_config"),
+                patch("trading_lab.service.resolve_mt5_access_enabled", return_value=False),
+                patch(
+                    "trading_lab.service.verify_windows_acl",
+                    return_value=AclVerification(True, "safe"),
+                ),
+                patch("trading_lab.service.configure_gateway_logging"),
+                patch("trading_lab.service.ApiKeyVerifier"),
+                patch("trading_lab.service.GatewayProcessLock") as process_lock,
+                patch(
+                    "trading_lab.service.build_health_only_application",
+                    return_value=application,
+                ),
+                patch("trading_lab.service._run_uvicorn"),
+                patch("trading_lab.service.logging.getLogger", return_value=Mock()),
+            ):
+                process_lock.return_value.__enter__.return_value = process_lock.return_value
+                with self.assertRaises(OSError) as raised:
+                    serve(
+                        root / "security.yaml",
+                        environment={"MT5_ACCESS_ENABLED": "false"},
+                    )
+            self.assertIs(stop_error, raised.exception)
+
     def test_service_disabled_bootstraps_from_yaml_with_invalid_mt5_material(self) -> None:
         for account, protected_mt5_access in (
             (None, False),
