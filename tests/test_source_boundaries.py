@@ -633,6 +633,7 @@ class SourceBoundaryTests(unittest.TestCase):
         for forbidden in (
             "runas.exe", "Start-Process", "TaskKill", "Set-Acl", "0.0.0.0",
             "import MetaTrader5", ".order_check(", ".order_send(",
+            "System.Net.Http", "HttpClient", "Add-Type -AssemblyName",
         ):
             self.assertNotIn(forbidden, harness)
         for required in (
@@ -643,8 +644,31 @@ class SourceBoundaryTests(unittest.TestCase):
             "gateway-health-only-$normalizedRunId.json",
             "filesystem_runtime_modified",
             "acl_modified",
+            "Invoke-WebRequest",
+            "-UseBasicParsing",
+            "-TimeoutSec 3",
+            "$report = [ordered]@{",
+            "status = 'FAIL_INITIALIZING'",
+            "# BEGIN_RUNTIME_GUARD",
+            "# BEGIN_DURABLE_REPORT_FINALLY",
+            "Write-ExclusiveJson $reportPath $report",
+            "Get-SanitizedRuntimeError",
         ):
             self.assertIn(required, harness)
+        self.assertLess(
+            harness.index("$report = [ordered]@{"),
+            harness.index("# BEGIN_RUNTIME_GUARD"),
+        )
+        self.assertLess(
+            harness.index("# BEGIN_RUNTIME_GUARD"),
+            harness.index(
+                "$effectiveIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()"
+            ),
+        )
+        self.assertGreater(
+            harness.rindex("Write-ExclusiveJson $reportPath $report"),
+            harness.index("# BEGIN_DURABLE_REPORT_FINALLY"),
+        )
 
     def test_machine_runtime_acl_resume_is_exact_target_and_dry_run_safe(self) -> None:
         installer = (ROOT / "scripts" / "Install-TradingLabPythonRuntime.ps1").read_text(

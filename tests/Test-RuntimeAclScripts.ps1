@@ -568,7 +568,8 @@ foreach ($forbiddenHealthOnly in @(
     'runas.exe', 'Start-Process', 'TaskKill', 'taskkill.exe', 'Set-Acl',
     'icacls', 'takeown', 'import MetaTrader5', '.initialize(', '.login(',
     '.terminal_info(', '.account_info(', '.symbol_info(', '.positions_get(',
-    '.orders_get(', '.history_', '.order_check(', '.order_send(', '0.0.0.0'
+    '.orders_get(', '.history_', '.order_check(', '.order_send(', '0.0.0.0',
+    'System.Net.Http', 'HttpClient', 'Add-Type -AssemblyName'
 )) {
     Assert-True (-not $gatewayHealthOnly.Contains($forbiddenHealthOnly)) "Gateway health-only forbidden action: $forbiddenHealthOnly"
 }
@@ -580,8 +581,10 @@ foreach ($requiredHealthOnly in @(
     "`$startInfo.EnvironmentVariables['TRADING_MODE'] = 'OBSERVE_ONLY'",
     "`$startInfo.EnvironmentVariables['MT5_ACCESS_ENABLED'] = 'false'",
     "`$startInfo.EnvironmentVariables['PYTHONDONTWRITEBYTECODE'] = '1'",
-    '--controlled-stdin-shutdown', 'http://$listenAddress`:$ListenPort/health',
-    'X-AUTOMATON-KEY', 'Get-FinalRuntimeFingerprint',
+    '--controlled-stdin-shutdown', '$healthUri = "http://127.0.0.1`:$ListenPort/health"',
+    'Invoke-WebRequest', '-UseBasicParsing', '-TimeoutSec 3',
+    "-Headers @{ 'X-AUTOMATON-KEY' = `$apiKey }",
+    'Get-FinalRuntimeFingerprint',
     'Assert-LoopbackPortAvailable', '[System.Diagnostics.ProcessStartInfo]::new()',
     'UseShellExecute = $false', 'RedirectStandardInput = $true',
     "`$process.StandardInput.Write('Q')", '$process.WaitForExit(15000)',
@@ -592,19 +595,35 @@ foreach ($requiredHealthOnly in @(
     'mt5_imported = $mt5Imported', 'mt5_accessed = $mt5Accessed',
     'order_check_called = $orderCheckCalled', 'order_send_called = $orderSendCalled',
     'automaton_started = $false', 'process_stopped_cleanly', 'orphan_processes',
-    'filesystem_runtime_modified', 'acl_modified', '[System.IO.FileMode]::CreateNew'
+    'filesystem_runtime_modified', 'acl_modified', '[System.IO.FileMode]::CreateNew',
+    "status = 'FAIL_INITIALIZING'", 'runtime_error = $null',
+    '# BEGIN_RUNTIME_GUARD', '# BEGIN_DURABLE_REPORT_FINALLY',
+    "`$stage = 'STARTUP'", "`$stage = 'HEALTH_GET'",
+    "`$failureStage = 'SHUTDOWN'", 'cleanup_attempted', 'cleanup_error',
+    'forced_termination_used', 'Get-SanitizedRuntimeError',
+    'Write-ExclusiveJson $reportPath $report',
+    'REPORT_WRITE_FAILED:', 'ORIGINAL_RUNTIME_ERROR:'
 )) {
     Assert-True ($gatewayHealthOnly.Contains($requiredHealthOnly)) "Gateway health-only invariant missing: $requiredHealthOnly"
 }
-$healthIdentityIndex = $gatewayHealthOnly.IndexOf('if ($effectiveSid -ne $expectedGatewaySid)')
-$healthFilesystemIndex = $gatewayHealthOnly.IndexOf("`$workspace = 'C:\automaton'")
+$healthReportIndex = $gatewayHealthOnly.IndexOf('$report = [ordered]@{')
+$healthRuntimeGuardIndex = $gatewayHealthOnly.IndexOf('# BEGIN_RUNTIME_GUARD')
+$healthIdentityIndex = $gatewayHealthOnly.IndexOf('$effectiveIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()')
 $healthStartIndex = $gatewayHealthOnly.IndexOf('if (-not $process.Start())')
 $healthBeforeFingerprint = $gatewayHealthOnly.IndexOf('$beforeFingerprint = Get-FinalRuntimeFingerprint')
 $healthAfterFingerprint = $gatewayHealthOnly.IndexOf('$afterFingerprint = Get-FinalRuntimeFingerprint')
-Assert-True ($healthIdentityIndex -ge 0 -and $healthIdentityIndex -lt $healthFilesystemIndex) 'Gateway health-only SID must precede filesystem access.'
+$healthDurableFinallyIndex = $gatewayHealthOnly.IndexOf('# BEGIN_DURABLE_REPORT_FINALLY')
+$healthReportWriteIndex = $gatewayHealthOnly.LastIndexOf('Write-ExclusiveJson $reportPath $report')
+Assert-True ($healthReportIndex -ge 0 -and $healthReportIndex -lt $healthRuntimeGuardIndex) 'Gateway health-only report envelope must exist before the runtime guard.'
+Assert-True ($healthRuntimeGuardIndex -lt $healthIdentityIndex -and $healthIdentityIndex -lt $healthStartIndex) 'Identity and startup must be inside the guarded runtime flow.'
 Assert-True ($healthBeforeFingerprint -ge 0 -and $healthBeforeFingerprint -lt $healthStartIndex) 'Final runtime fingerprint must precede process startup.'
 Assert-True ($healthAfterFingerprint -gt $healthStartIndex) 'Final runtime fingerprint must be repeated after process shutdown.'
+Assert-True ($healthDurableFinallyIndex -gt $healthStartIndex -and $healthReportWriteIndex -gt $healthDurableFinallyIndex) 'Durable report writing must occur from the outer finally after cleanup.'
 Assert-True (-not $gatewayHealthOnly.Contains('Write-Output $apiKey')) 'Gateway health-only harness must not print the IPC key.'
+Assert-True (-not $gatewayHealthOnly.Contains('Write-Host $apiKey')) 'Gateway health-only harness must not host-print the IPC key.'
+Assert-True ($gatewayHealthOnly.Contains(".Replace(`$SensitiveValue, '[REDACTED]')")) 'Gateway health-only errors must redact the exact IPC key value.'
+Assert-True ($gatewayHealthOnly.Contains("`$process.Kill()")) 'Gateway health-only cleanup must retain bounded forced termination of its process object.'
+Assert-True (-not $gatewayHealthOnly.Contains('Stop-Process')) 'Gateway health-only cleanup must not address arbitrary processes.'
 
 Assert-True ($collector.Contains('#Requires -RunAsAdministrator')) 'Collector must require elevation.'
 foreach ($required in @(
@@ -688,4 +707,7 @@ Assert-True `
     GATEWAY_HEALTH_ONLY_PROCESS_OWNERSHIP = 'PASS'
     GATEWAY_HEALTH_ONLY_RUNTIME_IMMUTABILITY = 'PASS'
     GATEWAY_HEALTH_ONLY_NO_SECRETS_OR_EXTERNAL_ACTIONS = 'PASS'
+    GATEWAY_HEALTH_ONLY_NATIVE_HTTP = 'PASS'
+    GATEWAY_HEALTH_ONLY_DURABLE_FAILURE_REPORT = 'PASS'
+    GATEWAY_HEALTH_ONLY_REPORT_REDACTION = 'PASS'
 } | ConvertTo-Json

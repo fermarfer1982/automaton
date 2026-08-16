@@ -10,18 +10,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
-$expectedGatewaySid = 'S-1-5-21-568964486-193631783-1609210587-1007'
-$effectiveIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-$effectiveSid = $effectiveIdentity.User.Value
-if ($effectiveSid -ne $expectedGatewaySid) {
-    throw "Wrong Gateway token SID. Expected $expectedGatewaySid; received $effectiveSid."
-}
-$principal = [System.Security.Principal.WindowsPrincipal]::new($effectiveIdentity)
-if ($principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw 'Gateway health-only harness refuses an administrative token.'
-}
-
 $normalizedRunId = $RunId.ToLowerInvariant()
+$expectedGatewaySid = 'S-1-5-21-568964486-193631783-1609210587-1007'
 $workspace = 'C:\automaton'
 $finalRoot = 'C:\automaton\.venv'
 $pythonExecutable = 'C:\automaton\.venv\Scripts\python.exe'
@@ -32,6 +22,74 @@ $runtimeTemp = Join-Path $operationalRoot 'runtime-tmp'
 $reportRoot = Join-Path $operationalRoot 'gateway-startup-results'
 $reportPath = Join-Path $reportRoot "gateway-health-only-$normalizedRunId.json"
 $listenAddress = '127.0.0.1'
+
+# Initialize the durable failure envelope before any identity, filesystem,
+# socket, configuration, Python, or process operation.
+$report = [ordered]@{
+    schema_version = 2
+    mode = 'GATEWAY_HEALTH_ONLY'
+    run_id = $normalizedRunId
+    effective_sid = $null
+    status = 'FAIL_INITIALIZING'
+    completed_at_utc = $null
+    failure_code = $null
+    failure_stage = 'INITIALIZING'
+    runtime_error = $null
+    python_executable = $pythonExecutable
+    listen_address = $listenAddress
+    listen_port = $ListenPort
+    trading_mode = 'OBSERVE_ONLY'
+    mt5_access_enabled = $false
+    gateway_process_started = $false
+    health_http_status = 0
+    health_payload_valid = $false
+    mt5_package_metadata_version = $null
+    mt5_imported = $false
+    mt5_accessed = $false
+    order_check_called = $false
+    order_send_called = $false
+    automaton_started = $false
+    cleanup_attempted = $false
+    shutdown_requested = $false
+    forced_termination_used = $false
+    cleanup_error = $null
+    process_stopped_cleanly = $false
+    orphan_processes = 0
+    runtime_fingerprint_verified = $false
+    filesystem_runtime_modified = $false
+    acl_modified = $false
+    final_runtime_item_count = 0
+}
+
+$effectiveSid = $null
+$apiKey = $null
+$process = $null
+$gatewayProcessStarted = $false
+$healthHttpStatus = 0
+$healthPayloadValid = $false
+$mt5PackageVersion = $null
+$mt5Imported = $false
+$mt5Accessed = $false
+$orderCheckCalled = $false
+$orderSendCalled = $false
+$cleanupAttempted = $false
+$shutdownRequested = $false
+$forcedTerminationUsed = $false
+$cleanupError = $null
+$processStoppedCleanly = $false
+$orphanProcesses = 0
+$beforeFingerprint = $null
+$afterFingerprint = $null
+$runtimeFingerprintVerified = $false
+$filesystemRuntimeModified = $false
+$aclModified = $false
+$runtimeSucceeded = $false
+$runtimeError = $null
+$failureCode = $null
+$failureStage = 'INITIALIZING'
+$stage = 'INITIALIZING'
+$reportWritten = $false
+$reportWriteError = $null
 
 function Get-CanonicalPath([string] $Path) {
     return [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
@@ -151,57 +209,76 @@ function Write-ExclusiveJson([string] $Path, [object] $Value) {
     } finally { $stream.Dispose() }
 }
 
-if (-not (Test-ExactPath $pythonExecutable 'C:\automaton\.venv\Scripts\python.exe')) {
-    throw 'FINAL_PYTHON_EXACT=FAIL'
-}
-foreach ($requiredDirectory in @($workspace, $finalRoot, $operationalRoot, $runtimeTemp)) {
-    Assert-NoReparsePoint $requiredDirectory $true
-}
-foreach ($requiredFile in @($pythonExecutable, $configPath, $apiKeyPath)) {
-    Assert-NoReparsePoint $requiredFile $false
-}
-if (-not [System.IO.Directory]::Exists($reportRoot)) {
-    [void][System.IO.Directory]::CreateDirectory($reportRoot)
-}
-Assert-NoReparsePoint $reportRoot $true
-if ([System.IO.File]::Exists($reportPath) -or [System.IO.Directory]::Exists($reportPath)) {
-    throw 'Gateway health-only report RunId collision. Use a new UUID.'
+function Get-SanitizedRuntimeError([object] $ErrorRecord, [string] $SensitiveValue) {
+    $message = $null
+    try { $message = [string]$ErrorRecord.Exception.Message } catch {}
+    if ([string]::IsNullOrWhiteSpace($message)) { $message = 'Unspecified harness failure.' }
+    if (-not [string]::IsNullOrEmpty($SensitiveValue)) {
+        $message = $message.Replace($SensitiveValue, '[REDACTED]')
+    }
+    $message = $message -replace '(?i)\b(password|passwd|api[_-]?key|ipc[_-]?key|credential|credentials|login|server|account)\b\s*[:=]\s*[^\s;,]+', '${1}=[REDACTED]'
+    $message = ($message -replace '[\r\n\t]+', ' ').Trim()
+    if ($message.Length -gt 512) { $message = $message.Substring(0, 512) }
+    return $message
 }
 
-$configText = [System.IO.File]::ReadAllText($configPath, [System.Text.Encoding]::UTF8)
-if ($configText -notmatch '(?m)^\s*trading_mode\s*:\s*OBSERVE_ONLY\s*$') {
-    throw 'TRADING_MODE_OBSERVE_ONLY=FAIL'
-}
-if ($configText -match '(?m)^\s*mt5_access_enabled\s*:\s*true\s*$') {
-    throw 'MT5_ACCESS_ENABLED_FALSE=FAIL'
-}
-if ($configText -match '(?im)^\s*(password|passwd|credential|credentials|token|secret|private_key)\s*:') {
-    throw 'Forbidden secret field exists in the protected trading config.'
-}
-
-$apiKey = [System.IO.File]::ReadAllText($apiKeyPath, [System.Text.Encoding]::ASCII)
-if ($apiKey -ne $apiKey.Trim() -or $apiKey -notmatch '^[A-Za-z0-9_-]{43,128}$') {
-    throw 'Protected Gateway API key format is invalid.'
-}
-
-Assert-LoopbackPortAvailable $ListenPort
-$beforeFingerprint = Get-FinalRuntimeFingerprint
-[void][System.Reflection.Assembly]::Load('System.Net.Http')
-
-$process = $null
-$gatewayProcessStarted = $false
-$healthHttpStatus = 0
-$healthPayloadValid = $false
-$mt5PackageVersion = $null
-$mt5Imported = $true
-$mt5Accessed = $true
-$orderCheckCalled = $true
-$orderSendCalled = $true
-$processStoppedCleanly = $false
-$orphanProcesses = 1
-$failureCode = $null
-
+# BEGIN_RUNTIME_GUARD: every potentially failing runtime operation is enclosed.
 try {
+    $stage = 'IDENTITY'
+    $effectiveIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $effectiveSid = $effectiveIdentity.User.Value
+    $report.effective_sid = $effectiveSid
+    if ($effectiveSid -ne $expectedGatewaySid) {
+        throw "Wrong Gateway token SID. Expected $expectedGatewaySid; received $effectiveSid."
+    }
+    $principal = [System.Security.Principal.WindowsPrincipal]::new($effectiveIdentity)
+    if ($principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'Gateway health-only harness refuses an administrative token.'
+    }
+
+    $stage = 'PATH_PREFLIGHT'
+    if (-not (Test-ExactPath $pythonExecutable 'C:\automaton\.venv\Scripts\python.exe')) {
+        throw 'FINAL_PYTHON_EXACT=FAIL'
+    }
+    foreach ($requiredDirectory in @($workspace, $finalRoot, $operationalRoot, $runtimeTemp)) {
+        Assert-NoReparsePoint $requiredDirectory $true
+    }
+    foreach ($requiredFile in @($pythonExecutable, $configPath, $apiKeyPath)) {
+        Assert-NoReparsePoint $requiredFile $false
+    }
+    if (-not [System.IO.Directory]::Exists($reportRoot)) {
+        [void][System.IO.Directory]::CreateDirectory($reportRoot)
+    }
+    Assert-NoReparsePoint $reportRoot $true
+    if ([System.IO.File]::Exists($reportPath) -or [System.IO.Directory]::Exists($reportPath)) {
+        throw 'Gateway health-only report RunId collision. Use a new UUID.'
+    }
+
+    $stage = 'CONFIG_PREFLIGHT'
+    $configText = [System.IO.File]::ReadAllText($configPath, [System.Text.Encoding]::UTF8)
+    if ($configText -notmatch '(?m)^\s*trading_mode\s*:\s*OBSERVE_ONLY\s*$') {
+        throw 'TRADING_MODE_OBSERVE_ONLY=FAIL'
+    }
+    if ($configText -match '(?m)^\s*mt5_access_enabled\s*:\s*true\s*$') {
+        throw 'MT5_ACCESS_ENABLED_FALSE=FAIL'
+    }
+    if ($configText -match '(?im)^\s*(password|passwd|credential|credentials|token|secret|private_key)\s*:') {
+        throw 'Forbidden secret field exists in the protected trading config.'
+    }
+
+    $stage = 'IPC_KEY_PREFLIGHT'
+    $apiKey = [System.IO.File]::ReadAllText($apiKeyPath, [System.Text.Encoding]::ASCII)
+    if ($apiKey -ne $apiKey.Trim() -or $apiKey -notmatch '^[A-Za-z0-9_-]{43,128}$') {
+        throw 'Protected Gateway API key format is invalid.'
+    }
+
+    $stage = 'PORT_PREFLIGHT'
+    Assert-LoopbackPortAvailable $ListenPort
+
+    $stage = 'RUNTIME_FINGERPRINT_BEFORE'
+    $beforeFingerprint = Get-FinalRuntimeFingerprint
+
+    $stage = 'STARTUP'
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $pythonExecutable
     $startInfo.Arguments = "-B -m trading_lab.service --config `"$configPath`" --port $ListenPort --controlled-stdin-shutdown"
@@ -222,36 +299,37 @@ try {
     if (-not $process.Start()) { throw 'Gateway process did not start.' }
     $gatewayProcessStarted = $true
 
+    $stage = 'HEALTH_GET'
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     $healthPayload = $null
+    $lastHealthError = $null
+    $healthUri = "http://127.0.0.1`:$ListenPort/health"
     while ([DateTime]::UtcNow -lt $deadline) {
         if ($process.HasExited) { break }
-        $client = [System.Net.Http.HttpClient]::new()
-        $request = $null
         try {
-            $client.Timeout = [TimeSpan]::FromSeconds(3)
-            $request = [System.Net.Http.HttpRequestMessage]::new(
-                [System.Net.Http.HttpMethod]::Get,
-                "http://$listenAddress`:$ListenPort/health"
-            )
-            try {
-                [void]$request.Headers.TryAddWithoutValidation('X-AUTOMATON-KEY', $apiKey)
-                $response = $client.SendAsync($request).GetAwaiter().GetResult()
-                try {
-                    $healthHttpStatus = [int]$response.StatusCode
-                    if ($healthHttpStatus -eq 200) {
-                        $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-                        $healthPayload = $body | ConvertFrom-Json
-                        break
-                    }
-                } finally { $response.Dispose() }
-            } finally { if ($null -ne $request) { $request.Dispose() } }
+            $response = Invoke-WebRequest `
+                -UseBasicParsing `
+                -Uri $healthUri `
+                -Headers @{ 'X-AUTOMATON-KEY' = $apiKey } `
+                -TimeoutSec 3 `
+                -ErrorAction Stop
+            $healthHttpStatus = [int]$response.StatusCode
+            if ($healthHttpStatus -eq 200) {
+                $healthPayload = $response.Content | ConvertFrom-Json
+                break
+            }
         } catch {
+            $lastHealthError = Get-SanitizedRuntimeError $_ $apiKey
             Start-Sleep -Milliseconds 200
-        } finally { $client.Dispose() }
+        }
     }
 
-    if ($null -eq $healthPayload) { throw 'Gateway health endpoint did not become ready.' }
+    if ($null -eq $healthPayload) {
+        $detail = if ([string]::IsNullOrWhiteSpace($lastHealthError)) {
+            'no HTTP response was received'
+        } else { $lastHealthError }
+        throw "Gateway health endpoint did not become ready: $detail"
+    }
     $mt5PackageVersion = [string]$healthPayload.mt5_package_metadata_version
     $mt5Imported = [bool]$healthPayload.mt5_imported
     $mt5Accessed = [bool]$healthPayload.mt5_accessed
@@ -266,75 +344,154 @@ try {
         -not $mt5Imported -and -not $mt5Accessed -and
         -not $orderCheckCalled -and -not $orderSendCalled -and
         -not [bool]$healthPayload.automaton_started
-    if (-not $healthPayloadValid) { throw 'Gateway health payload violated the disabled-MT5 contract.' }
+    if (-not $healthPayloadValid) {
+        throw 'Gateway health payload violated the disabled-MT5 contract.'
+    }
+    $runtimeSucceeded = $true
 } catch {
-    $failureCode = 'GATEWAY_HEALTH_ONLY_VALIDATION_FAILED'
+    $failureStage = $stage
+    $failureCode = "GATEWAY_HEALTH_ONLY_$($stage)_FAILED"
+    $runtimeError = Get-SanitizedRuntimeError $_ $apiKey
 } finally {
-    if ($null -ne $process -and $gatewayProcessStarted -and -not $process.HasExited) {
-        try {
-            $process.StandardInput.Write('Q')
-            $process.StandardInput.Flush()
-            $process.StandardInput.Close()
-            $processStoppedCleanly = $process.WaitForExit(15000) -and $process.ExitCode -eq 0
-        } catch { $processStoppedCleanly = $false }
-        if (-not $process.HasExited) {
-            try {
-                $process.Kill()
-                [void]$process.WaitForExit(5000)
-            } catch {}
-        }
-    } elseif ($null -ne $process -and $process.HasExited) {
-        $processStoppedCleanly = $process.ExitCode -eq 0
-    }
+    # BEGIN_DURABLE_REPORT_FINALLY: only the exact process object created above
+    # can be signalled or terminated here.
     if ($null -ne $process -and $gatewayProcessStarted) {
-        $knownPid = $process.Id
-        $orphanProcesses = if (Get-Process -Id $knownPid -ErrorAction SilentlyContinue) { 1 } else { 0 }
-        $process.Dispose()
+        $cleanupAttempted = $true
+        try {
+            $knownPid = $process.Id
+            if (-not $process.HasExited) {
+                $shutdownRequested = $true
+                try {
+                    $process.StandardInput.Write('Q')
+                    $process.StandardInput.Flush()
+                    $process.StandardInput.Close()
+                    $processStoppedCleanly =
+                        $process.WaitForExit(15000) -and $process.ExitCode -eq 0
+                    if (-not $processStoppedCleanly) {
+                        throw 'Controlled Gateway shutdown did not complete successfully.'
+                    }
+                } catch {
+                    $cleanupError = Get-SanitizedRuntimeError $_ $apiKey
+                    $processStoppedCleanly = $false
+                }
+            } else {
+                $processStoppedCleanly = $process.ExitCode -eq 0
+                if (-not $processStoppedCleanly) {
+                    $cleanupError = 'Gateway process exited unsuccessfully before controlled shutdown.'
+                }
+            }
+            if (-not $process.HasExited) {
+                $forcedTerminationUsed = $true
+                try {
+                    $process.Kill()
+                    [void]$process.WaitForExit(5000)
+                } catch {
+                    $forcedError = Get-SanitizedRuntimeError $_ $apiKey
+                    $cleanupError = if ([string]::IsNullOrWhiteSpace($cleanupError)) {
+                        $forcedError
+                    } else { "$cleanupError; $forcedError" }
+                }
+            }
+            $orphanProcesses = if (
+                Get-Process -Id $knownPid -ErrorAction SilentlyContinue
+            ) { 1 } else { 0 }
+        } catch {
+            $cleanupError = Get-SanitizedRuntimeError $_ $apiKey
+            $processStoppedCleanly = $false
+            $orphanProcesses = 1
+        } finally {
+            try { $process.Dispose() } catch {
+                $disposeError = Get-SanitizedRuntimeError $_ $apiKey
+                $cleanupError = if ([string]::IsNullOrWhiteSpace($cleanupError)) {
+                    $disposeError
+                } else { "$cleanupError; $disposeError" }
+            }
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($cleanupError)) {
+        if ([string]::IsNullOrWhiteSpace($runtimeError)) {
+            $failureStage = 'SHUTDOWN'
+            $failureCode = 'GATEWAY_HEALTH_ONLY_SHUTDOWN_FAILED'
+            $runtimeError = $cleanupError
+        }
+    }
+
+    if ($null -ne $beforeFingerprint) {
+        try {
+            $afterFingerprint = Get-FinalRuntimeFingerprint
+            $runtimeFingerprintVerified = $true
+            $filesystemRuntimeModified =
+                $beforeFingerprint.content_sha256 -ne $afterFingerprint.content_sha256
+            $aclModified = $beforeFingerprint.acl_sha256 -ne $afterFingerprint.acl_sha256
+        } catch {
+            $runtimeFingerprintVerified = $false
+            if ([string]::IsNullOrWhiteSpace($runtimeError)) {
+                $failureStage = 'RUNTIME_FINGERPRINT_AFTER'
+                $failureCode = 'GATEWAY_HEALTH_ONLY_RUNTIME_FINGERPRINT_AFTER_FAILED'
+                $runtimeError = Get-SanitizedRuntimeError $_ $apiKey
+            }
+        }
+    }
+
+    $passed =
+        $runtimeSucceeded -and $gatewayProcessStarted -and
+        $healthHttpStatus -eq 200 -and $healthPayloadValid -and
+        -not $mt5Imported -and -not $mt5Accessed -and
+        -not $orderCheckCalled -and -not $orderSendCalled -and
+        $processStoppedCleanly -and $orphanProcesses -eq 0 -and
+        [string]::IsNullOrWhiteSpace($cleanupError) -and
+        $runtimeFingerprintVerified -and
+        -not $filesystemRuntimeModified -and -not $aclModified
+    if (-not $passed -and [string]::IsNullOrWhiteSpace($failureCode)) {
+        $failureStage = 'BOUNDARY_VALIDATION'
+        $failureCode = 'GATEWAY_HEALTH_ONLY_BOUNDARY_FAILED'
+        $runtimeError = 'One or more health-only boundary checks did not pass.'
+    }
+
+    $report.effective_sid = $effectiveSid
+    $report.status = if ($passed) { 'PASS' } else { 'FAIL' }
+    $report.completed_at_utc = [DateTime]::UtcNow.ToString('o')
+    $report.failure_code = if ($passed) { $null } else { $failureCode }
+    $report.failure_stage = if ($passed) { $null } else { $failureStage }
+    $report.runtime_error = if ($passed) { $null } else { $runtimeError }
+    $report.gateway_process_started = $gatewayProcessStarted
+    $report.health_http_status = $healthHttpStatus
+    $report.health_payload_valid = $healthPayloadValid
+    $report.mt5_package_metadata_version = $mt5PackageVersion
+    $report.mt5_imported = $mt5Imported
+    $report.mt5_accessed = $mt5Accessed
+    $report.order_check_called = $orderCheckCalled
+    $report.order_send_called = $orderSendCalled
+    $report.cleanup_attempted = $cleanupAttempted
+    $report.shutdown_requested = $shutdownRequested
+    $report.forced_termination_used = $forcedTerminationUsed
+    $report.cleanup_error = $cleanupError
+    $report.process_stopped_cleanly = $processStoppedCleanly
+    $report.orphan_processes = $orphanProcesses
+    $report.runtime_fingerprint_verified = $runtimeFingerprintVerified
+    $report.filesystem_runtime_modified = $filesystemRuntimeModified
+    $report.acl_modified = $aclModified
+    $report.final_runtime_item_count = if ($null -eq $afterFingerprint) {
+        0
+    } else { $afterFingerprint.item_count }
+
+    try {
+        Write-ExclusiveJson $reportPath $report
+        $reportWritten = $true
+    } catch {
+        $reportWriteError = Get-SanitizedRuntimeError $_ $apiKey
+        $report.status = 'FAIL'
+        $passed = $false
     }
 }
 
-$afterFingerprint = Get-FinalRuntimeFingerprint
-$filesystemRuntimeModified = $beforeFingerprint.content_sha256 -ne $afterFingerprint.content_sha256
-$aclModified = $beforeFingerprint.acl_sha256 -ne $afterFingerprint.acl_sha256
-$passed =
-    $gatewayProcessStarted -and $healthHttpStatus -eq 200 -and $healthPayloadValid -and
-    -not $mt5Imported -and -not $mt5Accessed -and
-    -not $orderCheckCalled -and -not $orderSendCalled -and
-    $processStoppedCleanly -and $orphanProcesses -eq 0 -and
-    -not $filesystemRuntimeModified -and -not $aclModified
-if (-not $passed -and [string]::IsNullOrWhiteSpace($failureCode)) {
-    $failureCode = 'GATEWAY_HEALTH_ONLY_BOUNDARY_FAILED'
+if (-not [string]::IsNullOrWhiteSpace($reportWriteError)) {
+    Write-Error "REPORT_WRITE_FAILED: $reportWriteError" -ErrorAction Continue
+    if (-not [string]::IsNullOrWhiteSpace($runtimeError)) {
+        Write-Error "ORIGINAL_RUNTIME_ERROR: $runtimeError" -ErrorAction Continue
+    }
 }
-
-$report = [ordered]@{
-    schema_version = 1
-    mode = 'GATEWAY_HEALTH_ONLY'
-    run_id = $normalizedRunId
-    effective_sid = $effectiveSid
-    status = if ($passed) { 'PASS' } else { 'FAIL' }
-    completed_at_utc = [DateTime]::UtcNow.ToString('o')
-    failure_code = if ($passed) { $null } else { $failureCode }
-    python_executable = $pythonExecutable
-    listen_address = $listenAddress
-    listen_port = $ListenPort
-    trading_mode = 'OBSERVE_ONLY'
-    mt5_access_enabled = $false
-    gateway_process_started = $gatewayProcessStarted
-    health_http_status = $healthHttpStatus
-    health_payload_valid = $healthPayloadValid
-    mt5_package_metadata_version = $mt5PackageVersion
-    mt5_imported = $mt5Imported
-    mt5_accessed = $mt5Accessed
-    order_check_called = $orderCheckCalled
-    order_send_called = $orderSendCalled
-    automaton_started = $false
-    process_stopped_cleanly = $processStoppedCleanly
-    orphan_processes = $orphanProcesses
-    filesystem_runtime_modified = $filesystemRuntimeModified
-    acl_modified = $aclModified
-    final_runtime_item_count = $afterFingerprint.item_count
-}
-Write-ExclusiveJson $reportPath $report
 
 Write-Output "MODE=GATEWAY_HEALTH_ONLY"
 Write-Output "STATUS=$($report.status)"
@@ -348,4 +505,4 @@ Write-Output "ORDER_SEND=$($orderSendCalled.ToString().ToLowerInvariant())"
 Write-Output "PROCESS_STOPPED_CLEANLY=$($processStoppedCleanly.ToString().ToLowerInvariant())"
 Write-Output "ORPHAN_PROCESSES=$orphanProcesses"
 Write-Output "REPORT=$reportPath"
-if (-not $passed) { exit 1 }
+if (-not $passed -or -not $reportWritten) { exit 1 }
