@@ -673,11 +673,19 @@ $validPromotePlan = [pscustomobject]@{
     )
 }
 Assert-True (Resolve-TradingLabPromoteVenvPlanState $validPromotePlan $promoteBasePython $promoteActive $promoteStaging $promoteBackup $promoteFailed $promoteLock $promoteWheelhouse $promoteTemp).valid 'Exact transactional PromoteVenv plan must pass.'
+$orderedPlanSeed = Copy-TestFixture $validPromotePlan
+$orderedPromoteEnvironment = [ordered]@{}
+foreach ($property in $promoteEnvironment.PSObject.Properties) {
+    $orderedPromoteEnvironment[$property.Name] = $property.Value
+}
+$orderedPlanSeed.steps[1].environment = $orderedPromoteEnvironment
+$orderedPlanSeed.steps[2].environment = $orderedPromoteEnvironment
 $orderedPromotePlan = [ordered]@{}
-foreach ($property in $validPromotePlan.PSObject.Properties) {
+foreach ($property in $orderedPlanSeed.PSObject.Properties) {
     $orderedPromotePlan[$property.Name] = $property.Value
 }
 Assert-True ((Get-TradingLabPromoteProperty $orderedPromotePlan 'promotion_strategy') -eq 'REBUILD_AT_FINAL_PATH_TRANSACTIONALLY') 'PromoteVenv property access must support the OrderedDictionary emitted by the live plan builder.'
+Assert-True ((Get-TradingLabPromotePropertyCount $orderedPromoteEnvironment) -eq 8) 'PromoteVenv must count live OrderedDictionary environment keys, not adapter properties.'
 Assert-True (Resolve-TradingLabPromoteVenvPlanState $orderedPromotePlan $promoteBasePython $promoteActive $promoteStaging $promoteBackup $promoteFailed $promoteLock $promoteWheelhouse $promoteTemp).valid 'The live OrderedDictionary PromoteVenv plan shape must validate.'
 foreach ($planCase in @(
     [pscustomobject]@{ Name='relocates staging'; Mutate={ param($p) $p.steps[0].source=$promoteStaging } },

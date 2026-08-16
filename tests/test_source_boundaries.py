@@ -635,6 +635,7 @@ class SourceBoundaryTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("$Record -is [System.Collections.IDictionary]", promote_gate)
         self.assertIn("$Record.Contains($Name)", promote_gate)
+        self.assertIn("Get-TradingLabPromotePropertyCount $environment", promote_gate)
         composite_partial = re.compile(
             r"-band\s+(?:\[[^\]]+\]::)?(?:Modify|Write|FullControl)\s*\)\s*-ne\s*0",
             re.IGNORECASE,

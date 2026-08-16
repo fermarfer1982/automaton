@@ -11,6 +11,12 @@ function Get-TradingLabPromoteProperty([object] $Record, [string] $Name) {
     return $property.Value
 }
 
+function Get-TradingLabPromotePropertyCount([object] $Record) {
+    if ($null -eq $Record) { return 0 }
+    if ($Record -is [System.Collections.IDictionary]) { return $Record.Count }
+    return @($Record.PSObject.Properties).Count
+}
+
 function Test-TradingLabPromoteExactPath([string] $Path, [string] $Expected) {
     try {
         return [System.IO.Path]::GetFullPath($Path).TrimEnd('\').Equals(
@@ -291,7 +297,9 @@ function Resolve-TradingLabPromoteVenvPlanState(
                     $failures.Add("ENV_$($pair[0])")
                 }
             }
-            if (@($environment.PSObject.Properties).Count -ne 8) { $failures.Add('ENV_UNEXPECTED') }
+            if ((Get-TradingLabPromotePropertyCount $environment) -ne 8) {
+                $failures.Add('ENV_UNEXPECTED')
+            }
             $createEnvironment = Get-TradingLabPromoteProperty $create 'environment'
             if (($createEnvironment | ConvertTo-Json -Compress) -ne ($environment | ConvertTo-Json -Compress)) {
                 $failures.Add('CREATE_ENVIRONMENT')
