@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import SecurityConfig
+from .config import GatewayBootstrapConfig, SecurityConfig
 
 
 SYSTEM_SID = "S-1-5-18"
@@ -102,7 +102,11 @@ foreach ($target in $request.targets) {
 """
 
 
-def _targets(config_path: Path, config: SecurityConfig, include_automaton_state: bool) -> list[dict[str, Any]]:
+def _targets(
+    config_path: Path,
+    config: GatewayBootstrapConfig | SecurityConfig,
+    include_automaton_state: bool,
+) -> list[dict[str, Any]]:
     workspace = Path(__file__).resolve().parents[1]
     if any(item is None for item in (
         config.audit_db_path, config.api_key_path, config.gateway_lock_path,
@@ -302,7 +306,7 @@ def evaluate_acl_snapshot(
 
 def verify_windows_acl(
     config_path: str | Path,
-    config: SecurityConfig,
+    config: GatewayBootstrapConfig | SecurityConfig,
     *,
     include_automaton_state: bool = True,
     require_current_gateway: bool = False,

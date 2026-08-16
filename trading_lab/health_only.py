@@ -5,7 +5,7 @@ from importlib import metadata
 from typing import Any
 
 from .audit import HashChainAuditLog
-from .config import SecurityConfig
+from .config import GatewayBootstrapConfig, SecurityConfig
 from .mt5_access import MT5AccessDisabled
 from .research_store import ResearchStore
 from .sqlite_audit import DualAuditLog
@@ -35,7 +35,7 @@ class HealthOnlyGatewayApplication:
     def __init__(
         self,
         *,
-        config: SecurityConfig,
+        config: GatewayBootstrapConfig | SecurityConfig,
         audit,
         research_store: ResearchStore,
         runtime_identity_verified: bool,
@@ -123,7 +123,7 @@ class HealthOnlyGatewayApplication:
 
 
 def build_health_only_application(
-    config: SecurityConfig,
+    config: GatewayBootstrapConfig | SecurityConfig,
     *,
     runtime_identity_verified: bool,
 ) -> HealthOnlyGatewayApplication:

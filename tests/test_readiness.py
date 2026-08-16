@@ -84,7 +84,14 @@ class ReadinessAclGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = security_config(Path(directory))
             with (
-                patch("trading_lab.service.load_security_config", return_value=config),
+                patch(
+                    "trading_lab.service.load_gateway_bootstrap_config",
+                    return_value=config,
+                ),
+                patch(
+                    "trading_lab.service.load_mt5_security_config",
+                    return_value=config,
+                ),
                 patch(
                     "trading_lab.service.verify_windows_acl",
                     return_value=AclVerification(False, "unsafe ACL"),

@@ -616,6 +616,16 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertNotIn("import MetaTrader5", service + health_only + adapter)
         self.assertNotIn("from MetaTrader5", service + health_only + adapter)
         self.assertNotIn('importlib.import_module("MetaTrader5")', service + health_only)
+        self.assertNotIn("load_security_config(", service)
+        bootstrap_load = service.index("load_gateway_bootstrap_config(config_path)")
+        access_resolution = service.index(
+            "resolve_mt5_access_enabled(bootstrap_config, environment)"
+        )
+        enabled_branch = service.index("if mt5_access_enabled:", access_resolution)
+        complete_mt5_load = service.index("load_mt5_security_config(config_path)")
+        self.assertLess(bootstrap_load, access_resolution)
+        self.assertLess(access_resolution, enabled_branch)
+        self.assertLess(enabled_branch, complete_mt5_load)
         disabled_guard = service.index(
             "if not mt5_access_enabled or not config.mt5_access_enabled"
         )
@@ -623,6 +633,33 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertLess(disabled_guard, lazy_provider)
         self.assertIn('raw.get("mt5_access_enabled", False)', config)
         self.assertIn("MT5_ACCESS_ENABLED=true requires", config)
+        bootstrap_builder = config[
+            config.index("def _build_gateway_bootstrap_config("):
+            config.index("def load_gateway_bootstrap_config(")
+        ]
+        for mt5_only_field in (
+            "authorized_account",
+            "authorized_server",
+            "authorized_account_name",
+            "allowed_symbol",
+            "magic_number",
+            "mt5_terminal_path",
+            "risk_raw",
+        ):
+            self.assertNotIn(mt5_only_field, bootstrap_builder)
+        complete_loader = config[
+            config.index("def load_mt5_security_config("):
+            config.index("def load_security_config(")
+        ]
+        for required_mt5_gate in (
+            '_positive_int(raw.get("authorized_account")',
+            '_required_string(raw, "authorized_server")',
+            '_required_string(raw, "mt5_terminal_path")',
+            '_required_string(raw, "allowed_symbol")',
+            '_positive_int(raw.get("magic_number")',
+            "_build_risk_limits(raw)",
+        ):
+            self.assertIn(required_mt5_gate, complete_loader)
         self.assertIn('"MetaTrader5" in sys.modules', health_only)
         self.assertIn('metadata.version("MetaTrader5")', health_only)
         self.assertIn('"mt5_status": "IMPORTED_UNEXPECTEDLY"', health_only)

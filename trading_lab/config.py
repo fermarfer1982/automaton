@@ -37,6 +37,27 @@ class RiskLimits:
 
 
 @dataclass(frozen=True)
+class GatewayBootstrapConfig:
+    """Minimum protected configuration required for local HTTP health startup."""
+
+    schema_version: int
+    trading_mode: TradingMode
+    audit_path: Path
+    research_db_path: Path
+    demo_authorization_path: Path
+    kill_switch_path: Path
+    automaton_state_dir: Path
+    gateway_windows_identity: str
+    automaton_windows_identity: str
+    mt5_access_enabled: bool = False
+    audit_db_path: Path | None = None
+    api_key_path: Path | None = None
+    gateway_lock_path: Path | None = None
+    log_dir: Path | None = None
+    security_log_dir: Path | None = None
+
+
+@dataclass(frozen=True)
 class SecurityConfig:
     schema_version: int
     trading_mode: TradingMode
@@ -170,7 +191,7 @@ def _paths_overlap(first: Path, second: Path) -> bool:
     )
 
 
-def load_security_config(path: str | Path) -> SecurityConfig:
+def _load_raw_security_config(path: str | Path) -> tuple[dict[str, Any], Path]:
     config_path = Path(path)
     workspace = Path(__file__).resolve().parents[1]
     if not config_path.is_absolute():
@@ -202,7 +223,13 @@ def load_security_config(path: str | Path) -> SecurityConfig:
     unknown = set(raw) - _TOP_LEVEL_KEYS
     if unknown:
         raise ConfigError(f"Unknown security config fields: {', '.join(sorted(unknown))}")
+    return raw, workspace
 
+
+def _build_gateway_bootstrap_config(
+    raw: dict[str, Any],
+    workspace: Path,
+) -> GatewayBootstrapConfig:
     if raw.get("schema_version") != 1:
         raise ConfigError("schema_version must be exactly 1")
     try:
@@ -213,21 +240,119 @@ def load_security_config(path: str | Path) -> SecurityConfig:
     if not isinstance(mt5_access_enabled, bool):
         raise ConfigError("mt5_access_enabled must be an explicit boolean")
 
-    account = _positive_int(raw.get("authorized_account"), "authorized_account")
-    server = _required_string(raw, "authorized_server")
-    if server.upper() in {"CHANGE_ME", "REPLACE_WITH_EXACT_DEMO_SERVER"}:
-        raise ConfigError("authorized_server placeholder must be replaced explicitly")
-    raw_account_name = raw.get("authorized_account_name")
-    if raw_account_name is not None and (
-        not isinstance(raw_account_name, str) or not raw_account_name.strip()
-    ):
-        raise ConfigError("authorized_account_name must be null or a non-empty string")
-    account_name = raw_account_name.strip() if isinstance(raw_account_name, str) else None
-    symbol = _required_string(raw, "allowed_symbol")
-    if symbol != "XAUUSD":
-        raise ConfigError("Initial laboratory scope permits only exact symbol XAUUSD")
-    magic = _positive_int(raw.get("magic_number"), "magic_number")
+    audit_path = Path(_required_string(raw, "audit_path"))
+    research_path = Path(_required_string(raw, "research_db_path"))
+    authorization_path = Path(_required_string(raw, "demo_authorization_path"))
+    kill_path = Path(_required_string(raw, "kill_switch_path"))
+    automaton_state_dir = Path(_required_string(raw, "automaton_state_dir"))
+    lab_root = kill_path.parent.parent
+    audit_db_path = Path(str(
+        raw.get("audit_db_path") or lab_root / "audit" / "sqlite" / "audit.db"
+    ))
+    api_key_path = Path(str(
+        raw.get("api_key_path") or lab_root / "ipc" / "automaton.key"
+    ))
+    gateway_lock_path = Path(str(
+        raw.get("gateway_lock_path") or lab_root / "operational" / "gateway.lock"
+    ))
+    log_dir = Path(str(raw.get("log_dir") or lab_root / "logs" / "gateway"))
+    security_log_dir = Path(str(
+        raw.get("security_log_dir") or lab_root / "logs" / "security"
+    ))
+    gateway_identity = _required_string(raw, "gateway_windows_identity")
+    automaton_identity = _required_string(raw, "automaton_windows_identity")
+    if any("REPLACE_WITH" in value.upper() or value.upper() == "CHANGE_ME" for value in (
+        gateway_identity, automaton_identity,
+    )):
+        raise ConfigError("Windows identity placeholders must be replaced explicitly")
+    if gateway_identity.casefold() == automaton_identity.casefold():
+        raise ConfigError("Gateway and Automaton Windows identities must be distinct")
+    named_paths = {
+        "audit_path": audit_path,
+        "research_db_path": research_path,
+        "demo_authorization_path": authorization_path,
+        "kill_switch_path": kill_path,
+        "automaton_state_dir": automaton_state_dir,
+        "audit_db_path": audit_db_path,
+        "api_key_path": api_key_path,
+        "gateway_lock_path": gateway_lock_path,
+        "log_dir": log_dir,
+        "security_log_dir": security_log_dir,
+    }
+    for name, configured_path in named_paths.items():
+        if not configured_path.is_absolute():
+            raise ConfigError(f"{name} must be an absolute path")
+    protected_paths = (
+        audit_path, research_path, authorization_path, kill_path, automaton_state_dir,
+        audit_db_path, api_key_path, gateway_lock_path, log_dir, security_log_dir,
+    )
+    if len({str(Path(os.path.abspath(item))).casefold() for item in protected_paths}) != len(protected_paths):
+        raise ConfigError("Protected control, IPC, data, log, and state paths must be distinct")
+    for configured_path in protected_paths:
+        try:
+            if Path(os.path.abspath(configured_path)).is_relative_to(workspace):
+                raise ConfigError("Protected operational paths must remain outside the workspace")
+        except OSError as exc:
+            raise ConfigError(f"Cannot resolve protected operational path: {exc}") from exc
+    normalized_root = Path(os.path.abspath(lab_root))
+    expected_paths = {
+        "audit_path": normalized_root / "audit" / "journal" / "audit.jsonl",
+        "audit_db_path": normalized_root / "audit" / "sqlite" / "audit.db",
+        "research_db_path": normalized_root / "research" / "research.db",
+        "api_key_path": normalized_root / "ipc" / "automaton.key",
+        "gateway_lock_path": normalized_root / "operational" / "gateway.lock",
+        "log_dir": normalized_root / "logs" / "gateway",
+        "security_log_dir": normalized_root / "logs" / "security",
+        "demo_authorization_path": (
+            normalized_root / "control" / "demo-authorization" / "authorization.json"
+        ),
+        "kill_switch_path": normalized_root / "control" / "STOP_TRADING",
+    }
+    actual_paths = {
+        "audit_path": audit_path,
+        "audit_db_path": audit_db_path,
+        "research_db_path": research_path,
+        "api_key_path": api_key_path,
+        "gateway_lock_path": gateway_lock_path,
+        "log_dir": log_dir,
+        "security_log_dir": security_log_dir,
+        "demo_authorization_path": authorization_path,
+        "kill_switch_path": kill_path,
+    }
+    for name, expected in expected_paths.items():
+        if Path(os.path.abspath(actual_paths[name])) != expected:
+            raise ConfigError(f"{name} must use the separated protected domain: {expected}")
 
+    gateway_directories = (normalized_root,)
+    if any(_paths_overlap(automaton_state_dir, item) for item in gateway_directories):
+        raise ConfigError("Automaton state must be separate from every Gateway domain")
+
+    return GatewayBootstrapConfig(
+        schema_version=1,
+        trading_mode=mode,
+        audit_path=audit_path,
+        research_db_path=research_path,
+        demo_authorization_path=authorization_path,
+        kill_switch_path=kill_path,
+        automaton_state_dir=automaton_state_dir,
+        gateway_windows_identity=gateway_identity,
+        automaton_windows_identity=automaton_identity,
+        mt5_access_enabled=mt5_access_enabled,
+        audit_db_path=audit_db_path,
+        api_key_path=api_key_path,
+        gateway_lock_path=gateway_lock_path,
+        log_dir=log_dir,
+        security_log_dir=security_log_dir,
+    )
+
+
+def load_gateway_bootstrap_config(path: str | Path) -> GatewayBootstrapConfig:
+    """Load HTTP/ACL state without resolving any MT5-only material."""
+    raw, workspace = _load_raw_security_config(path)
+    return _build_gateway_bootstrap_config(raw, workspace)
+
+
+def _build_risk_limits(raw: dict[str, Any]) -> RiskLimits:
     risk_raw = raw.get("risk")
     if not isinstance(risk_raw, dict):
         raise ConfigError("risk must be an object")
@@ -303,124 +428,66 @@ def load_security_config(path: str | Path) -> SecurityConfig:
         raise ConfigError("Risk fractions must be less than 1")
     if risk.max_open_positions != 1:
         raise ConfigError("Initial laboratory maximum open positions must be exactly 1")
+    return risk
 
+
+def load_mt5_security_config(path: str | Path) -> SecurityConfig:
+    """Load the complete fail-closed MT5 account, symbol, terminal, and risk domain."""
+    raw, workspace = _load_raw_security_config(path)
+    bootstrap = _build_gateway_bootstrap_config(raw, workspace)
+
+    account = _positive_int(raw.get("authorized_account"), "authorized_account")
+    server = _required_string(raw, "authorized_server")
+    if server.upper() in {"CHANGE_ME", "REPLACE_WITH_EXACT_DEMO_SERVER"}:
+        raise ConfigError("authorized_server placeholder must be replaced explicitly")
+    raw_account_name = raw.get("authorized_account_name")
+    if raw_account_name is not None and (
+        not isinstance(raw_account_name, str) or not raw_account_name.strip()
+    ):
+        raise ConfigError("authorized_account_name must be null or a non-empty string")
+    account_name = raw_account_name.strip() if isinstance(raw_account_name, str) else None
+    symbol = _required_string(raw, "allowed_symbol")
+    if symbol != "XAUUSD":
+        raise ConfigError("Initial laboratory scope permits only exact symbol XAUUSD")
+    magic = _positive_int(raw.get("magic_number"), "magic_number")
     terminal_path = Path(_required_string(raw, "mt5_terminal_path"))
-    audit_path = Path(_required_string(raw, "audit_path"))
-    research_path = Path(_required_string(raw, "research_db_path"))
-    authorization_path = Path(_required_string(raw, "demo_authorization_path"))
-    kill_path = Path(_required_string(raw, "kill_switch_path"))
-    automaton_state_dir = Path(_required_string(raw, "automaton_state_dir"))
-    lab_root = kill_path.parent.parent
-    audit_db_path = Path(str(
-        raw.get("audit_db_path") or lab_root / "audit" / "sqlite" / "audit.db"
-    ))
-    api_key_path = Path(str(
-        raw.get("api_key_path") or lab_root / "ipc" / "automaton.key"
-    ))
-    gateway_lock_path = Path(str(
-        raw.get("gateway_lock_path") or lab_root / "operational" / "gateway.lock"
-    ))
-    log_dir = Path(str(raw.get("log_dir") or lab_root / "logs" / "gateway"))
-    security_log_dir = Path(str(
-        raw.get("security_log_dir") or lab_root / "logs" / "security"
-    ))
-    gateway_identity = _required_string(raw, "gateway_windows_identity")
-    automaton_identity = _required_string(raw, "automaton_windows_identity")
-    if any("REPLACE_WITH" in value.upper() or value.upper() == "CHANGE_ME" for value in (
-        gateway_identity, automaton_identity,
-    )):
-        raise ConfigError("Windows identity placeholders must be replaced explicitly")
-    if gateway_identity.casefold() == automaton_identity.casefold():
-        raise ConfigError("Gateway and Automaton Windows identities must be distinct")
-    named_paths = {
-        "mt5_terminal_path": terminal_path,
-        "audit_path": audit_path,
-        "research_db_path": research_path,
-        "demo_authorization_path": authorization_path,
-        "kill_switch_path": kill_path,
-        "automaton_state_dir": automaton_state_dir,
-        "audit_db_path": audit_db_path,
-        "api_key_path": api_key_path,
-        "gateway_lock_path": gateway_lock_path,
-        "log_dir": log_dir,
-        "security_log_dir": security_log_dir,
-    }
-    for name, configured_path in named_paths.items():
-        if not configured_path.is_absolute():
-            raise ConfigError(f"{name} must be an absolute path")
-    protected_paths = (
-        audit_path, research_path, authorization_path, kill_path, automaton_state_dir,
-        audit_db_path, api_key_path, gateway_lock_path, log_dir, security_log_dir,
-    )
-    if len({str(Path(os.path.abspath(item))).casefold() for item in protected_paths}) != len(protected_paths):
-        raise ConfigError("Protected control, IPC, data, log, and state paths must be distinct")
-    for configured_path in protected_paths:
-        try:
-            if Path(os.path.abspath(configured_path)).is_relative_to(workspace):
-                raise ConfigError("Protected operational paths must remain outside the workspace")
-        except OSError as exc:
-            raise ConfigError(f"Cannot resolve protected operational path: {exc}") from exc
-    normalized_root = Path(os.path.abspath(lab_root))
-    expected_paths = {
-        "audit_path": normalized_root / "audit" / "journal" / "audit.jsonl",
-        "audit_db_path": normalized_root / "audit" / "sqlite" / "audit.db",
-        "research_db_path": normalized_root / "research" / "research.db",
-        "api_key_path": normalized_root / "ipc" / "automaton.key",
-        "gateway_lock_path": normalized_root / "operational" / "gateway.lock",
-        "log_dir": normalized_root / "logs" / "gateway",
-        "security_log_dir": normalized_root / "logs" / "security",
-        "demo_authorization_path": (
-            normalized_root / "control" / "demo-authorization" / "authorization.json"
-        ),
-        "kill_switch_path": normalized_root / "control" / "STOP_TRADING",
-    }
-    actual_paths = {
-        "audit_path": audit_path,
-        "audit_db_path": audit_db_path,
-        "research_db_path": research_path,
-        "api_key_path": api_key_path,
-        "gateway_lock_path": gateway_lock_path,
-        "log_dir": log_dir,
-        "security_log_dir": security_log_dir,
-        "demo_authorization_path": authorization_path,
-        "kill_switch_path": kill_path,
-    }
-    for name, expected in expected_paths.items():
-        if Path(os.path.abspath(actual_paths[name])) != expected:
-            raise ConfigError(f"{name} must use the separated protected domain: {expected}")
-
-    gateway_directories = (normalized_root,)
-    if any(_paths_overlap(automaton_state_dir, item) for item in gateway_directories):
-        raise ConfigError("Automaton state must be separate from every Gateway domain")
+    if not terminal_path.is_absolute():
+        raise ConfigError("mt5_terminal_path must be an absolute path")
+    risk = _build_risk_limits(raw)
 
     return SecurityConfig(
-        schema_version=1,
-        trading_mode=mode,
+        schema_version=bootstrap.schema_version,
+        trading_mode=bootstrap.trading_mode,
         authorized_account=account,
         authorized_server=server,
         allowed_symbol=symbol,
         magic_number=magic,
         mt5_terminal_path=terminal_path,
-        audit_path=audit_path,
-        research_db_path=research_path,
-        demo_authorization_path=authorization_path,
-        kill_switch_path=kill_path,
-        automaton_state_dir=automaton_state_dir,
-        gateway_windows_identity=gateway_identity,
-        automaton_windows_identity=automaton_identity,
+        audit_path=bootstrap.audit_path,
+        research_db_path=bootstrap.research_db_path,
+        demo_authorization_path=bootstrap.demo_authorization_path,
+        kill_switch_path=bootstrap.kill_switch_path,
+        automaton_state_dir=bootstrap.automaton_state_dir,
+        gateway_windows_identity=bootstrap.gateway_windows_identity,
+        automaton_windows_identity=bootstrap.automaton_windows_identity,
         risk=risk,
-        mt5_access_enabled=mt5_access_enabled,
+        mt5_access_enabled=bootstrap.mt5_access_enabled,
         authorized_account_name=account_name,
-        audit_db_path=audit_db_path,
-        api_key_path=api_key_path,
-        gateway_lock_path=gateway_lock_path,
-        log_dir=log_dir,
-        security_log_dir=security_log_dir,
+        audit_db_path=bootstrap.audit_db_path,
+        api_key_path=bootstrap.api_key_path,
+        gateway_lock_path=bootstrap.gateway_lock_path,
+        log_dir=bootstrap.log_dir,
+        security_log_dir=bootstrap.security_log_dir,
     )
 
 
+def load_security_config(path: str | Path) -> SecurityConfig:
+    """Backward-compatible name for the complete MT5 security loader."""
+    return load_mt5_security_config(path)
+
+
 def resolve_mt5_access_enabled(
-    config: SecurityConfig,
+    config: GatewayBootstrapConfig | SecurityConfig,
     environment: dict[str, str] | None = None,
 ) -> bool:
     """Resolve a process restriction without allowing environment escalation."""

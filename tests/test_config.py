@@ -5,7 +5,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from trading_lab.config import ConfigError, load_security_config, resolve_mt5_access_enabled
+from trading_lab.config import (
+    ConfigError,
+    GatewayBootstrapConfig,
+    load_gateway_bootstrap_config,
+    load_mt5_security_config,
+    load_security_config,
+    resolve_mt5_access_enabled,
+)
 from trading_lab.domain import TradingMode
 
 
@@ -78,6 +85,62 @@ class SecurityConfigTests(unittest.TestCase):
             payload["mt5_access_enabled"] = "false"
             with self.assertRaises(ConfigError):
                 load_security_config(self.write(directory, payload))
+
+    def test_disabled_bootstrap_does_not_require_or_validate_mt5_account(self) -> None:
+        cases = (None, 0, -1, "malformed", {"not": "an account"})
+        for account in cases:
+            with self.subTest(account=account), tempfile.TemporaryDirectory() as directory:
+                payload = self.valid_config()
+                payload["mt5_access_enabled"] = False
+                if account is None:
+                    payload.pop("authorized_account")
+                else:
+                    payload["authorized_account"] = account
+                payload["authorized_server"] = 0
+                payload["mt5_terminal_path"] = None
+                payload["risk"] = "not-an-mt5-risk-object"
+                config = load_gateway_bootstrap_config(self.write(directory, payload))
+                self.assertIsInstance(config, GatewayBootstrapConfig)
+                self.assertFalse(config.mt5_access_enabled)
+                self.assertFalse(hasattr(config, "authorized_account"))
+                self.assertFalse(hasattr(config, "authorized_server"))
+                self.assertFalse(hasattr(config, "mt5_terminal_path"))
+                self.assertFalse(hasattr(config, "risk"))
+
+    def test_disabled_bootstrap_keeps_mt5_access_separate_and_non_escalating(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            payload = self.valid_config()
+            payload["mt5_access_enabled"] = False
+            payload.pop("authorized_account")
+            config = load_gateway_bootstrap_config(self.write(directory, payload))
+        self.assertEqual(TradingMode.OBSERVE_ONLY, config.trading_mode)
+        self.assertFalse(resolve_mt5_access_enabled(config, {}))
+        self.assertFalse(resolve_mt5_access_enabled(config, {"MT5_ACCESS_ENABLED": "false"}))
+        with self.assertRaises(ConfigError):
+            resolve_mt5_access_enabled(config, {"MT5_ACCESS_ENABLED": "true"})
+
+    def test_complete_mt5_loader_keeps_account_and_server_fail_closed(self) -> None:
+        account_cases = (None, 0, -1, "invalid")
+        for account in account_cases:
+            with self.subTest(account=account), tempfile.TemporaryDirectory() as directory:
+                payload = self.valid_config()
+                payload["mt5_access_enabled"] = True
+                if account is None:
+                    payload.pop("authorized_account")
+                else:
+                    payload["authorized_account"] = account
+                with self.assertRaisesRegex(ConfigError, "authorized_account"):
+                    load_mt5_security_config(self.write(directory, payload))
+        for server in (None, 0, "", "REPLACE_WITH_EXACT_DEMO_SERVER"):
+            with self.subTest(server=server), tempfile.TemporaryDirectory() as directory:
+                payload = self.valid_config()
+                payload["mt5_access_enabled"] = True
+                if server is None:
+                    payload.pop("authorized_server")
+                else:
+                    payload["authorized_server"] = server
+                with self.assertRaisesRegex(ConfigError, "authorized_server"):
+                    load_mt5_security_config(self.write(directory, payload))
 
     def test_rejects_credentials_in_security_config(self) -> None:
         for key in ("password", "api_key", "token"):

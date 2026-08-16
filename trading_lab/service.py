@@ -9,7 +9,13 @@ from dataclasses import replace
 from pathlib import Path
 
 from .api_auth import ApiKeyVerifier
-from .config import SecurityConfig, load_security_config, resolve_mt5_access_enabled
+from .config import (
+    ConfigError,
+    SecurityConfig,
+    load_gateway_bootstrap_config,
+    load_mt5_security_config,
+    resolve_mt5_access_enabled,
+)
 from .domain import TradingMode
 from .health_only import build_health_only_application
 from .logging_config import configure_gateway_logging
@@ -76,10 +82,16 @@ def serve(
 ) -> None:
     if not 1024 <= port <= 65535:
         raise ValueError("Gateway port must be between 1024 and 65535")
-    config = load_security_config(config_path)
-    mt5_access_enabled = resolve_mt5_access_enabled(config, environment)
-    if not mt5_access_enabled and config.trading_mode is not TradingMode.OBSERVE_ONLY:
+    bootstrap_config = load_gateway_bootstrap_config(config_path)
+    mt5_access_enabled = resolve_mt5_access_enabled(bootstrap_config, environment)
+    if not mt5_access_enabled and bootstrap_config.trading_mode is not TradingMode.OBSERVE_ONLY:
         raise RuntimeError("MT5-disabled startup requires TRADING_MODE=OBSERVE_ONLY")
+    if mt5_access_enabled:
+        config = load_mt5_security_config(config_path)
+        if not resolve_mt5_access_enabled(config, environment):
+            raise ConfigError("Protected MT5 access changed during startup")
+    else:
+        config = bootstrap_config
     acl = verify_windows_acl(
         config_path,
         config,
