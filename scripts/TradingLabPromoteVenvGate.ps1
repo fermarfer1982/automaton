@@ -2,6 +2,10 @@ Set-StrictMode -Version 2.0
 
 function Get-TradingLabPromoteProperty([object] $Record, [string] $Name) {
     if ($null -eq $Record) { return $null }
+    if ($Record -is [System.Collections.IDictionary]) {
+        if ($Record.Contains($Name)) { return $Record[$Name] }
+        return $null
+    }
     $property = $Record.PSObject.Properties[$Name]
     if ($null -eq $property) { return $null }
     return $property.Value

@@ -630,6 +630,11 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn("Test-TradingLabFileSystemRightsMutation", installer)
         self.assertIn("Get-TradingLabProhibitedMutationRightsMask", acl_gate)
         self.assertIn("Test-TradingLabFileSystemRightsMutation", acl_gate)
+        promote_gate = (
+            ROOT / "scripts" / "TradingLabPromoteVenvGate.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn("$Record -is [System.Collections.IDictionary]", promote_gate)
+        self.assertIn("$Record.Contains($Name)", promote_gate)
         composite_partial = re.compile(
             r"-band\s+(?:\[[^\]]+\]::)?(?:Modify|Write|FullControl)\s*\)\s*-ne\s*0",
             re.IGNORECASE,

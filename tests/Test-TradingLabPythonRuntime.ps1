@@ -673,6 +673,12 @@ $validPromotePlan = [pscustomobject]@{
     )
 }
 Assert-True (Resolve-TradingLabPromoteVenvPlanState $validPromotePlan $promoteBasePython $promoteActive $promoteStaging $promoteBackup $promoteFailed $promoteLock $promoteWheelhouse $promoteTemp).valid 'Exact transactional PromoteVenv plan must pass.'
+$orderedPromotePlan = [ordered]@{}
+foreach ($property in $validPromotePlan.PSObject.Properties) {
+    $orderedPromotePlan[$property.Name] = $property.Value
+}
+Assert-True ((Get-TradingLabPromoteProperty $orderedPromotePlan 'promotion_strategy') -eq 'REBUILD_AT_FINAL_PATH_TRANSACTIONALLY') 'PromoteVenv property access must support the OrderedDictionary emitted by the live plan builder.'
+Assert-True (Resolve-TradingLabPromoteVenvPlanState $orderedPromotePlan $promoteBasePython $promoteActive $promoteStaging $promoteBackup $promoteFailed $promoteLock $promoteWheelhouse $promoteTemp).valid 'The live OrderedDictionary PromoteVenv plan shape must validate.'
 foreach ($planCase in @(
     [pscustomobject]@{ Name='relocates staging'; Mutate={ param($p) $p.steps[0].source=$promoteStaging } },
     [pscustomobject]@{ Name='deletes staging'; Mutate={ param($p) $p.steps[4].operation='DELETE'; $p.steps[4].target=$promoteStaging } },
@@ -1509,6 +1515,7 @@ foreach ($gate in @(
     PROMOTE_VENV_PROCESS_USERS_FAIL_CLOSED = 'PASS'
     PROMOTE_VENV_ARTIFACTS_FAIL_CLOSED = 'PASS'
     PROMOTE_VENV_TRANSACTIONAL_PLAN = 'PASS'
+    PROMOTE_VENV_ORDERED_PLAN_LIVE_SHAPE = 'PASS'
     PROMOTE_VENV_STAGING_NON_RELOCATABLE = 'PASS'
     PROMOTE_VENV_OFFLINE_FINAL_BUILD = 'PASS'
     PROMOTE_VENV_ROLLBACK = 'PASS'
