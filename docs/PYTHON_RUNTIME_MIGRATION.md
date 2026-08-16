@@ -176,15 +176,18 @@ bajo SYSTEM. El resultado se clasifica como
 `EXPECTED_INSTALLED_TARGET_RUNTIME`; cualquier combinación incompleta o
 adicional es `CONFLICTING_PREEXISTING_RUNTIME`.
 
-El estado ACL posterior al installer se inspecciona antes de mutar. El estado
-exacto solo contiene SYSTEM y Administrators con FullControl y
-AutomatonGateway con ReadAndExecute, sin herencia. AutomatonAgent y Users no
-reciben acceso. Si el árbol conserva ACL heredadas, el dry-run emite
-`PYTHON_RUNTIME_ACL=INCOMPLETE_REQUIRES_EXPLICIT_APPLY`; no intenta ocultar la
-instalación válida ni vuelve a ejecutar el installer.
+El estado ACL posterior al installer se inspecciona antes de mutar. El root
+canónico debe pertenecer a Administrators, proteger su DACL y contener solo
+SYSTEM y Administrators con FullControl y AutomatonGateway con
+ReadAndExecute+Synchronize. AutomatonAgent y grupos amplios no reciben acceso.
+Un descendiente puede proteger su propia DACL o heredar exclusivamente esa
+misma política segura desde una cadena de parents totalmente auditada dentro
+del root. Una herencia segura se clasifica como `DESCENDANT_ACL_SAFE_INHERITED`:
+no es una divergencia ni justifica convertir ACEs heredadas en explícitas.
 
-El dry-run de `ResumeMachineRuntime` incluye un `acl_plan` completo antes de
-cualquier autorización de Apply. El plan queda confinado exactamente a
+Cuando la política efectiva es insegura, el dry-run de
+`ResumeMachineRuntime` incluye un `acl_plan` completo antes de cualquier
+autorización de Apply. El plan queda confinado exactamente a
 `C:\Program Files\AutomatonPython\3.14.5`, resuelve las identidades por SID,
 protege la herencia descartando ACEs heredadas y admite exclusivamente tres
 ACEs Allow: SYSTEM FullControl, Administrators FullControl y AutomatonGateway
@@ -207,20 +210,22 @@ Delete, ChangePermissions y TakeOwnership. Su valor es `852310` (`0xD0156`).
 `ReadAndExecute,Synchronize` vale `1179817` (`0x1200A9`) y su intersección con
 la máscara prohibida es cero.
 
-Si la ACL exacta ya está aplicada, `ResumeMachineRuntime` realiza una auditoría
-recursiva read-only de owner, herencia, ACEs, principals, derechos y reparse
-points. El estado pasa a
-`TARGET_RUNTIME_ACL_ALREADY_APPLIED_VALIDATION_PENDING`, fija
-`MUST_NOT_CALL_SET_ACL=true` y `ACL_REAPPLIED=false`, y completa la validación
-sin volver a invocar `Set-Acl`. Cualquier diferencia o enlace inesperado falla
-cerrado.
+Si el root está protegido y todos los descendientes protegidos o heredados
+cumplen la política efectiva, `ResumeMachineRuntime` realiza una auditoría
+recursiva read-only de owner, cadena de parents, ACEs, principals, derechos y
+reparse points. La presencia de descendientes heredados seguros produce
+`TARGET_RUNTIME_ACL_ALREADY_SAFE_NO_REPAIR_REQUIRED`, deja `acl_plan=null`,
+fija `MUST_NOT_CALL_SET_ACL=true`, `SET_ACL_CALL_COUNT=0` y
+`ACL_REAPPLIED=false`, y completa la validación sin invocar `Set-Acl`. Una raíz
+sin herencia protegida, un parent no auditable, un derecho de mutación,
+principal extra, Deny o reparse point sigue fallando cerrado.
 
 El inventario separa el descubrimiento base de la verificación final. Un layout
 completo con payload/MSI correctos continúa como `PRESENT_UNVERIFIED` y
 `TARGET_RUNTIME_ALREADY_INSTALLED_VALIDATION_PENDING` hasta que un snapshot
 `LIVE_READ_ONLY` demuestre conjuntamente Python 3.14.5 x64 funcional, rutas
 exactas, stdlib/venv/pip, cuatro MSI machine-wide sin extras y la ACL recursiva
-exacta. Solo entonces normaliza el estado en memoria a
+efectivamente segura. Solo entonces normaliza el estado en memoria a
 `PRESENT_VERIFIED`/`PASS`. Inventory no escribe reportes, registro, archivos ni
 ACL; cualquier evidencia ausente, ACE incompatible o reparse point conserva el
 estado pendiente o el fallo previo.

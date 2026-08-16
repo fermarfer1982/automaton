@@ -131,8 +131,11 @@ foreach ($required in @(
     'DENY_ACES_PLANNED', 'ACL_OTHER_DOMAINS_MODIFIED',
     'machine_runtime_acl_modified', 'acl_apply_requested', 'acl_applied', 'acl_plan',
     'TARGET_RUNTIME_ACL_ALREADY_APPLIED_VALIDATION_PENDING',
+    'TARGET_RUNTIME_ACL_ALREADY_SAFE_NO_REPAIR_REQUIRED',
     'MUST_NOT_CALL_SET_ACL', 'ACL_REAPPLIED', 'SET_ACL_CALL_COUNT',
-    'ACL_OWNER_ADMINISTRATORS', 'ACL_INHERITANCE_PROTECTED',
+    'ACL_OWNER_ADMINISTRATORS',
+    'ACL_ROOT_INHERITANCE_PROTECTED', 'ACL_DESCENDANT_POLICY_SAFE',
+    'ACL_SAFE_INHERITED_DESCENDANTS', 'ACL_UNSAFE_DESCENDANTS',
     'PYTHON_GATEWAY_READ', 'PYTHON_GATEWAY_WRITE_DENY',
     'PYTHON_GATEWAY_DELETE_DENY', 'PYTHON_GATEWAY_CHANGE_PERMISSIONS_DENY',
     'PYTHON_GATEWAY_TAKE_OWNERSHIP_DENY', 'ACL_UNEXPECTED_PRINCIPALS',
@@ -306,11 +309,15 @@ $completeBlock = $installer.Substring($completeStart, $completeEnd - $completeSt
 $dryRunReturn = $completeBlock.IndexOf('if (-not $Apply) { return }')
 $aclMutationCall = $completeBlock.IndexOf('Protect-ExactRuntimeTree $pythonBase $aclPlan')
 Assert-True ($dryRunReturn -ge 0 -and $aclMutationCall -gt $dryRunReturn) 'Dry-run must return before the only machine runtime ACL mutation call.'
-$alreadyAppliedBranch = $completeBlock.IndexOf("if (`$aclState.state -eq 'EXACT')")
+$alreadyAppliedBranch = $completeBlock.IndexOf("if (`$aclState.state -in @('EXACT_PROTECTED', 'SAFE_NO_REPAIR_REQUIRED'))")
 $alreadyAppliedReturn = $completeBlock.IndexOf('return', $alreadyAppliedBranch)
-Assert-True ($alreadyAppliedBranch -ge 0 -and $alreadyAppliedReturn -gt $alreadyAppliedBranch -and $alreadyAppliedReturn -lt $aclMutationCall) 'Already-applied ACL recovery must return before Set-Acl.'
-Assert-True ($completeBlock.Substring($alreadyAppliedBranch, $alreadyAppliedReturn - $alreadyAppliedBranch).Contains("`$report.must_not_call_set_acl = `$true")) 'Already-applied ACL recovery must set MUST_NOT_CALL_SET_ACL.'
-Assert-True ($completeBlock.Substring($alreadyAppliedBranch, $alreadyAppliedReturn - $alreadyAppliedBranch).Contains("`$report.acl_reapplied = `$false")) 'Already-applied ACL recovery must report ACL_REAPPLIED=false.'
+Assert-True ($alreadyAppliedBranch -ge 0 -and $alreadyAppliedReturn -gt $alreadyAppliedBranch -and $alreadyAppliedReturn -lt $aclMutationCall) 'Safe ACL recovery must return before Set-Acl.'
+$noRepairBlock = $completeBlock.Substring($alreadyAppliedBranch, $alreadyAppliedReturn - $alreadyAppliedBranch)
+Assert-True ($noRepairBlock.Contains("`$report.must_not_call_set_acl = `$true")) 'Safe ACL recovery must set MUST_NOT_CALL_SET_ACL.'
+Assert-True ($noRepairBlock.Contains("`$report.acl_reapplied = `$false")) 'Safe ACL recovery must report ACL_REAPPLIED=false.'
+Assert-True ($noRepairBlock.Contains("`$report.acl_plan = `$null")) 'Safe inherited ACL recovery must not produce a repair plan.'
+Assert-True ($noRepairBlock.Contains("`$report.machine_runtime_acl_modified = `$false")) 'Safe inherited ACL recovery must report no runtime ACL mutation.'
+Assert-True ($completeBlock.IndexOf('New-MachineRuntimeAclPlan $pythonBase') -gt $alreadyAppliedReturn) 'A recursive ACL plan must only be constructed after the safe no-op branch.'
 Assert-True (-not $completeBlock.Substring(0, $dryRunReturn).Contains('Set-Acl')) 'Dry-run path must never call Set-Acl.'
 Assert-True (-not $completeBlock.Substring(0, $dryRunReturn).Contains('.SetOwner(')) 'Dry-run path must never modify owner.'
 Assert-True ($installer.Contains('Assert-ExactRuntimeTarget $Root')) 'ACL application must validate the exact runtime target.'
@@ -853,17 +860,22 @@ $usersCase.entries = @($usersCase.entries) + @([pscustomobject]@{
 })
 Assert-True (-not (Test-AclPlanFixture $usersCase).valid) 'BUILTIN Users Modify must fail closed.'
 
-function New-ValidAclAuditItem([string] $Path) {
+function New-ValidAclAuditItem(
+    [string] $Path,
+    [bool] $Protected = $true,
+    [bool] $Inherited = $false,
+    [bool] $Directory = $true
+) {
     [pscustomobject]@{
         path = $Path
-        is_directory = $true
+        is_directory = $Directory
         is_reparse_point = $false
         owner_sid = $aclAdministratorsSid
-        inheritance_protected = $true
+        inheritance_protected = $Protected
         rules = @(
-            [pscustomobject]@{ sid = $aclSystemSid; rights = $aclFullControl; type = 'Allow'; inherited = $false },
-            [pscustomobject]@{ sid = $aclAdministratorsSid; rights = $aclFullControl; type = 'Allow'; inherited = $false },
-            [pscustomobject]@{ sid = $aclGatewaySid; rights = $aclGatewayRx; type = 'Allow'; inherited = $false }
+            [pscustomobject]@{ sid = $aclSystemSid; rights = $aclFullControl; type = 'Allow'; inherited = $Inherited },
+            [pscustomobject]@{ sid = $aclAdministratorsSid; rights = $aclFullControl; type = 'Allow'; inherited = $Inherited },
+            [pscustomobject]@{ sid = $aclGatewaySid; rights = $aclGatewayRx; type = 'Allow'; inherited = $Inherited }
         )
     }
 }
@@ -883,9 +895,39 @@ $cleanAuditItems = @(
 $cleanAudit = Test-AclAuditFixture $cleanAuditItems
 Assert-True ($cleanAudit.valid -and $cleanAudit.recursive_findings -eq 0 -and $cleanAudit.reparse_points -eq 0) 'Exact recursive ACL audit must pass with zero findings.'
 Assert-True ($cleanAudit.unexpected_principals -eq 0 -and $cleanAudit.gateway_mutation_intersection -eq 0) 'Exact recursive ACL audit masks/principals regressed.'
-Assert-True ($cleanAudit.owner_administrators -and $cleanAudit.inheritance_protected) 'Exact audit must expose owner/inheritance evidence.'
+Assert-True ($cleanAudit.owner_administrators -and $cleanAudit.root_inheritance_protected) 'Exact audit must expose owner/root-inheritance evidence.'
+Assert-True ($cleanAudit.descendant_policy_safe -and $cleanAudit.unsafe_descendants -eq 0) 'Protected descendants must satisfy the effective policy.'
 Assert-True ($cleanAudit.system_full_control -and $cleanAudit.administrators_full_control) 'Exact audit must expose administrative FullControl evidence.'
 Assert-True ($cleanAudit.gateway_read_execute -and $cleanAudit.agent_allow_aces -eq 0 -and $cleanAudit.deny_aces -eq 0) 'Exact audit must expose Gateway/Agent/Deny evidence.'
+
+$safeInheritedItems = @(
+    (New-ValidAclAuditItem 'C:\Program Files\AutomatonPython\3.14.5'),
+    (New-ValidAclAuditItem 'C:\Program Files\AutomatonPython\3.14.5\safe.pyc' $false $true $false)
+)
+$safeInheritedAudit = Test-AclAuditFixture $safeInheritedItems
+Assert-True ($safeInheritedAudit.valid -and $safeInheritedAudit.recursive_findings -eq 0) 'A safe inherited descendant must not generate a recursive finding.'
+Assert-True ($safeInheritedAudit.safe_inherited_descendants -eq 1 -and $safeInheritedAudit.unsafe_descendants -eq 0) 'Safe inherited descendant classification/count regressed.'
+Assert-True ($safeInheritedAudit.descendant_classification_counts.DESCENDANT_ACL_SAFE_INHERITED -eq 1) 'Safe inherited descendant must expose its explicit classification.'
+Assert-True ((Resolve-TradingLabRuntimeAclDisposition $safeInheritedAudit) -eq 'SAFE_NO_REPAIR_REQUIRED') 'Safe inherited ACL state must be a no-repair disposition.'
+
+$sixtySafePycItems = [System.Collections.Generic.List[object]]::new()
+$sixtySafePycItems.Add((New-ValidAclAuditItem 'C:\Program Files\AutomatonPython\3.14.5'))
+foreach ($index in 1..60) {
+    $sixtySafePycItems.Add((New-ValidAclAuditItem `
+        ("C:\Program Files\AutomatonPython\3.14.5\safe-{0:D2}.pyc" -f $index) `
+        $false $true $false))
+}
+$sixtySafePycAudit = Test-AclAuditFixture @($sixtySafePycItems)
+Assert-True ($sixtySafePycAudit.valid -and $sixtySafePycAudit.recursive_findings -eq 0) 'Sixty safe inherited pyc descendants must pass without a repair finding.'
+Assert-True ($sixtySafePycAudit.safe_inherited_descendants -eq 60) 'Safe inherited count must be dynamic and preserve all sixty fixture items.'
+Assert-True ((Resolve-TradingLabRuntimeAclDisposition $sixtySafePycAudit) -eq 'SAFE_NO_REPAIR_REQUIRED') 'Sixty safe inherited descendants must remain a no-op ACL state.'
+
+$missingParentItems = @(
+    (New-ValidAclAuditItem 'C:\Program Files\AutomatonPython\3.14.5'),
+    (New-ValidAclAuditItem 'C:\Program Files\AutomatonPython\3.14.5\missing\unsafe.pyc' $false $true $false)
+)
+$missingParentAudit = Test-AclAuditFixture $missingParentItems
+Assert-True (-not $missingParentAudit.valid -and $missingParentAudit.unsafe_descendants -eq 1) 'An inherited child with an unaudited parent chain must fail closed.'
 foreach ($unsafeGatewayRight in @(
     [System.Security.AccessControl.FileSystemRights]::Modify,
     [System.Security.AccessControl.FileSystemRights]::FullControl,
@@ -917,6 +959,39 @@ Assert-True (-not (Test-AclAuditFixture $ownerAuditCase).valid) 'Incorrect runti
 $reparseAuditCase = Copy-AclAuditFixture $cleanAuditItems; $reparseAuditCase[0].is_reparse_point = $true
 $reparseAudit = Test-AclAuditFixture $reparseAuditCase
 Assert-True (-not $reparseAudit.valid -and $reparseAudit.reparse_points -eq 1) 'Runtime reparse point must fail closed.'
+
+foreach ($unsafeInheritedGatewayRight in @(
+    [System.Security.AccessControl.FileSystemRights]::Write,
+    [System.Security.AccessControl.FileSystemRights]::Modify,
+    [System.Security.AccessControl.FileSystemRights]::TakeOwnership,
+    [System.Security.AccessControl.FileSystemRights]::ChangePermissions
+)) {
+    $case = Copy-AclAuditFixture $safeInheritedItems
+    ($case[1].rules | Where-Object { $_.sid -eq $aclGatewaySid }).rights = [int64]$unsafeInheritedGatewayRight
+    $audit = Test-AclAuditFixture $case
+    Assert-True (-not $audit.valid -and $audit.unsafe_descendants -eq 1 -and $audit.gateway_mutation_intersection -ne 0) "Inherited Gateway mutation must fail closed: $unsafeInheritedGatewayRight"
+}
+$inheritedAgentCase = Copy-AclAuditFixture $safeInheritedItems
+$inheritedAgentCase[1].rules = @($inheritedAgentCase[1].rules) + @([pscustomobject]@{
+    sid = $aclAgentSid; rights = 1L; type = 'Allow'; inherited = $true
+})
+$inheritedAgentAudit = Test-AclAuditFixture $inheritedAgentCase
+Assert-True (-not $inheritedAgentAudit.valid -and $inheritedAgentAudit.agent_allow_aces -eq 1 -and $inheritedAgentAudit.unsafe_descendants -eq 1) 'Inherited Agent Read must fail closed.'
+$explicitUnsafeChildCase = Copy-AclAuditFixture $safeInheritedItems
+($explicitUnsafeChildCase[1].rules | Where-Object { $_.sid -eq $aclGatewaySid }).inherited = $false
+($explicitUnsafeChildCase[1].rules | Where-Object { $_.sid -eq $aclGatewaySid }).rights = [int64][System.Security.AccessControl.FileSystemRights]::Write
+$explicitUnsafeChildAudit = Test-AclAuditFixture $explicitUnsafeChildCase
+Assert-True (-not $explicitUnsafeChildAudit.valid -and $explicitUnsafeChildAudit.unsafe_descendants -eq 1) 'An unprotected child with an explicit unsafe ACE must fail closed.'
+$unexpectedInheritedCase = Copy-AclAuditFixture $safeInheritedItems
+$unexpectedInheritedCase[1].rules = @($unexpectedInheritedCase[1].rules) + @([pscustomobject]@{
+    sid = 'S-1-5-11'; rights = 1L; type = 'Allow'; inherited = $true
+})
+$unexpectedInheritedAudit = Test-AclAuditFixture $unexpectedInheritedCase
+Assert-True (-not $unexpectedInheritedAudit.valid -and $unexpectedInheritedAudit.unexpected_principals -eq 1) 'An inherited unexpected principal must fail closed.'
+$inheritedReparseCase = Copy-AclAuditFixture $safeInheritedItems
+$inheritedReparseCase[1].is_reparse_point = $true
+$inheritedReparseAudit = Test-AclAuditFixture $inheritedReparseCase
+Assert-True (-not $inheritedReparseAudit.valid -and $inheritedReparseAudit.reparse_points -eq 1) 'An inherited reparse-point child must fail closed.'
 
 $lockedWheelFixture = @(
     [pscustomobject]@{ name = 'MetaTrader5'; version = '5.0.6090'; sha256 = ('a' * 64) },
@@ -1250,6 +1325,8 @@ function New-ExactRuntimeAclAudit {
         valid = $true; scanned_items = 20; recursive_findings = 0
         unexpected_principals = 0; reparse_points = 0
         owner_administrators = $true; inheritance_protected = $true
+        root_inheritance_protected = $true; descendant_policy_safe = $true
+        protected_descendants = 19; safe_inherited_descendants = 0; unsafe_descendants = 0
         system_full_control = $true; administrators_full_control = $true
         gateway_read_execute = $true; gateway_mutation_intersection = 0
         agent_allow_aces = 0; deny_aces = 0
@@ -1269,6 +1346,16 @@ $verifiedInventory = ConvertTo-TradingLabVerifiedPythonInventory `
 Assert-True $verifiedInventory.runtime_verification.verified 'Complete live runtime and exact ACL must verify.'
 Assert-True ($verifiedInventory.state.completed_target_runtime -eq 'PRESENT_VERIFIED') 'Verified runtime must be PRESENT_VERIFIED.'
 Assert-True ($verifiedInventory.state.prevalidation -eq 'PASS') 'Verified runtime prevalidation must be PASS.'
+
+$safeInheritedVerificationAcl = New-ExactRuntimeAclAudit
+$safeInheritedVerificationAcl.protected_descendants = 19
+$safeInheritedVerificationAcl.safe_inherited_descendants = 60
+$safeInheritedInventory = ConvertTo-TradingLabVerifiedPythonInventory `
+    (New-RuntimeVerificationInventory $complete.PSObject.Copy()) $safeInheritedVerificationAcl `
+    'C:\Program Files\AutomatonPython\3.14.5' '3.14.5' 'C:\Users'
+Assert-True ($safeInheritedInventory.runtime_verification.verified -and
+    $safeInheritedInventory.state.completed_target_runtime -eq 'PRESENT_VERIFIED' -and
+    $safeInheritedInventory.state.prevalidation -eq 'PASS') 'Safe inherited descendants must permit read-only final runtime verification.'
 
 $modifyAcl = New-ExactRuntimeAclAudit
 $modifyAcl.valid = $false; $modifyAcl.gateway_read_execute = $false; $modifyAcl.gateway_mutation_intersection = 65814
@@ -1391,6 +1478,14 @@ foreach ($gate in @(
     GATEWAY_MUTATION_INTERSECTION_ZERO = 'PASS'
     ACL_ALREADY_APPLIED_NO_REAPPLY = 'PASS'
     ACL_RECURSIVE_AUDIT_EXACT = 'PASS'
+    ACL_ROOT_PROTECTED_DESCENDANTS_PROTECTED = 'PASS'
+    ACL_DESCENDANT_SAFE_INHERITED = 'PASS'
+    ACL_SAFE_INHERITED_60_NO_REPAIR = 'PASS'
+    ACL_SAFE_INHERITED_NO_RECURSIVE_FINDING = 'PASS'
+    ACL_SAFE_INHERITED_COUNT_DYNAMIC = 'PASS'
+    ACL_INHERITANCE_CHAIN_CONFINED = 'PASS'
+    ACL_SAFE_STATE_NO_OP = 'PASS'
+    ACL_SAFE_STATE_SET_ACL_NEVER_CALLED = 'PASS'
     ACL_RECURSIVE_GATEWAY_UNSAFE_FAIL_CLOSED = 'PASS'
     ACL_RECURSIVE_AGENT_DENY_UNEXPECTED_FAIL_CLOSED = 'PASS'
     ACL_RECURSIVE_OWNER_INHERITANCE_REPARSE_FAIL_CLOSED = 'PASS'

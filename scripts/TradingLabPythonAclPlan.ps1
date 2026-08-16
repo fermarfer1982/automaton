@@ -167,7 +167,6 @@ function Test-TradingLabRuntimeAclAudit(
     $unexpectedPrincipals = 0
     $reparsePoints = 0
     $ownerMismatches = 0
-    $inheritanceMismatches = 0
     $systemRightsMismatches = 0
     $administratorsRightsMismatches = 0
     $gatewayRightsMismatches = 0
@@ -175,71 +174,150 @@ function Test-TradingLabRuntimeAclAudit(
     $agentAllowAces = 0
     $denyAces = 0
     $canonicalTarget = [System.IO.Path]::GetFullPath($ExpectedTarget).TrimEnd('\')
+    $records = [System.Collections.Generic.List[object]]::new()
+    $itemsByPath = @{}
+    $unsafePaths = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+    $rootCount = 0
+    $rootRecord = $null
+    $recordIndex = 0
     if (@($Items).Count -eq 0) { $findings.Add('ACL_AUDIT_EMPTY') }
 
+    # First canonicalize the complete snapshot.  Descendant inheritance is only
+    # trusted when every parent can later be proven to belong to this same map.
     foreach ($item in @($Items)) {
+        $recordIndex++
         $path = [string](Get-TradingLabAclPlanProperty $item 'path')
+        $canonicalPath = $null
+        $insideTarget = $false
         try {
             $canonicalPath = [System.IO.Path]::GetFullPath($path).TrimEnd('\')
-            if (-not ($canonicalPath.Equals($canonicalTarget, [System.StringComparison]::OrdinalIgnoreCase) -or
-                $canonicalPath.StartsWith($canonicalTarget + '\', [System.StringComparison]::OrdinalIgnoreCase))) {
+            $insideTarget = $canonicalPath.Equals($canonicalTarget, [System.StringComparison]::OrdinalIgnoreCase) -or
+                $canonicalPath.StartsWith($canonicalTarget + '\', [System.StringComparison]::OrdinalIgnoreCase)
+            if (-not $insideTarget) {
                 $findings.Add("ACL_AUDIT_PATH_OUTSIDE_TARGET:$path")
             }
         } catch { $findings.Add("ACL_AUDIT_PATH_INVALID:$path") }
 
+        $recordKey = if ($null -eq $canonicalPath) { "INVALID:$recordIndex" } else { $canonicalPath }
+        $isRoot = $null -ne $canonicalPath -and
+            $canonicalPath.Equals($canonicalTarget, [System.StringComparison]::OrdinalIgnoreCase)
+        $record = [pscustomobject]@{
+            key = $recordKey
+            path = $path
+            canonical_path = $canonicalPath
+            inside_target = $insideTarget
+            is_root = $isRoot
+            is_directory = [bool](Get-TradingLabAclPlanProperty $item 'is_directory')
+            inheritance_protected = [bool](Get-TradingLabAclPlanProperty $item 'inheritance_protected')
+            item = $item
+        }
+        $records.Add($record)
+        if ($null -eq $canonicalPath -or -not $insideTarget) {
+            [void]$unsafePaths.Add($recordKey)
+            continue
+        }
+        if ($itemsByPath.ContainsKey($canonicalPath)) {
+            $findings.Add("ACL_AUDIT_DUPLICATE_PATH:$path")
+            [void]$unsafePaths.Add($recordKey)
+        } else {
+            $itemsByPath[$canonicalPath] = $record
+        }
+        if ($isRoot) {
+            $rootCount++
+            if ($null -eq $rootRecord) { $rootRecord = $record }
+        }
+    }
+    if ($rootCount -ne 1) { $findings.Add("ACL_AUDIT_ROOT_COUNT:$rootCount") }
+    if ($null -ne $rootRecord -and -not $rootRecord.is_directory) {
+        $findings.Add('ACL_AUDIT_ROOT_NOT_DIRECTORY')
+        [void]$unsafePaths.Add($rootRecord.key)
+    }
+
+    # Validate the effective policy on root and descendants identically.  The
+    # only semantic distinction is that the canonical root must protect its
+    # DACL; an unprotected descendant is accepted only when every effective ACE
+    # is inherited from an audited parent chain inside that protected root.
+    foreach ($record in @($records)) {
+        $item = $record.item
+        $path = $record.path
+        $itemUnsafe = $unsafePaths.Contains($record.key)
+
         if ([bool](Get-TradingLabAclPlanProperty $item 'is_reparse_point')) {
             $reparsePoints++
             $findings.Add("ACL_AUDIT_REPARSE_POINT:$path")
+            $itemUnsafe = $true
         }
         if ((Get-TradingLabAclPlanProperty $item 'owner_sid') -ne $AdministratorsSid) {
             $ownerMismatches++
             $findings.Add("ACL_AUDIT_OWNER_NOT_ADMINISTRATORS:$path")
+            $itemUnsafe = $true
         }
-        if (-not [bool](Get-TradingLabAclPlanProperty $item 'inheritance_protected')) {
-            $inheritanceMismatches++
-            $findings.Add("ACL_AUDIT_INHERITANCE_NOT_PROTECTED:$path")
+        if ($record.is_root -and -not $record.inheritance_protected) {
+            $findings.Add("ACL_AUDIT_ROOT_INHERITANCE_NOT_PROTECTED:$path")
+            $itemUnsafe = $true
         }
 
         $rightsBySid = @{}
-        foreach ($rule in @((Get-TradingLabAclPlanProperty $item 'rules'))) {
+        $rules = @((Get-TradingLabAclPlanProperty $item 'rules'))
+        foreach ($rule in $rules) {
             $sid = [string](Get-TradingLabAclPlanProperty $rule 'sid')
             $type = [string](Get-TradingLabAclPlanProperty $rule 'type')
             $rights = [int64](Get-TradingLabAclPlanProperty $rule 'rights')
             if ($type -eq 'Deny') {
                 $denyAces++
                 $findings.Add("ACL_AUDIT_DENY_ACE:$path`:$sid")
+                $itemUnsafe = $true
                 continue
             }
             if ($type -ne 'Allow') {
                 $findings.Add("ACL_AUDIT_UNKNOWN_ACE_TYPE:$path`:$sid")
+                $itemUnsafe = $true
                 continue
             }
             if ($rightsBySid.ContainsKey($sid)) {
                 $findings.Add("ACL_AUDIT_DUPLICATE_ALLOW:$path`:$sid")
                 $rightsBySid[$sid] = $rightsBySid[$sid] -bor $rights
+                $itemUnsafe = $true
             } else { $rightsBySid[$sid] = $rights }
             if ($sid -notin @($SystemSid, $AdministratorsSid, $GatewaySid)) {
                 $unexpectedPrincipals++
                 $classification = Get-TradingLabFileSystemRightsClassification $rights
                 $findings.Add("ACL_AUDIT_UNEXPECTED_PRINCIPAL:$path`:$sid`:mutation=$($classification.modify_equivalent)")
+                $itemUnsafe = $true
+            }
+        }
+
+        if (-not $record.is_root -and -not $record.inheritance_protected) {
+            foreach ($rule in $rules) {
+                if (-not [bool](Get-TradingLabAclPlanProperty $rule 'inherited')) {
+                    $findings.Add("ACL_AUDIT_UNPROTECTED_DESCENDANT_EXPLICIT_ACE:$path")
+                    $itemUnsafe = $true
+                    break
+                }
             }
         }
 
         if ($rightsBySid.ContainsKey($AgentSid)) {
             $agentAllowAces++
             $findings.Add("ACL_AUDIT_AGENT_ALLOW:$path")
+            $itemUnsafe = $true
         }
         if (-not $rightsBySid.ContainsKey($SystemSid) -or $rightsBySid[$SystemSid] -ne $FullControlValue) {
             $systemRightsMismatches++
             $findings.Add("ACL_AUDIT_SYSTEM_NOT_FULLCONTROL:$path")
+            $itemUnsafe = $true
         }
         if (-not $rightsBySid.ContainsKey($AdministratorsSid) -or $rightsBySid[$AdministratorsSid] -ne $FullControlValue) {
             $administratorsRightsMismatches++
             $findings.Add("ACL_AUDIT_ADMINISTRATORS_NOT_FULLCONTROL:$path")
+            $itemUnsafe = $true
         }
         if (-not $rightsBySid.ContainsKey($GatewaySid)) {
             $gatewayRightsMismatches++
             $findings.Add("ACL_AUDIT_GATEWAY_MISSING:$path")
+            $itemUnsafe = $true
         } else {
             $gatewayMutationIntersection = $gatewayMutationIntersection -bor `
                 (Get-TradingLabMutationRightsIntersection $rightsBySid[$GatewaySid])
@@ -247,11 +325,55 @@ function Test-TradingLabRuntimeAclAudit(
                 (Test-TradingLabFileSystemRightsMutation $rightsBySid[$GatewaySid])) {
                 $gatewayRightsMismatches++
                 $findings.Add("ACL_AUDIT_GATEWAY_RIGHTS_UNSAFE:$path")
+                $itemUnsafe = $true
             }
         }
         if ($rightsBySid.Count -ne 3) {
             $findings.Add("ACL_AUDIT_ALLOW_PRINCIPAL_COUNT:$path`:$($rightsBySid.Count)")
+            $itemUnsafe = $true
         }
+        if ($itemUnsafe) { [void]$unsafePaths.Add($record.key) }
+    }
+
+    # Prove that each unprotected descendant inherits only through directories
+    # represented by this exact, canonical, reparse-free audit snapshot.
+    foreach ($record in @($records | Where-Object {
+        -not $_.is_root -and -not $_.inheritance_protected
+    })) {
+        if ($null -eq $record.canonical_path -or -not $record.inside_target) { continue }
+        $parent = [System.IO.Path]::GetDirectoryName($record.canonical_path)
+        while (-not [string]::IsNullOrWhiteSpace($parent)) {
+            $canonicalParent = [System.IO.Path]::GetFullPath($parent).TrimEnd('\')
+            if (-not $itemsByPath.ContainsKey($canonicalParent) -or
+                -not [bool]$itemsByPath[$canonicalParent].is_directory) {
+                $findings.Add("ACL_AUDIT_INHERITANCE_PARENT_UNVERIFIED:$($record.path)`:$canonicalParent")
+                [void]$unsafePaths.Add($record.key)
+                break
+            }
+            if ($unsafePaths.Contains($canonicalParent)) {
+                $findings.Add("ACL_AUDIT_INHERITANCE_CHAIN_UNSAFE:$($record.path)`:$canonicalParent")
+                [void]$unsafePaths.Add($record.key)
+                break
+            }
+            if ($canonicalParent.Equals($canonicalTarget, [System.StringComparison]::OrdinalIgnoreCase)) {
+                break
+            }
+            if (-not $canonicalParent.StartsWith($canonicalTarget + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                $findings.Add("ACL_AUDIT_INHERITANCE_CHAIN_OUTSIDE_TARGET:$($record.path)")
+                [void]$unsafePaths.Add($record.key)
+                break
+            }
+            $parent = [System.IO.Path]::GetDirectoryName($canonicalParent)
+        }
+    }
+
+    $safeInheritedDescendants = 0
+    $protectedDescendants = 0
+    $unsafeDescendants = 0
+    foreach ($record in @($records | Where-Object { -not $_.is_root })) {
+        if ($unsafePaths.Contains($record.key)) { $unsafeDescendants++ }
+        elseif ($record.inheritance_protected) { $protectedDescendants++ }
+        else { $safeInheritedDescendants++ }
     }
 
     $gatewayClassification = Get-TradingLabFileSystemRightsClassification $GatewayReadExecuteValue
@@ -263,7 +385,17 @@ function Test-TradingLabRuntimeAclAudit(
         unexpected_principals = $unexpectedPrincipals
         reparse_points = $reparsePoints
         owner_administrators = $ownerMismatches -eq 0
-        inheritance_protected = $inheritanceMismatches -eq 0
+        root_inheritance_protected = $null -ne $rootRecord -and $rootRecord.inheritance_protected
+        inheritance_protected = $null -ne $rootRecord -and $rootRecord.inheritance_protected
+        descendant_policy_safe = $unsafeDescendants -eq 0
+        protected_descendants = $protectedDescendants
+        safe_inherited_descendants = $safeInheritedDescendants
+        unsafe_descendants = $unsafeDescendants
+        descendant_classification_counts = [pscustomobject]@{
+            DESCENDANT_ACL_PROTECTED = $protectedDescendants
+            DESCENDANT_ACL_SAFE_INHERITED = $safeInheritedDescendants
+            DESCENDANT_ACL_UNSAFE = $unsafeDescendants
+        }
         system_full_control = $systemRightsMismatches -eq 0
         administrators_full_control = $administratorsRightsMismatches -eq 0
         gateway_read_execute = $gatewayRightsMismatches -eq 0
@@ -275,4 +407,14 @@ function Test-TradingLabRuntimeAclAudit(
         prohibited_mutation_mask_hex = $gatewayClassification.prohibited_mutation_mask_hex
         gateway_mutation_intersection = $gatewayMutationIntersection
     }
+}
+
+function Resolve-TradingLabRuntimeAclDisposition([object] $Audit) {
+    if ($null -eq $Audit -or -not [bool](Get-TradingLabAclPlanProperty $Audit 'valid')) {
+        return 'INCOMPLETE'
+    }
+    if ([int](Get-TradingLabAclPlanProperty $Audit 'safe_inherited_descendants') -gt 0) {
+        return 'SAFE_NO_REPAIR_REQUIRED'
+    }
+    return 'EXACT_PROTECTED'
 }

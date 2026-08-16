@@ -2152,7 +2152,7 @@ function Assert-MachineInstallationInventory([object] $Inventory) {
 function Get-MachineRuntimeAclState {
     $audit = Get-MachineRuntimeAclAudit $pythonBase
     return [pscustomobject]@{
-        state = if ($audit.valid) { 'EXACT' } else { 'INCOMPLETE' }
+        state = Resolve-TradingLabRuntimeAclDisposition $audit
         audit = $audit
     }
 }
@@ -2173,7 +2173,17 @@ function Get-ReadOnlyVerifiedMachineRuntimeInventory([object] $Inventory) {
             unexpected_principals = 0
             reparse_points = if ($reparseFailure) { 1 } else { 0 }
             owner_administrators = $false
+            root_inheritance_protected = $false
             inheritance_protected = $false
+            descendant_policy_safe = $false
+            protected_descendants = 0
+            safe_inherited_descendants = 0
+            unsafe_descendants = 1
+            descendant_classification_counts = [pscustomobject]@{
+                DESCENDANT_ACL_PROTECTED = 0
+                DESCENDANT_ACL_SAFE_INHERITED = 0
+                DESCENDANT_ACL_UNSAFE = 1
+            }
             system_full_control = $false
             administrators_full_control = $false
             gateway_read_execute = $false
@@ -2204,12 +2214,18 @@ function Assert-FinalVerifiedMachineRuntimeInventory([object] $Inventory) {
 }
 
 function Set-MachineRuntimeAclPassGates([object] $Audit) {
-    if ($null -eq $Audit -or -not $Audit.valid) {
+    if ($null -eq $Audit -or -not $Audit.valid -or
+        -not $Audit.root_inheritance_protected -or
+        -not $Audit.descendant_policy_safe -or
+        $Audit.unsafe_descendants -ne 0) {
         throw 'PYTHON_RUNTIME_ACL=FAIL: recursive audit did not pass.'
     }
     $report.acl_recursive_audit = $Audit
     $report.gates.ACL_OWNER_ADMINISTRATORS = 'PASS'
-    $report.gates.ACL_INHERITANCE_PROTECTED = 'PASS'
+    $report.gates.ACL_ROOT_INHERITANCE_PROTECTED = 'PASS'
+    $report.gates.ACL_DESCENDANT_POLICY_SAFE = 'PASS'
+    $report.gates.ACL_SAFE_INHERITED_DESCENDANTS = $Audit.safe_inherited_descendants
+    $report.gates.ACL_UNSAFE_DESCENDANTS = $Audit.unsafe_descendants
     $report.gates.SYSTEM_FULLCONTROL = 'PASS'
     $report.gates.ADMINISTRATORS_FULLCONTROL = 'PASS'
     $report.gates.PYTHON_GATEWAY_EXECUTE = 'PASS'
@@ -2256,24 +2272,31 @@ function Complete-InstalledMachineRuntime([object] $Inventory) {
     Set-MachineRuntimePassGates $metadata
     $report.inventory_after = $Inventory.state
 
-    $aclPlan = New-MachineRuntimeAclPlan $pythonBase
-    Set-MachineRuntimeAclPlanGates $aclPlan
     $report.acl_apply_requested = [bool]$Apply
 
     $aclState = Get-MachineRuntimeAclState
     $report.acl_recursive_audit = $aclState.audit
-    if ($aclState.state -eq 'EXACT') {
-        $report.recovery_state = 'TARGET_RUNTIME_ACL_ALREADY_APPLIED_VALIDATION_PENDING'
+    if ($aclState.state -in @('EXACT_PROTECTED', 'SAFE_NO_REPAIR_REQUIRED')) {
+        $report.recovery_state = if ($aclState.state -eq 'SAFE_NO_REPAIR_REQUIRED') {
+            'TARGET_RUNTIME_ACL_ALREADY_SAFE_NO_REPAIR_REQUIRED'
+        } else { 'TARGET_RUNTIME_ACL_ALREADY_APPLIED_VALIDATION_PENDING' }
         $report.must_not_call_set_acl = $true
+        $report.acl_plan = $null
+        $report.acl_applied = $false
         $report.acl_reapplied = $false
-        $report.gates.TARGET_RUNTIME_ACL_ALREADY_APPLIED_VALIDATION_PENDING = 'PASS'
+        $report.machine_runtime_acl_modified = $false
+        $report.gates[$report.recovery_state] = 'PASS'
+        $report.gates.ACL_PLAN = 'NO_OP'
         $report.gates.MUST_NOT_CALL_SET_ACL = 'true'
+        $report.gates.SET_ACL_CALL_COUNT = 0
+        $report.gates.ACL_APPLIED = 'false'
         $report.gates.ACL_REAPPLIED = 'false'
         Set-MachineRuntimeAclPassGates $aclState.audit
         $Inventory = ConvertTo-TradingLabVerifiedPythonInventory `
             $Inventory $aclState.audit $pythonBase $expectedPythonVersion (Join-Path $env:SystemDrive 'Users')
         Assert-FinalVerifiedMachineRuntimeInventory $Inventory
         $report.inventory_after = $Inventory.state
+        $report.runtime_verification = $Inventory.runtime_verification
         if ($Apply) {
             Initialize-PhaseStorage
             $report.current_run_applied_phase = 'MachineRuntimeValidationRecovered'
@@ -2281,6 +2304,8 @@ function Complete-InstalledMachineRuntime([object] $Inventory) {
         return
     }
 
+    $aclPlan = New-MachineRuntimeAclPlan $pythonBase
+    Set-MachineRuntimeAclPlanGates $aclPlan
     $report.gates.PYTHON_RUNTIME_ACL = 'INCOMPLETE_REQUIRES_EXPLICIT_APPLY'
     if (-not $Apply) { return }
     Initialize-PhaseStorage
@@ -2297,6 +2322,7 @@ function Complete-InstalledMachineRuntime([object] $Inventory) {
         $Inventory $postApplyAudit $pythonBase $expectedPythonVersion (Join-Path $env:SystemDrive 'Users')
     Assert-FinalVerifiedMachineRuntimeInventory $Inventory
     $report.inventory_after = $Inventory.state
+    $report.runtime_verification = $Inventory.runtime_verification
 }
 
 function Write-Report {
@@ -2390,6 +2416,16 @@ function Write-BuildVenvPreflightSummary {
     Write-Output "WHEELHOUSE_DUPLICATE_REQUIREMENTS=$(@($report.wheelhouse_validation.duplicate_requirements).Count)"
     Write-Output "build_venv_plan=$($report.build_venv_plan | ConvertTo-Json -Depth 8 -Compress)"
     Write-Output "post_build_validation_plan=$($report.post_build_validation_plan | ConvertTo-Json -Depth 8 -Compress)"
+}
+
+function Write-ResumeMachineRuntimeSummary {
+    if ($Phase -ne 'ResumeMachineRuntime' -or $null -eq $report.inventory_after) { return }
+    Write-Output "RESUME_APPLY=$($report.apply_requested.ToString().ToLowerInvariant())"
+    Write-Output "RECOVERY_STATE=$($report.recovery_state)"
+    Write-Output "COMPLETED_TARGET_RUNTIME=$($report.inventory_after.completed_target_runtime)"
+    Write-Output "RUNTIME_VERIFICATION=$($report.runtime_verification.status)"
+    Write-Output "PREVALIDATION=$($report.inventory_after.prevalidation)"
+    Write-Output "acl_plan=$(if ($null -eq $report.acl_plan) { 'null' } else { 'present' })"
 }
 
 function Write-UninstallPreflightSummary {
@@ -2940,6 +2976,7 @@ try {
         Write-Gates
         Write-UninstallPreflightSummary
         Write-InstallMachineRuntimePreflightSummary
+        Write-ResumeMachineRuntimeSummary
         Write-BuildVenvPreflightSummary
         Write-PromoteVenvPreflightSummary
         Write-Output "PYTHON_RECOVERY_PHASE=$Phase"
@@ -2952,6 +2989,7 @@ try {
     $report.status = 'PASS'
     Write-Report
     Write-Gates
+    Write-ResumeMachineRuntimeSummary
     Write-BuildVenvPreflightSummary
     Write-PromoteVenvPreflightSummary
     Write-Output "PYTHON_RECOVERY_PHASE=$Phase"

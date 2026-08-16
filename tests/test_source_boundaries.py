@@ -567,7 +567,9 @@ class SourceBoundaryTests(unittest.TestCase):
         dry_return = complete.index("if (-not $Apply) { return }")
         mutation = complete.index("Protect-ExactRuntimeTree $pythonBase $aclPlan")
         self.assertLess(dry_return, mutation)
-        already_applied = complete.index("if ($aclState.state -eq 'EXACT')")
+        already_applied = complete.index(
+            "if ($aclState.state -in @('EXACT_PROTECTED', 'SAFE_NO_REPAIR_REQUIRED'))"
+        )
         already_return = complete.index("return", already_applied)
         self.assertLess(already_applied, already_return)
         self.assertLess(already_return, mutation)
@@ -578,6 +580,18 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn(
             "$report.acl_reapplied = $false",
             complete[already_applied:already_return],
+        )
+        self.assertIn(
+            "$report.acl_plan = $null",
+            complete[already_applied:already_return],
+        )
+        self.assertIn(
+            "$report.machine_runtime_acl_modified = $false",
+            complete[already_applied:already_return],
+        )
+        self.assertGreater(
+            complete.index("New-MachineRuntimeAclPlan $pythonBase"),
+            already_return,
         )
         self.assertNotIn("Set-Acl", complete[:dry_return])
         self.assertNotIn(".SetOwner(", complete[:dry_return])
@@ -595,6 +609,10 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn("[System.IO.Directory]::EnumerateFileSystemEntries", installer)
         self.assertNotIn("AccessControlType]::Deny", installer)
         self.assertIn("Test-TradingLabRuntimeAclAudit", plan_source)
+        self.assertIn("ACL_AUDIT_ROOT_INHERITANCE_NOT_PROTECTED", plan_source)
+        self.assertIn("ACL_AUDIT_INHERITANCE_PARENT_UNVERIFIED", plan_source)
+        self.assertIn("safe_inherited_descendants", plan_source)
+        self.assertIn("SAFE_NO_REPAIR_REQUIRED", plan_source)
         self.assertIn("Get-TradingLabFileSystemRightsClassification", plan_source)
         for atomic_right in (
             "WriteData",
