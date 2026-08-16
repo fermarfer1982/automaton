@@ -48,9 +48,10 @@ $pythonBaseOnly = $sources[$pythonBaseOnlyPath]
 $pythonStagingOnly = $sources[$pythonStagingOnlyPath]
 $pythonFinalOnly = $sources[$pythonFinalOnlyPath]
 $collector = $sources[$collectorPath]
+$healthAst = $null
 $healthTokens = $null
 $healthParseErrors = $null
-[void][System.Management.Automation.Language.Parser]::ParseFile(
+$healthAst = [System.Management.Automation.Language.Parser]::ParseFile(
     $gatewayHealthOnlyPath, [ref]$healthTokens, [ref]$healthParseErrors
 )
 Assert-True ($healthParseErrors.Count -eq 0) 'Gateway health-only harness has AST errors.'
@@ -602,7 +603,17 @@ foreach ($requiredHealthOnly in @(
     "`$failureStage = 'SHUTDOWN'", 'cleanup_attempted', 'cleanup_error',
     'forced_termination_used', 'Get-SanitizedRuntimeError',
     'Write-ExclusiveJson $reportPath $report',
-    'REPORT_WRITE_FAILED:', 'ORIGINAL_RUNTIME_ERROR:'
+    'REPORT_WRITE_FAILED:', 'ORIGINAL_RUNTIME_ERROR:',
+    '$process.StandardOutput.ReadToEndAsync()',
+    '$process.StandardError.ReadToEndAsync()',
+    'Get-SanitizedBoundedProcessText', 'Receive-GatewayStreamCapture',
+    'Resolve-GatewayEarlyExit', 'GATEWAY_PROCESS_EARLY_EXIT',
+    'GATEWAY_HEALTH_ONLY_PROCESS_EARLY_EXIT',
+    'gateway_process_exit_observed', 'gateway_process_exit_code',
+    'gateway_exit_before_health', 'gateway_stdout_captured',
+    'gateway_stderr_captured', 'gateway_stdout_sanitized',
+    'gateway_stderr_sanitized', 'gateway_stream_capture_error',
+    "'...[TRUNCATED]'", '8192'
 )) {
     Assert-True ($gatewayHealthOnly.Contains($requiredHealthOnly)) "Gateway health-only invariant missing: $requiredHealthOnly"
 }
@@ -614,16 +625,72 @@ $healthBeforeFingerprint = $gatewayHealthOnly.IndexOf('$beforeFingerprint = Get-
 $healthAfterFingerprint = $gatewayHealthOnly.IndexOf('$afterFingerprint = Get-FinalRuntimeFingerprint')
 $healthDurableFinallyIndex = $gatewayHealthOnly.IndexOf('# BEGIN_DURABLE_REPORT_FINALLY')
 $healthReportWriteIndex = $gatewayHealthOnly.LastIndexOf('Write-ExclusiveJson $reportPath $report')
+$healthStdoutAsyncIndex = $gatewayHealthOnly.IndexOf('$process.StandardOutput.ReadToEndAsync()')
+$healthStderrAsyncIndex = $gatewayHealthOnly.IndexOf('$process.StandardError.ReadToEndAsync()')
+$healthPollingExitIndex = $gatewayHealthOnly.IndexOf('if ($process.HasExited) {', $healthStartIndex)
+$healthProbeIndex = $gatewayHealthOnly.IndexOf('Invoke-WebRequest', $healthStartIndex)
+$healthShutdownGuardIndex = $gatewayHealthOnly.IndexOf('if (-not $process.HasExited) {', $healthDurableFinallyIndex)
+$healthStdinIndex = $gatewayHealthOnly.IndexOf("`$process.StandardInput.Write('Q')", $healthDurableFinallyIndex)
 Assert-True ($healthReportIndex -ge 0 -and $healthReportIndex -lt $healthRuntimeGuardIndex) 'Gateway health-only report envelope must exist before the runtime guard.'
 Assert-True ($healthRuntimeGuardIndex -lt $healthIdentityIndex -and $healthIdentityIndex -lt $healthStartIndex) 'Identity and startup must be inside the guarded runtime flow.'
 Assert-True ($healthBeforeFingerprint -ge 0 -and $healthBeforeFingerprint -lt $healthStartIndex) 'Final runtime fingerprint must precede process startup.'
 Assert-True ($healthAfterFingerprint -gt $healthStartIndex) 'Final runtime fingerprint must be repeated after process shutdown.'
 Assert-True ($healthDurableFinallyIndex -gt $healthStartIndex -and $healthReportWriteIndex -gt $healthDurableFinallyIndex) 'Durable report writing must occur from the outer finally after cleanup.'
+Assert-True ($healthStdoutAsyncIndex -gt $healthStartIndex -and $healthStdoutAsyncIndex -lt $healthProbeIndex) 'Gateway stdout must start draining asynchronously immediately after process startup.'
+Assert-True ($healthStderrAsyncIndex -gt $healthStartIndex -and $healthStderrAsyncIndex -lt $healthProbeIndex) 'Gateway stderr must start draining asynchronously immediately after process startup.'
+Assert-True (-not ($gatewayHealthOnly -match '\.ReadToEnd\s*\(')) 'Gateway streams must never use synchronous ReadToEnd.'
+Assert-True ($healthPollingExitIndex -gt $healthStartIndex -and $healthPollingExitIndex -lt $healthProbeIndex) 'Gateway early exit must be checked before each health request.'
+Assert-True ($healthShutdownGuardIndex -ge 0 -and $healthShutdownGuardIndex -lt $healthStdinIndex) 'Controlled stdin shutdown must be guarded by a live-process check.'
 Assert-True (-not $gatewayHealthOnly.Contains('Write-Output $apiKey')) 'Gateway health-only harness must not print the IPC key.'
 Assert-True (-not $gatewayHealthOnly.Contains('Write-Host $apiKey')) 'Gateway health-only harness must not host-print the IPC key.'
 Assert-True ($gatewayHealthOnly.Contains(".Replace(`$SensitiveValue, '[REDACTED]')")) 'Gateway health-only errors must redact the exact IPC key value.'
 Assert-True ($gatewayHealthOnly.Contains("`$process.Kill()")) 'Gateway health-only cleanup must retain bounded forced termination of its process object.'
 Assert-True (-not $gatewayHealthOnly.Contains('Stop-Process')) 'Gateway health-only cleanup must not address arbitrary processes.'
+
+$earlyExitFunctionAst = $healthAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Resolve-GatewayEarlyExit'
+}, $true)
+Assert-True ($null -ne $earlyExitFunctionAst) 'Gateway early-exit resolver function is missing.'
+. ([scriptblock]::Create($earlyExitFunctionAst.Extent.Text))
+$exitZero = Resolve-GatewayEarlyExit $true $false 0
+$exitNonzero = Resolve-GatewayEarlyExit $true $false 17
+$stillRunning = Resolve-GatewayEarlyExit $false $false 0
+$healthSucceeded = Resolve-GatewayEarlyExit $true $true 0
+foreach ($earlyResult in @($exitZero, $exitNonzero)) {
+    Assert-True ($earlyResult.early_exit -and $earlyResult.status -eq 'FAIL') 'Any exit before health must fail as EARLY_EXIT.'
+    Assert-True ($earlyResult.failure_stage -eq 'GATEWAY_PROCESS_EARLY_EXIT') 'Early exit stage is not stable.'
+    Assert-True ($earlyResult.failure_code -eq 'GATEWAY_HEALTH_ONLY_PROCESS_EARLY_EXIT') 'Early exit code is not stable.'
+}
+Assert-True ($exitZero.exit_code -eq 0) 'Exit code zero must remain observable on early exit.'
+Assert-True ($exitNonzero.exit_code -eq 17) 'Nonzero exit code must remain observable on early exit.'
+Assert-True (-not $stillRunning.early_exit) 'A live process must continue health polling.'
+Assert-True (-not $healthSucceeded.early_exit) 'A completed successful health path must not be reclassified as early exit.'
+
+$sanitizeFunctionAst = $healthAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Get-SanitizedBoundedProcessText'
+}, $true)
+Assert-True ($null -ne $sanitizeFunctionAst) 'Gateway bounded stream sanitizer function is missing.'
+. ([scriptblock]::Create($sanitizeFunctionAst.Extent.Text))
+$testSecret = 'K1234567890_TEST_SECRET_VALUE'
+$traceback = "Traceback (most recent call last):`n  File `"service.py`", line 42`nRuntimeError: startup failed`nX-AUTOMATON-KEY=$testSecret`npassword=hidden`nlogin=123456"
+$sanitizedStderr = Get-SanitizedBoundedProcessText $traceback $testSecret 8192
+$sanitizedStdout = Get-SanitizedBoundedProcessText "gateway starting`napi key=$testSecret`nclient_secret=another-secret" $testSecret 8192
+Assert-True ($sanitizedStderr.Contains('Traceback (most recent call last):')) 'Sanitized stderr must preserve traceback diagnostics.'
+Assert-True ($sanitizedStderr.Contains('File "service.py", line 42')) 'Sanitized stderr must preserve file and line diagnostics.'
+Assert-True ($sanitizedStderr.Contains('RuntimeError: startup failed')) 'Sanitized stderr must preserve exception diagnostics.'
+Assert-True ($sanitizedStdout.Contains('gateway starting')) 'Sanitized stdout must preserve non-secret diagnostics.'
+Assert-True (-not ($sanitizedStderr + $sanitizedStdout).Contains($testSecret)) 'Exact IPC/API key value leaked through stream sanitization.'
+Assert-True (-not $sanitizedStdout.Contains('another-secret')) 'Unknown config secret leaked through stream sanitization.'
+Assert-True (-not $sanitizedStderr.Contains('password=hidden')) 'Password leaked through stream sanitization.'
+Assert-True (-not $sanitizedStderr.Contains('login=123456')) 'MT5 login leaked through stream sanitization.'
+$truncatedStream = Get-SanitizedBoundedProcessText ('A' * 10000) $null 8192
+$truncatedBytes = [System.Text.UTF8Encoding]::new($false).GetByteCount($truncatedStream)
+Assert-True ($truncatedBytes -le 8192) 'Sanitized process stream exceeded the exact UTF-8 byte limit.'
+Assert-True ($truncatedStream.EndsWith('...[TRUNCATED]')) 'Truncated process stream lacks the explicit marker.'
 
 Assert-True ($collector.Contains('#Requires -RunAsAdministrator')) 'Collector must require elevation.'
 foreach ($required in @(
@@ -710,4 +777,7 @@ Assert-True `
     GATEWAY_HEALTH_ONLY_NATIVE_HTTP = 'PASS'
     GATEWAY_HEALTH_ONLY_DURABLE_FAILURE_REPORT = 'PASS'
     GATEWAY_HEALTH_ONLY_REPORT_REDACTION = 'PASS'
+    GATEWAY_HEALTH_ONLY_ASYNC_STREAM_CAPTURE = 'PASS'
+    GATEWAY_HEALTH_ONLY_EARLY_EXIT_CLASSIFICATION = 'PASS'
+    GATEWAY_HEALTH_ONLY_BOUNDED_DIAGNOSTICS = 'PASS'
 } | ConvertTo-Json

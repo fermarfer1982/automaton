@@ -41,6 +41,14 @@ $report = [ordered]@{
     trading_mode = 'OBSERVE_ONLY'
     mt5_access_enabled = $false
     gateway_process_started = $false
+    gateway_process_exit_observed = $false
+    gateway_process_exit_code = $null
+    gateway_exit_before_health = $false
+    gateway_stdout_captured = $false
+    gateway_stderr_captured = $false
+    gateway_stdout_sanitized = $null
+    gateway_stderr_sanitized = $null
+    gateway_stream_capture_error = $null
     health_http_status = 0
     health_payload_valid = $false
     mt5_package_metadata_version = $null
@@ -64,7 +72,17 @@ $report = [ordered]@{
 $effectiveSid = $null
 $apiKey = $null
 $process = $null
+$stdoutReadTask = $null
+$stderrReadTask = $null
 $gatewayProcessStarted = $false
+$gatewayProcessExitObserved = $false
+$gatewayProcessExitCode = $null
+$gatewayExitBeforeHealth = $false
+$gatewayStdoutCaptured = $false
+$gatewayStderrCaptured = $false
+$gatewayStdoutSanitized = $null
+$gatewayStderrSanitized = $null
+$gatewayStreamCaptureError = $null
 $healthHttpStatus = 0
 $healthPayloadValid = $false
 $mt5PackageVersion = $null
@@ -222,6 +240,101 @@ function Get-SanitizedRuntimeError([object] $ErrorRecord, [string] $SensitiveVal
     return $message
 }
 
+function Get-SanitizedBoundedProcessText(
+    [AllowNull()][string] $Text,
+    [AllowNull()][string] $SensitiveValue,
+    [int] $MaximumUtf8Bytes = 8192
+) {
+    if ($MaximumUtf8Bytes -lt 64) { throw 'Process stream byte limit is too small.' }
+    if ($null -eq $Text) { return '' }
+    $sanitized = $Text
+    if (-not [string]::IsNullOrEmpty($SensitiveValue)) {
+        $sanitized = $sanitized.Replace($SensitiveValue, '[REDACTED]')
+    }
+    $secretAssignmentPattern = @'
+(?im)["']?(X-AUTOMATON-KEY|api[\s_-]?key|ipc[\s_-]?key|mt5[\s_-]?password|password|passwd|credential|credentials|client[\s_-]?secret|private[\s_-]?key|secret|access[\s_-]?token|refresh[\s_-]?token|token|mt5[\s_-]?login|login|authorized[\s_-]?account|account|server)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;}\r\n]+)
+'@.Trim()
+    $sanitized = [regex]::Replace(
+        $sanitized,
+        $secretAssignmentPattern,
+        '$1=[REDACTED]'
+    )
+
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    if ($encoding.GetByteCount($sanitized) -le $MaximumUtf8Bytes) {
+        return $sanitized
+    }
+    $marker = '...[TRUNCATED]'
+    $payloadLimit = $MaximumUtf8Bytes - $encoding.GetByteCount($marker)
+    $low = 0
+    $high = [Math]::Min($sanitized.Length, $payloadLimit)
+    while ($low -lt $high) {
+        $middle = [int][Math]::Ceiling(($low + $high) / 2.0)
+        if ($encoding.GetByteCount($sanitized.Substring(0, $middle)) -le $payloadLimit) {
+            $low = $middle
+        } else {
+            $high = $middle - 1
+        }
+    }
+    if ($low -gt 0 -and [char]::IsHighSurrogate($sanitized[$low - 1])) {
+        $low--
+    }
+    return $sanitized.Substring(0, $low) + $marker
+}
+
+function Receive-GatewayStreamCapture(
+    [AllowNull()][object] $ReadTask,
+    [AllowNull()][string] $SensitiveValue,
+    [int] $TimeoutMilliseconds = 5000
+) {
+    if ($null -eq $ReadTask) {
+        return [pscustomobject]@{
+            captured = $false
+            sanitized = $null
+            error = 'Asynchronous stream reader was not initialized.'
+        }
+    }
+    try {
+        if (-not $ReadTask.Wait($TimeoutMilliseconds)) {
+            return [pscustomobject]@{
+                captured = $false
+                sanitized = $null
+                error = 'Asynchronous stream capture timed out.'
+            }
+        }
+        return [pscustomobject]@{
+            captured = $true
+            sanitized = Get-SanitizedBoundedProcessText `
+                ([string]$ReadTask.Result) $SensitiveValue 8192
+            error = $null
+        }
+    } catch {
+        return [pscustomobject]@{
+            captured = $false
+            sanitized = $null
+            error = Get-SanitizedRuntimeError $_ $SensitiveValue
+        }
+    }
+}
+
+function Resolve-GatewayEarlyExit(
+    [bool] $HasExited,
+    [bool] $HealthObserved,
+    [int] $ExitCode
+) {
+    $earlyExit = $HasExited -and -not $HealthObserved
+    return [pscustomobject]@{
+        early_exit = $earlyExit
+        status = if ($earlyExit) { 'FAIL' } else { $null }
+        failure_stage = if ($earlyExit) { 'GATEWAY_PROCESS_EARLY_EXIT' } else { $null }
+        failure_code = if ($earlyExit) {
+            'GATEWAY_HEALTH_ONLY_PROCESS_EARLY_EXIT'
+        } else { $null }
+        exit_observed = $HasExited
+        exit_code = if ($HasExited) { $ExitCode } else { $null }
+    }
+}
+
 # BEGIN_RUNTIME_GUARD: every potentially failing runtime operation is enclosed.
 try {
     $stage = 'IDENTITY'
@@ -298,6 +411,8 @@ try {
     $process.StartInfo = $startInfo
     if (-not $process.Start()) { throw 'Gateway process did not start.' }
     $gatewayProcessStarted = $true
+    $stdoutReadTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrReadTask = $process.StandardError.ReadToEndAsync()
 
     $stage = 'HEALTH_GET'
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
@@ -305,7 +420,15 @@ try {
     $lastHealthError = $null
     $healthUri = "http://127.0.0.1`:$ListenPort/health"
     while ([DateTime]::UtcNow -lt $deadline) {
-        if ($process.HasExited) { break }
+        if ($process.HasExited) {
+            $earlyExit = Resolve-GatewayEarlyExit $true $false $process.ExitCode
+            $gatewayExitBeforeHealth = $earlyExit.early_exit
+            $gatewayProcessExitObserved = $earlyExit.exit_observed
+            $gatewayProcessExitCode = $earlyExit.exit_code
+            $stage = $earlyExit.failure_stage
+            $failureCode = $earlyExit.failure_code
+            throw "Gateway process exited before health with exit code $gatewayProcessExitCode."
+        }
         try {
             $response = Invoke-WebRequest `
                 -UseBasicParsing `
@@ -320,6 +443,15 @@ try {
             }
         } catch {
             $lastHealthError = Get-SanitizedRuntimeError $_ $apiKey
+            if ($process.HasExited) {
+                $earlyExit = Resolve-GatewayEarlyExit $true $false $process.ExitCode
+                $gatewayExitBeforeHealth = $earlyExit.early_exit
+                $gatewayProcessExitObserved = $earlyExit.exit_observed
+                $gatewayProcessExitCode = $earlyExit.exit_code
+                $stage = $earlyExit.failure_stage
+                $failureCode = $earlyExit.failure_code
+                throw "Gateway process exited before health with exit code $gatewayProcessExitCode."
+            }
             Start-Sleep -Milliseconds 200
         }
     }
@@ -350,7 +482,9 @@ try {
     $runtimeSucceeded = $true
 } catch {
     $failureStage = $stage
-    $failureCode = "GATEWAY_HEALTH_ONLY_$($stage)_FAILED"
+    if ([string]::IsNullOrWhiteSpace($failureCode)) {
+        $failureCode = "GATEWAY_HEALTH_ONLY_$($stage)_FAILED"
+    }
     $runtimeError = Get-SanitizedRuntimeError $_ $apiKey
 } finally {
     # BEGIN_DURABLE_REPORT_FINALLY: only the exact process object created above
@@ -392,6 +526,23 @@ try {
                     } else { "$cleanupError; $forcedError" }
                 }
             }
+            if ($process.HasExited) {
+                $gatewayProcessExitObserved = $true
+                $gatewayProcessExitCode = $process.ExitCode
+            }
+            $stdoutCapture = Receive-GatewayStreamCapture $stdoutReadTask $apiKey 5000
+            $stderrCapture = Receive-GatewayStreamCapture $stderrReadTask $apiKey 5000
+            $gatewayStdoutCaptured = [bool]$stdoutCapture.captured
+            $gatewayStderrCaptured = [bool]$stderrCapture.captured
+            $gatewayStdoutSanitized = $stdoutCapture.sanitized
+            $gatewayStderrSanitized = $stderrCapture.sanitized
+            $streamErrors = @(
+                @($stdoutCapture.error, $stderrCapture.error) |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+            )
+            if ($streamErrors.Count -gt 0) {
+                $gatewayStreamCaptureError = $streamErrors -join '; '
+            }
             $orphanProcesses = if (
                 Get-Process -Id $knownPid -ErrorAction SilentlyContinue
             ) { 1 } else { 0 }
@@ -417,6 +568,18 @@ try {
         }
     }
 
+    if (
+        $gatewayProcessStarted -and
+        (-not $gatewayStdoutCaptured -or -not $gatewayStderrCaptured) -and
+        [string]::IsNullOrWhiteSpace($runtimeError)
+    ) {
+        $failureStage = 'STREAM_CAPTURE'
+        $failureCode = 'GATEWAY_HEALTH_ONLY_STREAM_CAPTURE_FAILED'
+        $runtimeError = if ([string]::IsNullOrWhiteSpace($gatewayStreamCaptureError)) {
+            'Gateway stdout/stderr capture did not complete.'
+        } else { $gatewayStreamCaptureError }
+    }
+
     if ($null -ne $beforeFingerprint) {
         try {
             $afterFingerprint = Get-FinalRuntimeFingerprint
@@ -436,6 +599,8 @@ try {
 
     $passed =
         $runtimeSucceeded -and $gatewayProcessStarted -and
+        $gatewayProcessExitObserved -and
+        $gatewayStdoutCaptured -and $gatewayStderrCaptured -and
         $healthHttpStatus -eq 200 -and $healthPayloadValid -and
         -not $mt5Imported -and -not $mt5Accessed -and
         -not $orderCheckCalled -and -not $orderSendCalled -and
@@ -456,6 +621,14 @@ try {
     $report.failure_stage = if ($passed) { $null } else { $failureStage }
     $report.runtime_error = if ($passed) { $null } else { $runtimeError }
     $report.gateway_process_started = $gatewayProcessStarted
+    $report.gateway_process_exit_observed = $gatewayProcessExitObserved
+    $report.gateway_process_exit_code = $gatewayProcessExitCode
+    $report.gateway_exit_before_health = $gatewayExitBeforeHealth
+    $report.gateway_stdout_captured = $gatewayStdoutCaptured
+    $report.gateway_stderr_captured = $gatewayStderrCaptured
+    $report.gateway_stdout_sanitized = $gatewayStdoutSanitized
+    $report.gateway_stderr_sanitized = $gatewayStderrSanitized
+    $report.gateway_stream_capture_error = $gatewayStreamCaptureError
     $report.health_http_status = $healthHttpStatus
     $report.health_payload_valid = $healthPayloadValid
     $report.mt5_package_metadata_version = $mt5PackageVersion

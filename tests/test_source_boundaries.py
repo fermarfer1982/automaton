@@ -653,8 +653,23 @@ class SourceBoundaryTests(unittest.TestCase):
             "# BEGIN_DURABLE_REPORT_FINALLY",
             "Write-ExclusiveJson $reportPath $report",
             "Get-SanitizedRuntimeError",
+            "$process.StandardOutput.ReadToEndAsync()",
+            "$process.StandardError.ReadToEndAsync()",
+            "Resolve-GatewayEarlyExit",
+            "GATEWAY_PROCESS_EARLY_EXIT",
+            "GATEWAY_HEALTH_ONLY_PROCESS_EARLY_EXIT",
+            "gateway_process_exit_observed",
+            "gateway_process_exit_code",
+            "gateway_exit_before_health",
+            "gateway_stdout_captured",
+            "gateway_stderr_captured",
+            "gateway_stdout_sanitized",
+            "gateway_stderr_sanitized",
+            "Get-SanitizedBoundedProcessText",
+            "...[TRUNCATED]",
         ):
             self.assertIn(required, harness)
+        self.assertNotRegex(harness, r"\.ReadToEnd\s*\(")
         self.assertLess(
             harness.index("$report = [ordered]@{"),
             harness.index("# BEGIN_RUNTIME_GUARD"),
@@ -668,6 +683,20 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertGreater(
             harness.rindex("Write-ExclusiveJson $reportPath $report"),
             harness.index("# BEGIN_DURABLE_REPORT_FINALLY"),
+        )
+        process_start = harness.index("if (-not $process.Start())")
+        health_probe = harness.index("Invoke-WebRequest", process_start)
+        self.assertLess(
+            harness.index("$process.StandardOutput.ReadToEndAsync()", process_start),
+            health_probe,
+        )
+        self.assertLess(
+            harness.index("$process.StandardError.ReadToEndAsync()", process_start),
+            health_probe,
+        )
+        self.assertLess(
+            harness.index("if ($process.HasExited) {", process_start),
+            health_probe,
         )
 
     def test_machine_runtime_acl_resume_is_exact_target_and_dry_run_safe(self) -> None:
