@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import re
 import unittest
@@ -40,6 +41,7 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn('"scripts/Test-PythonBaseOnlyRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Test-PythonStagingOnlyRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Test-PythonFinalOnlyRuntimeAcl.ps1"', source)
+        self.assertIn('"scripts/Test-GatewayHealthOnly.ps1"', source)
         self.assertIn('"scripts/Collect-RuntimeAclResults.ps1"', source)
         self.assertIn('"scripts/Install-TradingLabPythonRuntime.ps1"', source)
         self.assertIn('"scripts/TradingLabPythonInventory.ps1"', source)
@@ -591,6 +593,58 @@ class SourceBoundaryTests(unittest.TestCase):
             "filesystem_final_modified =",
         ):
             self.assertIn(boundary, implementation)
+
+    def test_gateway_health_only_startup_has_no_import_time_mt5_coupling(self) -> None:
+        service = (ROOT / "trading_lab" / "service.py").read_text(encoding="utf-8")
+        health_only = (ROOT / "trading_lab" / "health_only.py").read_text(
+            encoding="utf-8"
+        )
+        adapter = (ROOT / "trading_lab" / "mt5_adapter.py").read_text(encoding="utf-8")
+        harness = (ROOT / "scripts" / "Test-GatewayHealthOnly.ps1").read_text(
+            encoding="utf-8"
+        )
+        config = (ROOT / "trading_lab" / "config.py").read_text(encoding="utf-8")
+        service_tree = ast.parse(service)
+        top_level_imports = {
+            node.module
+            for node in service_tree.body
+            if isinstance(node, ast.ImportFrom) and node.module is not None
+        }
+        self.assertNotIn("factory", top_level_imports)
+        self.assertNotIn("providers", top_level_imports)
+        self.assertNotIn("mt5_adapter", top_level_imports)
+        self.assertNotIn("import MetaTrader5", service + health_only + adapter)
+        self.assertNotIn("from MetaTrader5", service + health_only + adapter)
+        self.assertNotIn('importlib.import_module("MetaTrader5")', service + health_only)
+        disabled_guard = service.index(
+            "if not mt5_access_enabled or not config.mt5_access_enabled"
+        )
+        lazy_provider = service.index("from .providers import MT5ExecutionProvider")
+        self.assertLess(disabled_guard, lazy_provider)
+        self.assertIn('raw.get("mt5_access_enabled", False)', config)
+        self.assertIn("MT5_ACCESS_ENABLED=true requires", config)
+        self.assertIn('"MetaTrader5" in sys.modules', health_only)
+        self.assertIn('metadata.version("MetaTrader5")', health_only)
+        self.assertIn('"mt5_status": "IMPORTED_UNEXPECTEDLY"', health_only)
+        self.assertIn('else "DISABLED_NOT_ACCESSED"', health_only)
+        self.assertIn('@app.get("/health", dependencies=protected)', (
+            ROOT / "trading_lab" / "fastapi_service.py"
+        ).read_text(encoding="utf-8"))
+        for forbidden in (
+            "runas.exe", "Start-Process", "TaskKill", "Set-Acl", "0.0.0.0",
+            "import MetaTrader5", ".order_check(", ".order_send(",
+        ):
+            self.assertNotIn(forbidden, harness)
+        for required in (
+            "C:\\automaton\\.venv\\Scripts\\python.exe",
+            "$listenAddress = '127.0.0.1'",
+            "MT5_ACCESS_ENABLED'] = 'false'",
+            "--controlled-stdin-shutdown",
+            "gateway-health-only-$normalizedRunId.json",
+            "filesystem_runtime_modified",
+            "acl_modified",
+        ):
+            self.assertIn(required, harness)
 
     def test_machine_runtime_acl_resume_is_exact_target_and_dry_run_safe(self) -> None:
         installer = (ROOT / "scripts" / "Install-TradingLabPythonRuntime.ps1").read_text(

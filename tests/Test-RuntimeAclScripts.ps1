@@ -8,6 +8,7 @@ $gatewayPath = Join-Path $workspace 'scripts\Test-GatewayRuntimeAcl.ps1'
 $pythonBaseOnlyPath = Join-Path $workspace 'scripts\Test-PythonBaseOnlyRuntimeAcl.ps1'
 $pythonStagingOnlyPath = Join-Path $workspace 'scripts\Test-PythonStagingOnlyRuntimeAcl.ps1'
 $pythonFinalOnlyPath = Join-Path $workspace 'scripts\Test-PythonFinalOnlyRuntimeAcl.ps1'
+$gatewayHealthOnlyPath = Join-Path $workspace 'scripts\Test-GatewayHealthOnly.ps1'
 $collectorPath = Join-Path $workspace 'scripts\Collect-RuntimeAclResults.ps1'
 $paths = @(
     $agentPath, $gatewayPath, $pythonBaseOnlyPath, $pythonStagingOnlyPath,
@@ -47,6 +48,13 @@ $pythonBaseOnly = $sources[$pythonBaseOnlyPath]
 $pythonStagingOnly = $sources[$pythonStagingOnlyPath]
 $pythonFinalOnly = $sources[$pythonFinalOnlyPath]
 $collector = $sources[$collectorPath]
+$healthTokens = $null
+$healthParseErrors = $null
+[void][System.Management.Automation.Language.Parser]::ParseFile(
+    $gatewayHealthOnlyPath, [ref]$healthTokens, [ref]$healthParseErrors
+)
+Assert-True ($healthParseErrors.Count -eq 0) 'Gateway health-only harness has AST errors.'
+$gatewayHealthOnly = [System.IO.File]::ReadAllText($gatewayHealthOnlyPath)
 
 Assert-True `
     ($agent.Contains('S-1-5-21-568964486-193631783-1609210587-1006')) `
@@ -556,6 +564,48 @@ $finalFilesystemMutation = $validFinalBoundaries | ConvertTo-Json | ConvertFrom-
 $finalFilesystemMutation.filesystem_final_modified = $true
 Assert-True (-not (Test-PythonFinalOnlyBoundaryRecord $finalFilesystemMutation)) 'Final filesystem mutation must fail the boundary.'
 
+foreach ($forbiddenHealthOnly in @(
+    'runas.exe', 'Start-Process', 'TaskKill', 'taskkill.exe', 'Set-Acl',
+    'icacls', 'takeown', 'import MetaTrader5', '.initialize(', '.login(',
+    '.terminal_info(', '.account_info(', '.symbol_info(', '.positions_get(',
+    '.orders_get(', '.history_', '.order_check(', '.order_send(', '0.0.0.0'
+)) {
+    Assert-True (-not $gatewayHealthOnly.Contains($forbiddenHealthOnly)) "Gateway health-only forbidden action: $forbiddenHealthOnly"
+}
+foreach ($requiredHealthOnly in @(
+    "`$expectedGatewaySid = 'S-1-5-21-568964486-193631783-1609210587-1007'",
+    "`$finalRoot = 'C:\automaton\.venv'",
+    "`$pythonExecutable = 'C:\automaton\.venv\Scripts\python.exe'",
+    "`$listenAddress = '127.0.0.1'", '[ValidateRange(1024, 65535)]',
+    "`$startInfo.EnvironmentVariables['TRADING_MODE'] = 'OBSERVE_ONLY'",
+    "`$startInfo.EnvironmentVariables['MT5_ACCESS_ENABLED'] = 'false'",
+    "`$startInfo.EnvironmentVariables['PYTHONDONTWRITEBYTECODE'] = '1'",
+    '--controlled-stdin-shutdown', 'http://$listenAddress`:$ListenPort/health',
+    'X-AUTOMATON-KEY', 'Get-FinalRuntimeFingerprint',
+    'Assert-LoopbackPortAvailable', '[System.Diagnostics.ProcessStartInfo]::new()',
+    'UseShellExecute = $false', 'RedirectStandardInput = $true',
+    "`$process.StandardInput.Write('Q')", '$process.WaitForExit(15000)',
+    '$process.Kill()', 'Get-Process -Id $knownPid',
+    'gateway-startup-results', 'gateway-health-only-$normalizedRunId.json',
+    "mode = 'GATEWAY_HEALTH_ONLY'", "trading_mode = 'OBSERVE_ONLY'",
+    'mt5_access_enabled = $false', 'mt5_package_metadata_version',
+    'mt5_imported = $mt5Imported', 'mt5_accessed = $mt5Accessed',
+    'order_check_called = $orderCheckCalled', 'order_send_called = $orderSendCalled',
+    'automaton_started = $false', 'process_stopped_cleanly', 'orphan_processes',
+    'filesystem_runtime_modified', 'acl_modified', '[System.IO.FileMode]::CreateNew'
+)) {
+    Assert-True ($gatewayHealthOnly.Contains($requiredHealthOnly)) "Gateway health-only invariant missing: $requiredHealthOnly"
+}
+$healthIdentityIndex = $gatewayHealthOnly.IndexOf('if ($effectiveSid -ne $expectedGatewaySid)')
+$healthFilesystemIndex = $gatewayHealthOnly.IndexOf("`$workspace = 'C:\automaton'")
+$healthStartIndex = $gatewayHealthOnly.IndexOf('if (-not $process.Start())')
+$healthBeforeFingerprint = $gatewayHealthOnly.IndexOf('$beforeFingerprint = Get-FinalRuntimeFingerprint')
+$healthAfterFingerprint = $gatewayHealthOnly.IndexOf('$afterFingerprint = Get-FinalRuntimeFingerprint')
+Assert-True ($healthIdentityIndex -ge 0 -and $healthIdentityIndex -lt $healthFilesystemIndex) 'Gateway health-only SID must precede filesystem access.'
+Assert-True ($healthBeforeFingerprint -ge 0 -and $healthBeforeFingerprint -lt $healthStartIndex) 'Final runtime fingerprint must precede process startup.'
+Assert-True ($healthAfterFingerprint -gt $healthStartIndex) 'Final runtime fingerprint must be repeated after process shutdown.'
+Assert-True (-not $gatewayHealthOnly.Contains('Write-Output $apiKey')) 'Gateway health-only harness must not print the IPC key.'
+
 Assert-True ($collector.Contains('#Requires -RunAsAdministrator')) 'Collector must require elevation.'
 foreach ($required in @(
     'before_sha256', 'append_sha256', 'PREFIX_OR_SUFFIX_HASH_MISMATCH',
@@ -632,4 +682,10 @@ Assert-True `
     PYTHON_FINAL_ONLY_MUTATION_FAIL_CLOSED = 'PASS'
     PYTHON_FINAL_ONLY_STAGING_BACKUP_BOUNDARIES = 'PASS'
     PYTHON_FINAL_ONLY_NO_ACL_SERVICE_MT5_ORDERS = 'PASS'
+    GATEWAY_HEALTH_ONLY_AST = 'PASS'
+    GATEWAY_HEALTH_ONLY_EXACT_SID_PYTHON_LOOPBACK = 'PASS'
+    GATEWAY_HEALTH_ONLY_MT5_DISABLED = 'PASS'
+    GATEWAY_HEALTH_ONLY_PROCESS_OWNERSHIP = 'PASS'
+    GATEWAY_HEALTH_ONLY_RUNTIME_IMMUTABILITY = 'PASS'
+    GATEWAY_HEALTH_ONLY_NO_SECRETS_OR_EXTERNAL_ACTIONS = 'PASS'
 } | ConvertTo-Json

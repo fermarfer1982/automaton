@@ -26,6 +26,7 @@ Este perfil es un laboratorio aislado y *fail-closed*. No hereda las capacidades
 20. **S20 — Evidencia antes de conclusión.** La elegibilidad estadística empieza en 30 observaciones y nunca promociona automáticamente hipótesis.
 21. **S21 — Perfil sin capacidades externas.** Shell, instalaciones, pagos, wallet, replicación, social, orquestación y `git push` quedan fuera del allowlist.
 22. **S22 — ACL por dominio.** No existe un árbol global de datos Gateway con `Modify`; control/IPC son read-only, SQLite se reconoce mutable y journal/security log usan privilegio append propuesto pendiente de validación real post-apply.
+23. **S23 — Acceso MT5 explícito.** `MT5_ACCESS_ENABLED` es un control protegido e independiente de `TRADING_MODE`, con valor predeterminado `false`. Mientras esté deshabilitado, el proceso no importa ni accede a MetaTrader5 y solo expone salud autenticada; el entorno puede restringir el valor protegido, pero nunca habilitarlo.
 
 ## Pruebas que sostienen el límite
 
@@ -34,6 +35,7 @@ Este perfil es un laboratorio aislado y *fail-closed*. No hereda las capacidades
 - `tests/test_source_boundaries.py`: ausencia de selección/login y confinamiento de ejecución/capacidades.
 - `tests/test_audit.py`, `tests/test_sqlite_audit.py` y `tests/test_research_store.py`: redacción, integridad, append-only y evidencia.
 - `tests/test_http_service.py`, `tests/test_api_auth.py`: autenticación y contrato HTTP.
+- `tests/test_health_only_startup.py` y `tests/Test-RuntimeAclScripts.ps1`: arranque health-only sin importar MT5, confinamiento loopback y harness controlado por PID propio.
 - `tests/test_windows_acl.py`, `tests/test_authorization.py` y `tests/test_operator.py`: identidades, autorización externa y controles humanos.
 
 Cambiar cualquiera de estos límites exige revisión humana explícita, tests previos y una nueva versión de la política. Nunca es una tarea de self-modification del agente.

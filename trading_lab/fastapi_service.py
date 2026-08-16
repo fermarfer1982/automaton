@@ -18,6 +18,7 @@ from .api_models import (
     ReviewBody,
 )
 from .domain import SemanticTradeRequest
+from .mt5_access import MT5AccessDisabled
 
 
 MAX_REQUEST_BYTES = 64 * 1024
@@ -80,6 +81,17 @@ def create_fastapi_app(application, verifier: ApiKeyVerifier) -> FastAPI:
             status_code=503,
             content={"error": "fail_closed", "error_type": type(exc).__name__},
         )
+
+    @app.exception_handler(MT5AccessDisabled)
+    async def mt5_access_disabled(_request: Request, _exc: MT5AccessDisabled):
+        return JSONResponse(
+            status_code=503,
+            content={"error": "fail_closed", "code": "MT5_ACCESS_DISABLED"},
+        )
+
+    @app.get("/health", dependencies=protected)
+    def startup_health():
+        return application.health()
 
     @app.get("/v1/health", dependencies=protected)
     def health():

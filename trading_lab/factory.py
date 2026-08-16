@@ -8,6 +8,7 @@ from .config import SecurityConfig, security_config_hash
 from .execution_engine import ExecutionEngine
 from .gateway import MT5Gateway
 from .mt5_adapter import MT5Adapter
+from .mt5_access import MT5AccessDisabled
 from .paper_engine import PaperEngine
 from .position_sizer import PositionSizer
 from .providers import LiveMT5MarketDataProvider, MT5ExecutionProvider
@@ -22,6 +23,8 @@ def build_application(
     *,
     runtime_identity_verified: bool = False,
 ) -> GatewayApplication:
+    if not config.mt5_access_enabled:
+        raise MT5AccessDisabled()
     mt5 = adapter or MT5ExecutionProvider(config.mt5_terminal_path)
     market_data = LiveMT5MarketDataProvider(mt5)
     guard = AccountGuard(

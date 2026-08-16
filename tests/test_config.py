@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from trading_lab.config import ConfigError, load_security_config
+from trading_lab.config import ConfigError, load_security_config, resolve_mt5_access_enabled
 from trading_lab.domain import TradingMode
 
 
@@ -54,6 +54,30 @@ class SecurityConfigTests(unittest.TestCase):
             payload.pop("trading_mode")
             config = load_security_config(self.write(directory, payload))
             self.assertEqual(TradingMode.OBSERVE_ONLY, config.trading_mode)
+
+    def test_mt5_access_defaults_disabled_and_environment_cannot_escalate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_security_config(self.write(directory, self.valid_config()))
+        self.assertFalse(config.mt5_access_enabled)
+        self.assertFalse(resolve_mt5_access_enabled(config, {}))
+        self.assertFalse(resolve_mt5_access_enabled(config, {"MT5_ACCESS_ENABLED": "false"}))
+        with self.assertRaises(ConfigError):
+            resolve_mt5_access_enabled(config, {"MT5_ACCESS_ENABLED": "true"})
+
+    def test_mt5_access_requires_explicit_boolean_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            payload = self.valid_config()
+            payload["mt5_access_enabled"] = True
+            config = load_security_config(self.write(directory, payload))
+        self.assertTrue(config.mt5_access_enabled)
+        self.assertTrue(resolve_mt5_access_enabled(config, {}))
+        self.assertTrue(resolve_mt5_access_enabled(config, {"MT5_ACCESS_ENABLED": "true"}))
+        self.assertFalse(resolve_mt5_access_enabled(config, {"MT5_ACCESS_ENABLED": "false"}))
+        with tempfile.TemporaryDirectory() as directory:
+            payload = self.valid_config()
+            payload["mt5_access_enabled"] = "false"
+            with self.assertRaises(ConfigError):
+                load_security_config(self.write(directory, payload))
 
     def test_rejects_credentials_in_security_config(self) -> None:
         for key in ("password", "api_key", "token"):

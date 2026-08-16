@@ -53,6 +53,7 @@ class SecurityConfig:
     gateway_windows_identity: str
     automaton_windows_identity: str
     risk: RiskLimits
+    mt5_access_enabled: bool = False
     authorized_account_name: str | None = None
     audit_db_path: Path | None = None
     api_key_path: Path | None = None
@@ -66,6 +67,7 @@ def security_config_hash(config: SecurityConfig) -> str:
     payload = {
         "schema_version": config.schema_version,
         "trading_mode": config.trading_mode.value,
+        "mt5_access_enabled": config.mt5_access_enabled,
         "authorized_account": config.authorized_account,
         "authorized_server": config.authorized_server,
         "authorized_account_name": config.authorized_account_name,
@@ -105,7 +107,7 @@ _CREDENTIAL_KEYS = {
     "private_key",
 }
 _TOP_LEVEL_KEYS = {
-    "schema_version", "trading_mode", "authorized_account", "authorized_server",
+    "schema_version", "trading_mode", "mt5_access_enabled", "authorized_account", "authorized_server",
     "allowed_symbol", "magic_number", "mt5_terminal_path", "audit_path",
     "research_db_path", "demo_authorization_path", "kill_switch_path",
     "automaton_state_dir", "gateway_windows_identity",
@@ -207,6 +209,9 @@ def load_security_config(path: str | Path) -> SecurityConfig:
         mode = TradingMode(raw.get("trading_mode", TradingMode.OBSERVE_ONLY.value))
     except ValueError as exc:
         raise ConfigError("trading_mode is invalid") from exc
+    mt5_access_enabled = raw.get("mt5_access_enabled", False)
+    if not isinstance(mt5_access_enabled, bool):
+        raise ConfigError("mt5_access_enabled must be an explicit boolean")
 
     account = _positive_int(raw.get("authorized_account"), "authorized_account")
     server = _required_string(raw, "authorized_server")
@@ -404,6 +409,7 @@ def load_security_config(path: str | Path) -> SecurityConfig:
         gateway_windows_identity=gateway_identity,
         automaton_windows_identity=automaton_identity,
         risk=risk,
+        mt5_access_enabled=mt5_access_enabled,
         authorized_account_name=account_name,
         audit_db_path=audit_db_path,
         api_key_path=api_key_path,
@@ -411,3 +417,24 @@ def load_security_config(path: str | Path) -> SecurityConfig:
         log_dir=log_dir,
         security_log_dir=security_log_dir,
     )
+
+
+def resolve_mt5_access_enabled(
+    config: SecurityConfig,
+    environment: dict[str, str] | None = None,
+) -> bool:
+    """Resolve a process restriction without allowing environment escalation."""
+    values = os.environ if environment is None else environment
+    raw = values.get("MT5_ACCESS_ENABLED")
+    if raw is None:
+        return config.mt5_access_enabled
+    normalized = raw.strip().casefold()
+    if normalized == "false":
+        return False
+    if normalized == "true":
+        if not config.mt5_access_enabled:
+            raise ConfigError(
+                "MT5_ACCESS_ENABLED=true requires mt5_access_enabled: true in protected config"
+            )
+        return True
+    raise ConfigError("MT5_ACCESS_ENABLED must be exactly true or false when set")

@@ -23,6 +23,7 @@ function Assert-ExactBootstrapConfig([string] $ConfigPath, [string] $TemplatePat
     $text = [System.Text.Encoding]::UTF8.GetString($configuredBytes)
     if (
         $text -notmatch '(?m)^trading_mode:\s*OBSERVE_ONLY\s*$' -or
+        $text -notmatch '(?m)^mt5_access_enabled:\s*false\s*$' -or
         $text -notmatch '(?m)^authorized_account:\s*0\s*$' -or
         $text -notmatch '(?m)^authorized_server:\s*CHANGE_ME\s*$'
     ) {
@@ -34,6 +35,7 @@ function Assert-ExactBootstrapConfig([string] $ConfigPath, [string] $TemplatePat
     return [pscustomobject]@{
         exact_template = $true
         trading_mode = 'OBSERVE_ONLY'
+        mt5_access_enabled = $false
         account_configured = $false
         credentials_present = $false
     }

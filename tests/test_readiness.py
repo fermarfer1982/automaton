@@ -35,6 +35,7 @@ def security_config(directory: Path) -> SecurityConfig:
         gateway_windows_identity="LAB\\Gateway",
         automaton_windows_identity="LAB\\Agent",
         risk=RiskLimits(0.0025, 0.01, 30.0, 1, 0.01, 0.01, 20, 300),
+        mt5_access_enabled=True,
     )
 
 
@@ -88,7 +89,7 @@ class ReadinessAclGateTests(unittest.TestCase):
                     "trading_lab.service.verify_windows_acl",
                     return_value=AclVerification(False, "unsafe ACL"),
                 ),
-                patch("trading_lab.service.MT5ExecutionProvider") as adapter,
+                patch("trading_lab.service.acquire_mt5_adapter") as adapter,
             ):
                 with self.assertRaises(PermissionError):
                     serve(Path(directory) / "security.json")
