@@ -194,6 +194,37 @@ function New-AclProposal(
     }
 }
 
+function New-ControlAclProposal {
+    return [pscustomobject]@{
+        path = $control
+        policy_key = $null
+        domain = 'human_managed_control_directory'
+        inheritance_protected = $true
+        inherited_aces_preserved = $false
+        deny_aces = 0
+        child_propagation = 'Recovery principals ContainerInherit,ObjectInherit; Gateway ThisObjectOnly'
+        owner = 'BUILTIN\Administrators'
+        entries = @(
+            [pscustomobject]@{
+                principal = 'NT AUTHORITY\SYSTEM'; sid = $systemSid.Value
+                rights = 'FullControl'; type = 'Allow'; inheritance_flags = 'ContainerInherit,ObjectInherit'
+                propagation_flags = 'None'
+            }
+            [pscustomobject]@{
+                principal = 'BUILTIN\Administrators'; sid = $administratorsSid.Value
+                rights = 'FullControl'; type = 'Allow'; inheritance_flags = 'ContainerInherit,ObjectInherit'
+                propagation_flags = 'None'
+            }
+            [pscustomobject]@{
+                principal = $gatewaySid.Value; sid = $gatewaySid.Value
+                rights = 'ReadAndExecute,Synchronize'; type = 'Allow'; inheritance_flags = 'None'
+                propagation_flags = 'None'
+            }
+        )
+        representative_targets = @('trading.yaml', 'STOP_TRADING', 'demo-authorization')
+    }
+}
+
 function New-DemoAuthorizationAclProposal {
     return [pscustomobject]@{
         path = $demoAuthorization
@@ -240,9 +271,7 @@ $aclProposals = @(
         'trading_lab', 'src', 'scripts', 'tests', 'config', 'package files',
         'Python source', 'TypeScript source', '.runtime', '.venv'
     )
-    New-AclProposal $control 'human_managed_control_directory' @($gatewaySid) @(
-        'ReadAndExecute'
-    ) 'ThisObjectOnly' @('trading.yaml', 'STOP_TRADING', 'demo-authorization')
+    New-ControlAclProposal
     New-AclProposal $configFile 'human_managed_config_file' @($gatewaySid) @(
         'Read'
     ) 'None' @('trading.yaml')
@@ -441,6 +470,40 @@ function Set-ExactTreeAcl(
     }
 }
 
+function Set-ExactControlAcl {
+    $security = [System.Security.AccessControl.DirectorySecurity]::new()
+    $security.SetOwner($administratorsSid)
+    $security.SetAccessRuleProtection($true, $false)
+    foreach ($principal in @($systemSid, $administratorsSid)) {
+        $security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+            $principal,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        ))
+    }
+    $security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+        $gatewaySid,
+        [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+        [System.Security.AccessControl.InheritanceFlags]::None,
+        [System.Security.AccessControl.PropagationFlags]::None,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    ))
+    Set-Acl -LiteralPath $control -AclObject $security
+    if ($ProgressPath) {
+        $progressRecord = [pscustomobject]@{
+            path = $control
+            applied_at_utc = [DateTime]::UtcNow.ToString('o')
+        }
+        [System.IO.File]::AppendAllText(
+            $ProgressPath,
+            (($progressRecord | ConvertTo-Json -Compress) + [Environment]::NewLine),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+    }
+}
+
 function Set-ExactDemoAuthorizationAcl {
     $security = [System.Security.AccessControl.DirectorySecurity]::new()
     $security.SetOwner($administratorsSid)
@@ -516,7 +579,7 @@ foreach ($protectedRootFile in @(
     }
     Set-ExactAcl $protectedRootFile @($gatewaySid, $automatonSid) @($readExecute, $readExecute) $false $false
 }
-Set-ExactAcl $control @($gatewaySid) @($readExecute) $true $false
+Set-ExactControlAcl
 Set-ExactAcl $configFile @($gatewaySid) @($read) $false $false
 if (Test-Path -LiteralPath $killSwitchFile -PathType Leaf) {
     Set-ExactAcl $killSwitchFile @($gatewaySid) @($read) $false $false

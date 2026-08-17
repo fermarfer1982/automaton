@@ -74,6 +74,17 @@ el descriptor del parent y escribe su reporte; el gate independiente
 `Set-MT5ReadOnlyProtectedIdentity.ps1` actualiza transaccionalmente la identidad
 broker protegida. Ambos son dry-run por defecto y requieren `-Apply` humano.
 
+El drift limitado a una ACE exacta de maintenance en `control`,
+`demo-authorization` y sus artifacts se reconcilia exclusivamente mediante
+`Repair-MT5ReadOnlyAuthorizationAclDrift.ps1`. Su dry-run construye y valida los
+descriptores candidatos en memoria sin llamar `Set-Acl`. Un `-Apply` futuro
+requiere autorizaciÃ³n humana separada, reserva un reporte exclusivo, revalida
+identidades, hashes, Git y ACL justo antes de modificar, y solo entonces aplica
+`control` seguido de `demo-authorization`. La propagaciÃ³n natural debe dejar cada
+artifact con exactamente tres ACE heredadas. Cualquier otro drift, fallo del
+verifier o cambio de contenido activa rollback a las SDDL originales y estado
+`FAIL_CLOSED`.
+
 La preparación es reanudable: `trading.yaml` preexistente debe coincidir byte a
 byte con la plantilla OBSERVE_ONLY inválida y una key IPC preexistente debe ser
 Base64URL válido que decodifique exactamente a 32 bytes. Ninguno se sobrescribe

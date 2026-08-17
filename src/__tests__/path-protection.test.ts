@@ -89,6 +89,13 @@ describe("isProtectedFile", () => {
     expect(isProtectedFile("/some/path/agent/policy-engine.js")).toBe(true);
     expect(isProtectedFile("/some/path/agent/policy-rules/index.ts")).toBe(true);
     expect(isProtectedFile("/some/path/agent/policy-rules/index.js")).toBe(true);
+    expect(
+      isProtectedFile("/some/path/scripts/Repair-MT5ReadOnlyAuthorizationAclDrift.ps1"),
+    ).toBe(true);
+    expect(
+      isProtectedFile("/some/path/scripts/MT5ReadOnlyAclRepairHelpers.ps1"),
+    ).toBe(true);
+    expect(isProtectedFile("/some/path/trading_lab/acl_repair_verifier.py")).toBe(true);
   });
 
   it("does NOT false-positive on substring matches", () => {

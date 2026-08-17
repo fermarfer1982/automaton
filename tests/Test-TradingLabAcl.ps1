@@ -21,9 +21,15 @@ if ($applyErrors.Count -ne 0) {
 }
 $applySource = [System.IO.File]::ReadAllText($applyGatePath)
 $authorizationAclPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\Set-MT5ReadOnlyAuthorizationAcl.ps1'
+$repairAclPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\Repair-MT5ReadOnlyAuthorizationAclDrift.ps1'
+$repairHelperPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\MT5ReadOnlyAclRepairHelpers.ps1'
+$repairVerifierPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'trading_lab\acl_repair_verifier.py'
 $protectedIdentityPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\Set-MT5ReadOnlyProtectedIdentity.ps1'
 $protectedHelperPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\ProtectedIdentityGateHelpers.ps1'
-foreach ($maintenanceScript in @($authorizationAclPath, $protectedIdentityPath, $protectedHelperPath)) {
+foreach ($maintenanceScript in @(
+    $authorizationAclPath, $repairAclPath, $repairHelperPath,
+    $protectedIdentityPath, $protectedHelperPath
+)) {
     $maintenanceTokens = $null
     $maintenanceErrors = $null
     [void][System.Management.Automation.Language.Parser]::ParseFile(
@@ -34,9 +40,13 @@ foreach ($maintenanceScript in @($authorizationAclPath, $protectedIdentityPath, 
     }
 }
 $authorizationAclSource = [System.IO.File]::ReadAllText($authorizationAclPath)
+$repairAclSource = [System.IO.File]::ReadAllText($repairAclPath)
+$repairHelperSource = [System.IO.File]::ReadAllText($repairHelperPath)
+$repairVerifierSource = [System.IO.File]::ReadAllText($repairVerifierPath)
 $protectedIdentitySource = [System.IO.File]::ReadAllText($protectedIdentityPath)
 $protectedHelperSource = [System.IO.File]::ReadAllText($protectedHelperPath)
 . $protectedHelperPath
+. $repairHelperPath
 foreach ($forbidden in @('Start-Process -Credential', 'runas.exe', '.order_send(', '.order_check(', 'import MetaTrader5')) {
     if ($applySource.Contains($forbidden)) {
         throw "ACL apply gate contains forbidden runtime action: $forbidden"
@@ -83,6 +93,8 @@ foreach ($required in @(
     "S-1-5-32-545",
     "Get-DirectLocalGroupSids",
     "SetAccessRuleProtection(`$true, `$false)",
+    'New-ControlAclProposal',
+    'Set-ExactControlAcl',
     "`$protectedSourceDirectories",
     "Protected source tree contains a reparse point",
     "sqlite_immutable = `$false",
@@ -477,6 +489,7 @@ foreach ($legacyApplySemantic in @(
     }
 }
 foreach ($newApplySemantic in @(
+    'Assert-ExactControlDirectoryAcl',
     'Assert-ExactAuthorizationDirectoryAcl',
     'Assert-ExactAuthorizationArtifactAcl',
     'mt5-read-only-authorization-<UUID>.json',
@@ -486,6 +499,241 @@ foreach ($newApplySemantic in @(
     if (-not $applySource.Contains($newApplySemantic)) {
         throw "ACL apply gate lacks RunId artifact verification: $newApplySemantic"
     }
+}
+
+$testGatewaySid = 'S-1-5-21-10-20-30-1007'
+$testAgentSid = 'S-1-5-21-10-20-30-1006'
+$testMaintenanceSid = 'S-1-5-21-10-20-30-1001'
+$testAdministratorsSid = 'S-1-5-32-544'
+
+function New-RepairTestSnapshot(
+    [string] $Path,
+    [bool] $Directory,
+    [bool] $Protected,
+    [object[]] $Rules,
+    [string] $Owner = 'S-1-5-32-544',
+    [bool] $Reparse = $false
+) {
+    return [pscustomobject]@{
+        path = $Path
+        is_directory = $Directory
+        reparse = $Reparse
+        owner_sid = $Owner
+        protected = $Protected
+        sddl = 'synthetic-test-sddl'
+        rules = @($Rules)
+    }
+}
+
+function Assert-RepairTestThrows([scriptblock] $Action, [string] $Message) {
+    $threw = $false
+    try { & $Action } catch { $threw = $true }
+    if (-not $threw) { throw $Message }
+}
+
+$canonicalControl = New-RepairTestSnapshot 'C:\control' $true $true `
+    @(Get-MT5AclExpectedRules 'CONTROL' $testGatewaySid)
+$canonicalDemo = New-RepairTestSnapshot 'C:\control\demo-authorization' $true $true `
+    @(Get-MT5AclExpectedRules 'DEMO_AUTHORIZATION' $testGatewaySid)
+$canonicalArtifact = New-RepairTestSnapshot `
+    'C:\control\demo-authorization\mt5-read-only-authorization-00000000-0000-0000-0000-000000000001.json' `
+    $false $false @(Get-MT5AclExpectedRules 'AUTHORIZATION_FILE' $testGatewaySid)
+
+foreach ($case in @(
+    [pscustomobject]@{ snapshot=$canonicalControl; kind='CONTROL' },
+    [pscustomobject]@{ snapshot=$canonicalDemo; kind='DEMO_AUTHORIZATION' },
+    [pscustomobject]@{ snapshot=$canonicalArtifact; kind='AUTHORIZATION_FILE' }
+)) {
+    $state = Get-MT5AclRepairState $case.snapshot $case.kind `
+        $testGatewaySid $testMaintenanceSid
+    if ($state -ne 'CANONICAL') { throw "Canonical repair test state failed: $($case.kind)" }
+}
+$canonicalPlan = Get-MT5AclRepairPlan 'CANONICAL' 'CANONICAL' @('CANONICAL')
+if ($canonicalPlan.drift_detected -or $canonicalPlan.forward_set_acl_call_count -ne 0 -or
+    $canonicalPlan.control_set_acl_required -or $canonicalPlan.demo_set_acl_required) {
+    throw 'Canonical/idempotent repair plan would mutate an already canonical state.'
+}
+
+$controlMaintenance = New-RepairTestSnapshot 'C:\control' $true $true `
+    (@(Get-MT5AclExpectedRules 'CONTROL' $testGatewaySid) + @(
+        New-MT5AclRuleRecord $testMaintenanceSid 2032127L $false `
+            'ContainerInherit, ObjectInherit' 'None'
+    ))
+if ((Get-MT5AclRepairState $controlMaintenance 'CONTROL' $testGatewaySid `
+    $testMaintenanceSid) -ne 'MAINTENANCE_FULL_CONTROL_DRIFT') {
+    throw 'Maintenance drift on control was not detected.'
+}
+$demoMaintenance = New-RepairTestSnapshot 'C:\control\demo-authorization' $true $true `
+    (@(Get-MT5AclExpectedRules 'DEMO_AUTHORIZATION' $testGatewaySid) + @(
+        New-MT5AclRuleRecord $testMaintenanceSid 2032127L $false `
+            'ContainerInherit, ObjectInherit' 'None'
+    ))
+if ((Get-MT5AclRepairState $demoMaintenance 'DEMO_AUTHORIZATION' $testGatewaySid `
+    $testMaintenanceSid) -ne 'MAINTENANCE_FULL_CONTROL_DRIFT') {
+    throw 'Maintenance drift on demo-authorization was not detected.'
+}
+$artifactMaintenance = New-RepairTestSnapshot $canonicalArtifact.path $false $false `
+    (@(Get-MT5AclExpectedRules 'AUTHORIZATION_FILE' $testGatewaySid) + @(
+        New-MT5AclRuleRecord $testMaintenanceSid 2032127L $true 'None' 'None'
+    ))
+if ((Get-MT5AclRepairState $artifactMaintenance 'AUTHORIZATION_FILE' $testGatewaySid `
+    $testMaintenanceSid) -ne 'MAINTENANCE_FULL_CONTROL_DRIFT') {
+    throw 'Inherited maintenance drift on an authorization file was not detected.'
+}
+$driftPlan = Get-MT5AclRepairPlan `
+    'MAINTENANCE_FULL_CONTROL_DRIFT' `
+    'MAINTENANCE_FULL_CONTROL_DRIFT' `
+    @('MAINTENANCE_FULL_CONTROL_DRIFT')
+if (-not $driftPlan.drift_detected -or -not $driftPlan.control_set_acl_required -or
+    -not $driftPlan.demo_set_acl_required -or $driftPlan.forward_set_acl_call_count -ne 2) {
+    throw 'Maintenance drift did not produce the exact bounded two-directory repair plan.'
+}
+
+$agentControl = New-RepairTestSnapshot 'C:\control' $true $true `
+    (@(Get-MT5AclExpectedRules 'CONTROL' $testGatewaySid) + @(
+        New-MT5AclRuleRecord $testAgentSid 1179785L $false 'None' 'None'
+    ))
+Assert-RepairTestThrows {
+    Get-MT5AclRepairState $agentControl 'CONTROL' $testGatewaySid $testMaintenanceSid
+} 'Agent ACE was accepted as repairable drift.'
+$denyRules = @(Get-MT5AclExpectedRules 'DEMO_AUTHORIZATION' $testGatewaySid)
+$denyRules[0].type = 'Deny'
+$denyDemo = New-RepairTestSnapshot 'C:\control\demo-authorization' $true $true $denyRules
+Assert-RepairTestThrows {
+    Get-MT5AclRepairState $denyDemo 'DEMO_AUTHORIZATION' $testGatewaySid $testMaintenanceSid
+} 'Deny ACE was accepted as repairable drift.'
+$explicitArtifactRules = @(Get-MT5AclExpectedRules 'AUTHORIZATION_FILE' $testGatewaySid)
+$explicitArtifactRules[0].inherited = $false
+$explicitArtifact = New-RepairTestSnapshot $canonicalArtifact.path $false $false $explicitArtifactRules
+Assert-RepairTestThrows {
+    Get-MT5AclRepairState $explicitArtifact 'AUTHORIZATION_FILE' `
+        $testGatewaySid $testMaintenanceSid
+} 'Explicit authorization-file ACE was accepted as repairable drift.'
+$wrongOwner = New-RepairTestSnapshot 'C:\control' $true $true `
+    @(Get-MT5AclExpectedRules 'CONTROL' $testGatewaySid) $testMaintenanceSid
+Assert-RepairTestThrows {
+    Get-MT5AclRepairState $wrongOwner 'CONTROL' $testGatewaySid $testMaintenanceSid
+} 'Unexpected owner was accepted by the repair model.'
+$reparseArtifact = New-RepairTestSnapshot $canonicalArtifact.path $false $false `
+    @(Get-MT5AclExpectedRules 'AUTHORIZATION_FILE' $testGatewaySid) `
+    $testAdministratorsSid $true
+Assert-RepairTestThrows {
+    Get-MT5AclRepairState $reparseArtifact 'AUTHORIZATION_FILE' `
+        $testGatewaySid $testMaintenanceSid
+} 'Reparse authorization file was accepted by the repair model.'
+
+$candidateControl = Get-MT5AclDirectorySecuritySnapshot `
+    (New-MT5AclCanonicalDirectorySecurity 'CONTROL' $testGatewaySid) 'C:\control'
+$candidateDemo = Get-MT5AclDirectorySecuritySnapshot `
+    (New-MT5AclCanonicalDirectorySecurity 'DEMO_AUTHORIZATION' $testGatewaySid) `
+    'C:\control\demo-authorization'
+Assert-MT5AclCanonicalSnapshot $candidateControl 'CONTROL' $testGatewaySid $testMaintenanceSid
+Assert-MT5AclCanonicalSnapshot $candidateDemo 'DEMO_AUTHORIZATION' `
+    $testGatewaySid $testMaintenanceSid
+$artifactSddl = Get-MT5AclCanonicalArtifactSddl $testGatewaySid
+if ($artifactSddl -notmatch 'D:AI' -or $artifactSddl -notmatch ';ID;') {
+    throw 'Canonical authorization-file expected SDDL is not inherited.'
+}
+
+foreach ($requiredRepairBoundary in @(
+    '#Requires -RunAsAdministrator',
+    "mode = 'MT5_READ_ONLY_AUTHORIZATION_ACL_DRIFT_REPAIR'",
+    'Read-TradingLabWindowsAclPolicy',
+    'Assert-RepositoryClean',
+    'Assert-FreshSecurityPreconditions',
+    'Reserve-RepairReport',
+    'Assert-ServiceIdentity',
+    'Get-MT5AclRepairPlan',
+    'Set-Acl -LiteralPath $controlPath -AclObject $controlCandidate',
+    'Set-Acl -LiteralPath $demoAuthorizationPath -AclObject $demoCandidate',
+    'Invoke-RepairRollback',
+    'Assert-RepairStateUnchanged $initialState $restored',
+    'Invoke-FullCanonicalVerifier',
+    'without_automaton_state',
+    'with_automaton_state',
+    'modified_content',
+    'trading.yaml changed during ACL repair',
+    'expectedConfigSha256 = ''beabc9b2553a674739b62195a4181eeca0ed59019e11b78055808ec4cd31686e''',
+    'FileMode]::CreateNew',
+    'SET_ACL_CALL_COUNT=',
+    'FILESYSTEM_MUTATION='
+)) {
+    if (-not $repairAclSource.Contains([string]$requiredRepairBoundary)) {
+        throw "Transactional ACL repair gate lacks required boundary: $requiredRepairBoundary"
+    }
+}
+foreach ($forbiddenRepairBoundary in @(
+    'MetaTrader5.initialize', 'import MetaTrader5', '.order_check(', '.order_send(',
+    'runas.exe', 'Start-Process', 'icacls', 'Invoke-Expression',
+    'New-MT5ReadOnlyAuthorization.ps1', 'trading_lab.service'
+)) {
+    if (($repairAclSource + $repairHelperSource + $repairVerifierSource).Contains(
+        $forbiddenRepairBoundary
+    )) {
+        throw "Transactional ACL repair gate contains forbidden boundary: $forbiddenRepairBoundary"
+    }
+}
+foreach ($requiredChildBoundary in @(
+    '^mt5-read-only-authorization-',
+    'Authorization child is a directory or reparse point',
+    'Unexpected authorization child filename',
+    'FileAttributes]::ReparsePoint',
+    'Authorization artifact changed during prevalidation'
+)) {
+    if (-not $repairAclSource.Contains($requiredChildBoundary)) {
+        throw "Authorization child repair boundary is absent: $requiredChildBoundary"
+    }
+}
+$mainRepairStart = $repairAclSource.IndexOf('Reserve-RepairReport', $repairAclSource.IndexOf('$initialState = Get-RepairState'))
+$freshPreconditions = $repairAclSource.IndexOf('Assert-FreshSecurityPreconditions', $mainRepairStart)
+$freshSnapshot = $repairAclSource.IndexOf('$freshState = Get-RepairState', $freshPreconditions)
+$controlApply = $repairAclSource.IndexOf(
+    'Set-Acl -LiteralPath $controlPath -AclObject $controlCandidate',
+    $freshSnapshot
+)
+$demoApply = $repairAclSource.IndexOf(
+    'Set-Acl -LiteralPath $demoAuthorizationPath -AclObject $demoCandidate',
+    $controlApply
+)
+$specializedVerify = $repairAclSource.IndexOf(
+    '$postState = Get-RepairState',
+    $demoApply
+)
+$fullVerify = $repairAclSource.IndexOf('Invoke-FullCanonicalVerifier', $specializedVerify)
+$failureCatch = $repairAclSource.IndexOf('} catch {', $fullVerify)
+$rollbackCall = $repairAclSource.IndexOf('Invoke-RepairRollback', $failureCatch)
+if ($mainRepairStart -lt 0 -or $freshPreconditions -le $mainRepairStart -or
+    $freshSnapshot -le $freshPreconditions -or $controlApply -le $freshSnapshot -or
+    $demoApply -le $controlApply -or $specializedVerify -le $demoApply -or
+    $fullVerify -le $specializedVerify -or $failureCatch -le $fullVerify -or
+    $rollbackCall -le $failureCatch) {
+    throw 'Transactional repair ordering or rollback coverage is incomplete.'
+}
+$dryBranch = $repairAclSource.Substring(
+    $repairAclSource.IndexOf('if (-not $Apply)', $freshSnapshot),
+    $repairAclSource.IndexOf('} else {', $freshSnapshot) -
+        $repairAclSource.IndexOf('if (-not $Apply)', $freshSnapshot)
+)
+foreach ($forbiddenDryRepair in @('Set-Acl', 'Invoke-FullCanonicalVerifier', 'Invoke-RepairRollback')) {
+    if ($dryBranch.Contains($forbiddenDryRepair)) {
+        throw "ACL repair dry-run branch contains mutation: $forbiddenDryRepair"
+    }
+}
+foreach ($rollbackEvidence in @(
+    '$report.rollback_attempted = $true',
+    '$report.rollback_verified = [bool]$rollback.verified',
+    '$report.error = $primaryError',
+    "`$report.status = 'FAIL_CLOSED'"
+)) {
+    if (-not $repairAclSource.Contains($rollbackEvidence)) {
+        throw "ACL repair failure/rollback evidence is missing: $rollbackEvidence"
+    }
+}
+if ($repairVerifierSource -notmatch 'verify_windows_acl\(' -or
+    $repairVerifierSource -notmatch 'include_automaton_state=False' -or
+    $repairVerifierSource -notmatch 'include_automaton_state=True' -or
+    $repairVerifierSource -match '(?m)^\s*(?:from|import)\s+MetaTrader5') {
+    throw 'ACL repair verifier does not run both scopes or imports MetaTrader5.'
 }
 
 $aclDryRunIndex = $source.IndexOf('if (-not $Apply)')

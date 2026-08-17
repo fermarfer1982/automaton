@@ -211,6 +211,27 @@ function Test-ExactAclRule(
         $Rule.propagation_flags -eq $PropagationFlags
 }
 
+function Assert-ExactControlDirectoryAcl($Snapshot) {
+    Assert-RecoveryAndOwner $Snapshot
+    if (@($Snapshot.rules).Count -ne 3) {
+        throw 'Control directory must contain exactly three canonical ACEs.'
+    }
+    $expected = @(
+        [pscustomobject]@{ Sid = $systemSid; Rights = $fullControl; Inheritance = 'ContainerInherit, ObjectInherit'; Propagation = 'None' },
+        [pscustomobject]@{ Sid = $administratorsSid; Rights = $fullControl; Inheritance = 'ContainerInherit, ObjectInherit'; Propagation = 'None' },
+        [pscustomobject]@{ Sid = $gatewaySid; Rights = $readExecuteRights; Inheritance = 'None'; Propagation = 'None' }
+    )
+    $remaining = [System.Collections.Generic.List[object]]::new()
+    foreach ($rule in $Snapshot.rules) { $remaining.Add($rule) }
+    foreach ($item in $expected) {
+        $match = @($remaining | Where-Object {
+            Test-ExactAclRule $_ $item.Sid ([int64]$item.Rights) $false $item.Inheritance $item.Propagation
+        } | Select-Object -First 1)
+        if ($match.Count -ne 1) { throw 'Control directory ACL is not canonical.' }
+        [void]$remaining.Remove($match[0])
+    }
+}
+
 function Assert-ExactAuthorizationDirectoryAcl($Snapshot) {
     Assert-RecoveryAndOwner $Snapshot
     if (@($Snapshot.rules).Count -ne 4) {
@@ -383,6 +404,7 @@ try {
         $snapshots[$entry.Key] = $snapshot
     }
 
+    Assert-ExactControlDirectoryAcl $snapshots.control
     Assert-ExactAuthorizationDirectoryAcl $snapshots.demo_authorization
     $authorizationArtifacts = @()
     foreach ($artifact in @(Get-ChildItem -LiteralPath $targets.demo_authorization -Force)) {

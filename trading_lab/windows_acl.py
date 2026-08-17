@@ -322,8 +322,11 @@ def _targets(
         "scripts/Apply-TradingLabAclGate.ps1",
         "scripts/TradingLabAclBootstrap.ps1",
         "scripts/Set-MT5ReadOnlyAuthorizationAcl.ps1",
+        "scripts/Repair-MT5ReadOnlyAuthorizationAclDrift.ps1",
+        "scripts/MT5ReadOnlyAclRepairHelpers.ps1",
         "scripts/Set-MT5ReadOnlyProtectedIdentity.ps1",
         "scripts/ProtectedIdentityGateHelpers.ps1",
+        "trading_lab/acl_repair_verifier.py",
         "config/windows-acl-policy.json",
         "config/trading.security.example.json",
         "config/trading.example.yaml", "requirements-mt5.txt",
@@ -377,6 +380,56 @@ def _exact_rule(
         and _flag_set(rule.get("inheritance_flags")) == inheritance
         and _flag_set(rule.get("propagation_flags")) == propagation
     )
+
+
+def _verify_control_directory_acl(
+    target: Mapping[str, Any], *, gateway_sid: str, automaton_sid: str
+) -> None:
+    path = str(target["path"])
+    rules = target.get("rules", [])
+    if (
+        not isinstance(rules, list)
+        or not target.get("actual_is_directory", target.get("is_directory"))
+        or target.get("reparse")
+        or not target.get("protected")
+        or str(target.get("owner_sid", "")) != ADMINISTRATORS_SID
+    ):
+        raise ValueError(f"control directory metadata is not canonical on {path}")
+    expected = (
+        (
+            SYSTEM_SID,
+            FULL_CONTROL_RIGHTS,
+            frozenset({"ContainerInherit", "ObjectInherit"}),
+        ),
+        (
+            ADMINISTRATORS_SID,
+            FULL_CONTROL_RIGHTS,
+            frozenset({"ContainerInherit", "ObjectInherit"}),
+        ),
+        (gateway_sid, READ_EXECUTE_RIGHTS, frozenset()),
+    )
+    if len(rules) != len(expected):
+        raise ValueError(f"control directory ACE count is not exact on {path}")
+    unmatched = list(rules)
+    for sid, rights, inheritance in expected:
+        match = next((
+            rule for rule in unmatched
+            if _exact_rule(
+                rule,
+                sid=sid,
+                rights=rights,
+                inherited=False,
+                inheritance=inheritance,
+                propagation=frozenset(),
+            )
+        ), None)
+        if match is None:
+            raise ValueError(f"control directory policy mismatch on {path}")
+        unmatched.remove(match)
+    if any(str(rule.get("sid", "")) == automaton_sid for rule in rules):
+        raise ValueError(f"Automaton identity has access to control directory {path}")
+    if any(str(rule.get("type", "")) != "Allow" for rule in rules):
+        raise ValueError(f"control directory permits only exact Allow ACEs on {path}")
 
 
 def _verify_authorization_acl(
@@ -496,6 +549,13 @@ def evaluate_acl_snapshot(
                 raise ValueError(f"required ACL target is absent: {path}")
             if target.get("actual_is_directory", target.get("is_directory")) != target.get("is_directory"):
                 raise ValueError(f"ACL target has the wrong filesystem type: {path}")
+            if policy_key == "control_directory":
+                _verify_control_directory_acl(
+                    target,
+                    gateway_sid=gateway_sid,
+                    automaton_sid=automaton_sid,
+                )
+                continue
             if role in {"authorization_directory", "authorization_file"}:
                 _verify_authorization_acl(
                     target,

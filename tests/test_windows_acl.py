@@ -77,9 +77,14 @@ def target(
     is_directory: bool = True,
     maintenance: bool = False,
 ) -> dict[str, object]:
+    recovery_inheritance = INHERITANCE if policy_key == "control_directory" else "None"
     rules = [
-        rule(SYSTEM_SID, FULL_CONTROL_RIGHTS),
-        rule(ADMINISTRATORS_SID, FULL_CONTROL_RIGHTS),
+        rule(SYSTEM_SID, FULL_CONTROL_RIGHTS, inheritance_flags=recovery_inheritance),
+        rule(
+            ADMINISTRATORS_SID,
+            FULL_CONTROL_RIGHTS,
+            inheritance_flags=recovery_inheritance,
+        ),
         rule(principal, rights),
     ]
     if maintenance:
@@ -325,6 +330,28 @@ class WindowsAclTests(unittest.TestCase):
         snapshot = safe_snapshot()
         snapshot["targets"][3]["rules"] = snapshot["targets"][3]["rules"][:-1]  # type: ignore[index]
         self.assertFalse(verify(snapshot).passed)
+
+    def test_control_directory_recovery_and_gateway_aces_are_exact(self) -> None:
+        for rule_index, property_name, unsafe_value in (
+            (0, "inheritance_flags", "None"),
+            (1, "inheritance_flags", "None"),
+            (2, "inheritance_flags", INHERITANCE),
+            (2, "rights", READ_RIGHTS),
+        ):
+            snapshot = safe_snapshot()
+            snapshot["targets"][1]["rules"][rule_index][property_name] = unsafe_value  # type: ignore[index]
+            result = verify(snapshot)
+            self.assertFalse(result.passed, (rule_index, property_name))
+
+    def test_control_directory_rejects_extra_agent_deny_and_maintenance_aces(self) -> None:
+        for extra in (
+            rule(AGENT, READ_RIGHTS),
+            rule(GATEWAY, READ_RIGHTS, access_type="Deny"),
+            rule(MAINTENANCE, FULL_CONTROL_RIGHTS, inheritance_flags=INHERITANCE),
+        ):
+            snapshot = safe_snapshot()
+            snapshot["targets"][1]["rules"].append(extra)  # type: ignore[index,union-attr]
+            self.assertFalse(verify(snapshot).passed)
 
     def test_gateway_and_agent_mutation_on_root_are_rejected(self) -> None:
         for principal_index in (2, 4):

@@ -11,6 +11,72 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SourceBoundaryTests(unittest.TestCase):
+    def test_transactional_acl_repair_is_bounded_and_mt5_free(self) -> None:
+        repair = (
+            ROOT / "scripts" / "Repair-MT5ReadOnlyAuthorizationAclDrift.ps1"
+        ).read_text(encoding="utf-8")
+        helper = (
+            ROOT / "scripts" / "MT5ReadOnlyAclRepairHelpers.ps1"
+        ).read_text(encoding="utf-8")
+        verifier = (
+            ROOT / "trading_lab" / "acl_repair_verifier.py"
+        ).read_text(encoding="utf-8")
+        for required in (
+            "Get-MT5AclRepairPlan",
+            "Assert-FreshSecurityPreconditions",
+            "Reserve-RepairReport",
+            "Assert-RepairStateUnchanged",
+            "Set-Acl -LiteralPath $controlPath -AclObject $controlCandidate",
+            "Set-Acl -LiteralPath $demoAuthorizationPath -AclObject $demoCandidate",
+            "Invoke-RepairRollback",
+            "Invoke-FullCanonicalVerifier",
+            "rollback_verified",
+            "modified_content",
+            "FileMode]::CreateNew",
+            "TRADING_MODE'] = 'OBSERVE_ONLY'",
+            "MT5_ACCESS_ENABLED'] = 'false'",
+        ):
+            self.assertIn(required, repair)
+        combined = repair + helper + verifier
+        for forbidden in (
+            "import MetaTrader5",
+            "MetaTrader5.initialize",
+            ".order_check(",
+            ".order_send(",
+            "runas.exe",
+            "icacls",
+            "Invoke-Expression",
+            "trading_lab.service",
+        ):
+            self.assertNotIn(forbidden, combined)
+        self.assertIn("include_automaton_state=False", verifier)
+        self.assertIn("include_automaton_state=True", verifier)
+        self.assertNotRegex(
+            verifier,
+            re.compile(r"^\s*(?:from|import)\s+MetaTrader5", re.MULTILINE),
+        )
+        initial = repair.index("$initialState = Get-RepairState")
+        reservation = repair.index("Reserve-RepairReport", initial)
+        fresh_preconditions = repair.index("Assert-FreshSecurityPreconditions", reservation)
+        main = repair.index("$freshState = Get-RepairState", fresh_preconditions)
+        dry = repair.index("if (-not $Apply)", main)
+        apply_branch = repair.index("} else {", dry)
+        dry_source = repair[dry:apply_branch]
+        self.assertNotIn("Set-Acl", dry_source)
+        self.assertNotIn("Invoke-FullCanonicalVerifier", dry_source)
+        control = repair.index("Set-Acl -LiteralPath $controlPath", apply_branch)
+        demo = repair.index("Set-Acl -LiteralPath $demoAuthorizationPath", control)
+        specialized = repair.index("$postState = Get-RepairState", demo)
+        full = repair.index("Invoke-FullCanonicalVerifier", specialized)
+        rollback = repair.index("Invoke-RepairRollback", full)
+        self.assertLess(reservation, fresh_preconditions)
+        self.assertLess(fresh_preconditions, main)
+        self.assertLess(main, control)
+        self.assertLess(control, demo)
+        self.assertLess(demo, specialized)
+        self.assertLess(specialized, full)
+        self.assertLess(full, rollback)
+
     def test_audit_jsonl_uses_only_shared_win32_append_boundary(self) -> None:
         audit = (ROOT / "trading_lab" / "audit.py").read_text(encoding="utf-8")
         primitive = (
@@ -39,6 +105,7 @@ class SourceBoundaryTests(unittest.TestCase):
 
     def test_trading_security_code_is_self_modification_protected(self) -> None:
         source = (ROOT / "src" / "self-mod" / "code.ts").read_text(encoding="utf-8")
+        acl_source = (ROOT / "trading_lab" / "windows_acl.py").read_text(encoding="utf-8")
         self.assertIn('"trading_lab"', source)
         self.assertIn('"trading"', source)
         self.assertIn('"trading.security.json"', source)
@@ -51,8 +118,17 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn('"scripts/Apply-TradingLabAclGate.ps1"', source)
         self.assertIn('"scripts/TradingLabAclBootstrap.ps1"', source)
         self.assertIn('"scripts/Set-MT5ReadOnlyAuthorizationAcl.ps1"', source)
+        self.assertIn('"scripts/Repair-MT5ReadOnlyAuthorizationAclDrift.ps1"', source)
+        self.assertIn('"scripts/MT5ReadOnlyAclRepairHelpers.ps1"', source)
         self.assertIn('"scripts/Set-MT5ReadOnlyProtectedIdentity.ps1"', source)
         self.assertIn('"scripts/ProtectedIdentityGateHelpers.ps1"', source)
+        self.assertIn('"trading_lab/acl_repair_verifier.py"', source)
+        for protected_acl_source in (
+            '"scripts/Repair-MT5ReadOnlyAuthorizationAclDrift.ps1"',
+            '"scripts/MT5ReadOnlyAclRepairHelpers.ps1"',
+            '"trading_lab/acl_repair_verifier.py"',
+        ):
+            self.assertIn(protected_acl_source, acl_source)
         self.assertIn('"scripts/New-TradingLabUsers.ps1"', source)
         self.assertIn('"scripts/Test-AgentRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Test-GatewayRuntimeAcl.ps1"', source)
