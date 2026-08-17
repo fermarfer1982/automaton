@@ -52,6 +52,7 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn('"scripts/TradingLabAclBootstrap.ps1"', source)
         self.assertIn('"scripts/Set-MT5ReadOnlyAuthorizationAcl.ps1"', source)
         self.assertIn('"scripts/Set-MT5ReadOnlyProtectedIdentity.ps1"', source)
+        self.assertIn('"scripts/ProtectedIdentityGateHelpers.ps1"', source)
         self.assertIn('"scripts/New-TradingLabUsers.ps1"', source)
         self.assertIn('"scripts/Test-AgentRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Test-GatewayRuntimeAcl.ps1"', source)
@@ -1074,10 +1075,13 @@ class SourceBoundaryTests(unittest.TestCase):
         protected_identity = (
             ROOT / "scripts" / "Set-MT5ReadOnlyProtectedIdentity.ps1"
         ).read_text(encoding="utf-8")
-        helper = (
+        powershell_helper = (
+            ROOT / "scripts" / "ProtectedIdentityGateHelpers.ps1"
+        ).read_text(encoding="utf-8")
+        python_helper = (
             ROOT / "trading_lab" / "protected_identity_config.py"
         ).read_text(encoding="utf-8")
-        combined = authorization_acl + protected_identity + helper
+        combined = authorization_acl + protected_identity + powershell_helper + python_helper
         for forbidden in (
             "import MetaTrader5", "from MetaTrader5", "initialize(", "login(",
             "order_check", "order_send", "trading_lab.service", "start_gateway",
@@ -1086,7 +1090,16 @@ class SourceBoundaryTests(unittest.TestCase):
             self.assertNotIn(forbidden, combined)
         self.assertIn("FileMode]::CreateNew", authorization_acl)
         self.assertIn("[System.IO.File]::Replace", protected_identity)
-        self.assertIn("load_mt5_security_config", helper)
+        self.assertIn("--mode pre-replace", protected_identity)
+        self.assertIn("--mode post-replace", protected_identity)
+        self.assertIn("VALIDATE_PRE_REPLACE", protected_identity)
+        self.assertIn("VALIDATE_POST_REPLACE", protected_identity)
+        self.assertIn("_build_mt5_security_config", python_helper)
+        self.assertIn("CANONICAL_WORKSPACE", python_helper)
+        self.assertIn("load_mt5_security_config(candidate)", python_helper)
+        self.assertIn("CANONICAL_CONFIG_PATH", python_helper)
+        self.assertIn("ReadToEndAsync()", powershell_helper)
+        self.assertIn("...[TRUNCATED]", powershell_helper)
 
 
 if __name__ == "__main__":

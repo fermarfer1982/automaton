@@ -17,6 +17,7 @@ from trading_lab.protected_identity_config import (
     parse_yaml_bytes,
     plan_identity_update,
     render_candidate,
+    validate_canonical_config,
     validate_candidate,
 )
 
@@ -43,7 +44,16 @@ def placeholder() -> dict[str, object]:
         "automaton_state_dir": r"C:\Users\AutomatonAgent\.automaton",
         "gateway_windows_identity": r"DESKTOP-QPK9UQ5\AutomatonGateway",
         "automaton_windows_identity": r"DESKTOP-QPK9UQ5\AutomatonAgent",
-        "risk": {"max_volume": 0.01},
+        "risk": {
+            "max_risk_per_trade_fraction": 0.0025,
+            "max_volume": 0.01,
+            "max_spread_points": 30.0,
+            "max_open_positions": 1,
+            "max_symbol_exposure_lots": 0.01,
+            "max_daily_loss_fraction": 0.01,
+            "min_stop_distance_points": 20,
+            "duplicate_window_seconds": 300,
+        },
     }
 
 
@@ -112,7 +122,7 @@ class ProtectedIdentityConfigTests(unittest.TestCase):
         plan_identity_update(raw)
         self.assertEqual(before, raw)
 
-    def test_parse_and_real_loader_failures_fail_closed(self) -> None:
+    def test_parse_builder_and_real_loader_failures_fail_closed(self) -> None:
         with self.assertRaises(ConfigError):
             parse_yaml_bytes(b"risk: [unterminated")
         with tempfile.TemporaryDirectory() as directory:
@@ -124,10 +134,69 @@ class ProtectedIdentityConfigTests(unittest.TestCase):
             baseline.write_text(yaml.safe_dump(placeholder(), sort_keys=False), encoding="utf-8")
             candidate.write_bytes(render_candidate(placeholder()))
             with patch(
-                "trading_lab.protected_identity_config.load_mt5_security_config",
-                side_effect=ConfigError("reload rejected"),
-            ), self.assertRaisesRegex(ConfigError, "reload rejected"):
+                "trading_lab.protected_identity_config._build_mt5_security_config",
+                side_effect=ConfigError("builder rejected"),
+            ), self.assertRaisesRegex(ConfigError, "builder rejected"):
                 validate_candidate(baseline, candidate)
+
+    def test_temp_candidate_uses_builder_while_public_loader_remains_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "trading.yaml"
+            candidate = root / ".trading.identity-test.tmp"
+            import yaml
+
+            baseline.write_text(yaml.safe_dump(placeholder(), sort_keys=False), encoding="utf-8")
+            original = baseline.read_bytes()
+            candidate.write_bytes(render_candidate(placeholder()))
+            result = validate_candidate(baseline, candidate)
+            self.assertEqual("PASS", result["status"])
+            self.assertEqual("_build_mt5_security_config", result["loader"])
+            self.assertEqual(original, baseline.read_bytes())
+            from trading_lab.config import load_mt5_security_config
+
+            with self.assertRaisesRegex(ConfigError, "must use .yaml"):
+                load_mt5_security_config(candidate)
+
+    def test_post_replace_requires_canonical_path_and_public_loader(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "original.backup"
+            canonical = root / "trading.yaml"
+            wrong = root / "other.yaml"
+            import yaml
+
+            baseline.write_text(yaml.safe_dump(placeholder(), sort_keys=False), encoding="utf-8")
+            content = render_candidate(placeholder())
+            canonical.write_bytes(content)
+            wrong.write_bytes(content)
+            with patch(
+                "trading_lab.protected_identity_config.CANONICAL_CONFIG_PATH",
+                canonical,
+            ):
+                result = validate_canonical_config(baseline, canonical)
+                self.assertEqual("load_mt5_security_config", result["loader"])
+                with self.assertRaisesRegex(ConfigError, "canonical trading.yaml"):
+                    validate_canonical_config(baseline, wrong)
+
+    def test_post_replace_public_loader_failure_is_propagated_for_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "original.backup"
+            canonical = root / "trading.yaml"
+            import yaml
+
+            baseline.write_text(yaml.safe_dump(placeholder(), sort_keys=False), encoding="utf-8")
+            canonical.write_bytes(render_candidate(placeholder()))
+            with (
+                patch("trading_lab.protected_identity_config.CANONICAL_CONFIG_PATH", canonical),
+                patch(
+                    "trading_lab.protected_identity_config.load_mt5_security_config",
+                    side_effect=ConfigError("canonical reload rejected"),
+                ),
+                self.assertRaisesRegex(ConfigError, "canonical reload rejected"),
+            ):
+                validate_canonical_config(baseline, canonical)
 
 
 if __name__ == "__main__":

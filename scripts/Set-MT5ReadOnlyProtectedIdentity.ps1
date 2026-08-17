@@ -27,6 +27,7 @@ $gatewaySid = 'S-1-5-21-568964486-193631783-1609210587-1007'
 $agentSid = 'S-1-5-21-568964486-193631783-1609210587-1006'
 $fullControl = 2032127L
 $readRights = 1179785L
+. (Join-Path $PSScriptRoot 'ProtectedIdentityGateHelpers.ps1')
 
 $report = [ordered]@{
     schema_version = 1
@@ -59,7 +60,18 @@ $report = [ordered]@{
     set_acl_call_count = 0
     rollback_attempted = $false
     rollback_succeeded = $false
+    rollback_error = $null
+    failure_stage = 'INITIALIZATION'
+    helper_stage = $null
+    helper_operation = $null
+    helper_exit_code = $null
+    helper_stdout = ''
+    helper_stderr = ''
+    helper_calls = @()
+    temporary_artifacts_cleanup_attempted = $false
     temporary_artifacts_removed = $false
+    temporary_artifacts_remaining = @()
+    temporary_artifacts_cleanup_errors = @()
     config_modified = $false
     mt5_imported = $false
     mt5_accessed = $false
@@ -131,38 +143,53 @@ function Assert-ExactConfigAcl($Snapshot) {
     }
 }
 
-function Invoke-ProtectedHelper([string] $Arguments) {
-    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $python
-    $startInfo.Arguments = $Arguments
-    $startInfo.WorkingDirectory = $workspace
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $startInfo.EnvironmentVariables['PYTHONDONTWRITEBYTECODE'] = '1'
-    $startInfo.EnvironmentVariables['PYTHONNOUSERSITE'] = '1'
-    $startInfo.EnvironmentVariables['TRADING_MODE'] = 'OBSERVE_ONLY'
-    $startInfo.EnvironmentVariables['MT5_ACCESS_ENABLED'] = 'false'
-    $process = [System.Diagnostics.Process]::new()
-    $process.StartInfo = $startInfo
+function Invoke-ProtectedHelper(
+    [ValidateSet('inspect', 'render', 'validate')] [string] $Operation,
+    [ValidateSet('INSPECT', 'RENDER', 'VALIDATE_PRE_REPLACE', 'VALIDATE_POST_REPLACE')]
+    [string] $Stage,
+    [string] $Arguments
+) {
+    $report.failure_stage = $Stage
+    $report.helper_stage = $Stage
+    $report.helper_operation = $Operation
+    $result = Invoke-ProtectedIdentityHelperProcess `
+        -Operation $Operation `
+        -Stage $Stage `
+        -Executable $python `
+        -Arguments $Arguments `
+        -WorkingDirectory $workspace `
+        -SensitiveValues @([string]$report.target.authorized_account)
+    $diagnostic = [pscustomobject]@{
+        operation = $result.operation
+        stage = $result.stage
+        process_started = $result.process_started
+        exit_code = $result.exit_code
+        timed_out = $result.timed_out
+        succeeded = $result.succeeded
+        stdout = $result.stdout
+        stderr = $result.stderr
+    }
+    $report.helper_calls += $diagnostic
+    $report.helper_exit_code = $result.exit_code
+    $report.helper_stdout = $result.stdout
+    $report.helper_stderr = $result.stderr
+    $failureCode = 'PROTECTED_HELPER_' + $Operation.ToUpperInvariant() + '_FAILED'
+    if (-not $result.succeeded) { throw $failureCode }
     try {
-        if (-not $process.Start()) { throw 'Protected config helper did not start.' }
-        $stdout = $process.StandardOutput.ReadToEndAsync()
-        $stderr = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit(30000)) {
-            $process.Kill()
-            [void]$process.WaitForExit(5000)
-            throw 'Protected config helper timed out.'
-        }
-        if (-not $stdout.Wait(5000) -or -not $stderr.Wait(5000)) {
-            throw 'Protected config helper output capture did not complete.'
-        }
-        if ($process.ExitCode -ne 0) {
-            throw "Protected config helper failed closed with exit code $($process.ExitCode)."
-        }
-        return ([string]$stdout.Result).Trim() | ConvertFrom-Json -ErrorAction Stop
-    } finally { $process.Dispose() }
+        return ([string]$result.raw_stdout).Trim() | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        $report.helper_stderr = ConvertTo-ProtectedHelperDiagnostic (
+            $report.helper_stderr + [Environment]::NewLine + 'Helper stdout was not valid JSON.'
+        ) @([string]$report.target.authorized_account)
+        throw $failureCode
+    }
+}
+
+function Set-CleanupReport($Cleanup) {
+    $report.temporary_artifacts_cleanup_attempted = [bool]$Cleanup.attempted
+    $report.temporary_artifacts_removed = [bool]$Cleanup.removed
+    $report.temporary_artifacts_remaining = @($Cleanup.remaining)
+    $report.temporary_artifacts_cleanup_errors = @($Cleanup.errors)
 }
 
 function Write-DurableReport {
@@ -187,7 +214,10 @@ function Write-DurableReport {
 
 $originalAcl = $null
 $replacePerformed = $false
+$transactionPathsWereInitiallyAbsent = $false
+$reportWriteFailed = $false
 try {
+    $report.failure_stage = 'PREVALIDATION'
     if ((Get-CanonicalPath $configPath) -ne 'C:\ProgramData\AutomatonMT5Lab\control\trading.yaml') {
         throw 'Protected config target is not exact.'
     }
@@ -202,6 +232,7 @@ try {
             throw "RunId-specific transaction artifact already exists: $transient"
         }
     }
+    $transactionPathsWereInitiallyAbsent = $true
     $policy = [System.IO.File]::ReadAllText($policyPath, [System.Text.Encoding]::UTF8) |
         ConvertFrom-Json -ErrorAction Stop
     $maintenanceIdentity = [string]$policy.maintenance_identity
@@ -223,7 +254,7 @@ try {
     Assert-ExactConfigAcl $beforeAcl
     $originalAcl = Get-Acl -LiteralPath $configPath -ErrorAction Stop
     $report.acl_before_sddl = $beforeAcl.sddl
-    $inspection = Invoke-ProtectedHelper "-B -m trading_lab.protected_identity_config inspect --config `"$configPath`""
+    $inspection = Invoke-ProtectedHelper 'inspect' 'INSPECT' "-B -m trading_lab.protected_identity_config inspect --config `"$configPath`""
     $report.initial_state = [string]$inspection.state
     $report.mt5_access_enabled_initially_present = [bool]$inspection.mt5_access_enabled_present
     $report.hash_before = [string]$inspection.source_sha256
@@ -237,13 +268,16 @@ try {
         $report.real_loader_validated = ($report.initial_state -eq 'EXACT_TARGET')
         $report.hash_after = $report.hash_before
     } elseif ($report.initial_state -eq 'KNOWN_PLACEHOLDER') {
-        $rendered = Invoke-ProtectedHelper "-B -m trading_lab.protected_identity_config render --config `"$configPath`" --output `"$tempPath`""
+        $rendered = Invoke-ProtectedHelper 'render' 'RENDER' "-B -m trading_lab.protected_identity_config render --config `"$configPath`" --output `"$tempPath`""
         if ([string]$rendered.source_sha256 -ne $report.hash_before -or
             [string]$rendered.candidate_sha256 -ne $report.hash_candidate) {
             throw 'Protected config changed between inspect and render.'
         }
-        $validated = Invoke-ProtectedHelper "-B -m trading_lab.protected_identity_config validate --baseline `"$configPath`" --candidate `"$tempPath`""
-        $report.candidate_validated = ([string]$validated.status -eq 'PASS')
+        $validated = Invoke-ProtectedHelper 'validate' 'VALIDATE_PRE_REPLACE' "-B -m trading_lab.protected_identity_config validate --mode pre-replace --baseline `"$configPath`" --candidate `"$tempPath`""
+        $report.candidate_validated = ([string]$validated.status -eq 'PASS' -and
+            [string]$validated.loader -eq '_build_mt5_security_config' -and
+            [string]$validated.candidate_sha256 -eq $report.hash_candidate)
+        if (-not $report.candidate_validated) { throw 'Candidate builder validation failed closed.' }
         $preReplaceAcl = Get-ConfigAclSnapshot
         Assert-ExactConfigAcl $preReplaceAcl
         $preReplaceHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -259,11 +293,11 @@ try {
         $afterAcl = Get-ConfigAclSnapshot
         Assert-ExactConfigAcl $afterAcl
         if ($afterAcl.sddl -ne $beforeAcl.sddl) { throw 'Protected config ACL was not preserved exactly.' }
-        $reloaded = Invoke-ProtectedHelper "-B -m trading_lab.protected_identity_config validate --baseline `"$backupPath`" --candidate `"$configPath`""
+        $reloaded = Invoke-ProtectedHelper 'validate' 'VALIDATE_POST_REPLACE' "-B -m trading_lab.protected_identity_config validate --mode post-replace --baseline `"$backupPath`" --candidate `"$configPath`""
         $report.real_loader_validated = ([string]$reloaded.loader -eq 'load_mt5_security_config')
         $report.hash_after = [string]$reloaded.candidate_sha256
     } else {
-        $validated = Invoke-ProtectedHelper "-B -m trading_lab.protected_identity_config validate --baseline `"$configPath`" --candidate `"$configPath`""
+        $validated = Invoke-ProtectedHelper 'validate' 'VALIDATE_POST_REPLACE' "-B -m trading_lab.protected_identity_config validate --mode post-replace --baseline `"$configPath`" --candidate `"$configPath`""
         $report.candidate_validated = ([string]$validated.status -eq 'PASS')
         $report.real_loader_validated = ([string]$validated.loader -eq 'load_mt5_security_config')
         $report.hash_after = [string]$validated.candidate_sha256
@@ -274,45 +308,88 @@ try {
     if ($Apply -and ($report.hash_after -ne $report.hash_candidate -or -not $report.real_loader_validated)) {
         throw 'Protected config final hash or real-loader validation failed.'
     }
-    if ($Apply -and $replacePerformed) {
-        Remove-Item -LiteralPath $backupPath -Force -ErrorAction Stop
-    }
-    $report.temporary_artifacts_removed = -not (
-        [System.IO.File]::Exists($tempPath) -or [System.IO.File]::Exists($backupPath) -or
-        [System.IO.File]::Exists($failedPath)
-    )
+    $report.failure_stage = 'CLEANUP'
+    $cleanup = Remove-ProtectedIdentityTransactionArtifacts `
+        @($tempPath, $backupPath, $failedPath) `
+        -ExpectedParent (Split-Path -Parent $configPath) `
+        -RunId ([guid]$normalizedRunId)
+    Set-CleanupReport $cleanup
     if (-not $report.temporary_artifacts_removed) { throw 'Transaction artifacts were not removed.' }
+    $report.failure_stage = $null
     $report.status = if ($Apply) { 'PASS' } else { 'DRY_RUN_PASS' }
 } catch {
-    $report.error = $_.Exception.Message
-    if ($Apply -and $replacePerformed -and [System.IO.File]::Exists($backupPath)) {
+    $primaryError = $_.Exception.Message
+    $report.error = $primaryError
+    if ($Apply -and $replacePerformed) {
         $report.rollback_attempted = $true
-        try {
-            [System.IO.File]::Replace($backupPath, $configPath, $failedPath, $true)
-            if ($null -ne $originalAcl) {
-                Set-Acl -LiteralPath $configPath -AclObject $originalAcl
-                $report.set_acl_call_count++
+        if (-not [System.IO.File]::Exists($backupPath)) {
+            $report.rollback_succeeded = $false
+            $report.rollback_error = 'Rollback backup is unavailable; automatic cleanup was withheld.'
+        } else {
+            try {
+                [System.IO.File]::Replace($backupPath, $configPath, $failedPath, $true)
+                if ($null -ne $originalAcl) {
+                    Set-Acl -LiteralPath $configPath -AclObject $originalAcl
+                    $report.set_acl_call_count++
+                }
+                $restoredAcl = Get-ConfigAclSnapshot
+                Assert-ExactConfigAcl $restoredAcl
+                $restoredHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                $report.rollback_succeeded = ($restoredHash -eq $report.hash_before -and
+                    $restoredAcl.sddl -eq $report.acl_before_sddl)
+                if (-not $report.rollback_succeeded) {
+                    $report.rollback_error = 'Rollback completed but original hash or ACL verification failed.'
+                }
+            } catch {
+                $report.rollback_succeeded = $false
+                $report.rollback_error = ConvertTo-ProtectedHelperDiagnostic $_.Exception.Message @(
+                    [string]$report.target.authorized_account
+                )
             }
-            $restoredAcl = Get-ConfigAclSnapshot
-            Assert-ExactConfigAcl $restoredAcl
-            $restoredHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant()
-            $report.rollback_succeeded = ($restoredHash -eq $report.hash_before -and
-                $restoredAcl.sddl -eq $report.acl_before_sddl)
-        } catch { $report.rollback_succeeded = $false }
-    }
-    foreach ($transient in @($tempPath, $backupPath, $failedPath)) {
-        if ([System.IO.File]::Exists($transient)) {
-            try { Remove-Item -LiteralPath $transient -Force -ErrorAction Stop } catch { }
         }
     }
+    if (-not $transactionPathsWereInitiallyAbsent) {
+        $remaining = @(@($tempPath, $backupPath, $failedPath) | Where-Object {
+            [System.IO.File]::Exists($_) -or [System.IO.Directory]::Exists($_)
+        })
+        Set-CleanupReport ([pscustomobject]@{
+            attempted = $false
+            removed = ($remaining.Count -eq 0)
+            remaining = $remaining
+            errors = @('Pre-existing RunId artifacts were preserved; this run did not own them.')
+        })
+    } elseif (-not $report.rollback_attempted -or $report.rollback_succeeded) {
+        $cleanup = Remove-ProtectedIdentityTransactionArtifacts `
+            @($tempPath, $backupPath, $failedPath) `
+            -ExpectedParent (Split-Path -Parent $configPath) `
+            -RunId ([guid]$normalizedRunId)
+        Set-CleanupReport $cleanup
+    } else {
+        $remaining = @(@($tempPath, $backupPath, $failedPath) | Where-Object {
+            [System.IO.File]::Exists($_) -or [System.IO.Directory]::Exists($_)
+        })
+        Set-CleanupReport ([pscustomobject]@{
+            attempted = $true
+            removed = ($remaining.Count -eq 0)
+            remaining = $remaining
+            errors = @('Rollback failed; recovery artifacts were preserved for human reconciliation.')
+        })
+    }
+    $report.error = $primaryError
     $report.status = 'FAIL_CLOSED'
 } finally {
     $report.completed_at_utc = [DateTime]::UtcNow.ToString('o')
     try { Write-DurableReport } catch {
+        $reportWriteFailed = $true
+        if ($null -eq $report.error) {
+            $report.error = 'DURABLE_REPORT_WRITE_FAILED'
+            $report.failure_stage = 'REPORT_WRITE'
+        }
+        $report.status = 'FAIL_CLOSED'
+        [Console]::Error.WriteLine("Primary gate error: $($report.error)")
         [Console]::Error.WriteLine("Unable to persist protected config report: $($_.Exception.Message)")
-        throw
     }
 }
 
 $report | ConvertTo-Json -Depth 10
-if ($report.status -notin @('PASS', 'DRY_RUN_PASS')) { exit 1 }
+if ($reportWriteFailed -or $report.status -notin @('PASS', 'DRY_RUN_PASS')) { exit 1 }

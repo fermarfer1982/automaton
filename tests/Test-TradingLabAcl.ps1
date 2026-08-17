@@ -22,7 +22,8 @@ if ($applyErrors.Count -ne 0) {
 $applySource = [System.IO.File]::ReadAllText($applyGatePath)
 $authorizationAclPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\Set-MT5ReadOnlyAuthorizationAcl.ps1'
 $protectedIdentityPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\Set-MT5ReadOnlyProtectedIdentity.ps1'
-foreach ($maintenanceScript in @($authorizationAclPath, $protectedIdentityPath)) {
+$protectedHelperPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\ProtectedIdentityGateHelpers.ps1'
+foreach ($maintenanceScript in @($authorizationAclPath, $protectedIdentityPath, $protectedHelperPath)) {
     $maintenanceTokens = $null
     $maintenanceErrors = $null
     [void][System.Management.Automation.Language.Parser]::ParseFile(
@@ -34,6 +35,8 @@ foreach ($maintenanceScript in @($authorizationAclPath, $protectedIdentityPath))
 }
 $authorizationAclSource = [System.IO.File]::ReadAllText($authorizationAclPath)
 $protectedIdentitySource = [System.IO.File]::ReadAllText($protectedIdentityPath)
+$protectedHelperSource = [System.IO.File]::ReadAllText($protectedHelperPath)
+. $protectedHelperPath
 foreach ($forbidden in @('Start-Process -Credential', 'runas.exe', '.order_send(', '.order_check(', 'import MetaTrader5')) {
     if ($applySource.Contains($forbidden)) {
         throw "ACL apply gate contains forbidden runtime action: $forbidden"
@@ -176,11 +179,35 @@ foreach ($requiredConfigGate in @(
     'rollback_attempted',
     'hash_before',
     'hash_after',
+    "Invoke-ProtectedHelper 'inspect' 'INSPECT'",
+    "Invoke-ProtectedHelper 'render' 'RENDER'",
+    "Invoke-ProtectedHelper 'validate' 'VALIDATE_PRE_REPLACE'",
+    "Invoke-ProtectedHelper 'validate' 'VALIDATE_POST_REPLACE'",
+    '--mode pre-replace',
+    '--mode post-replace',
+    '[string]$validated.candidate_sha256 -eq $report.hash_candidate',
+    'temporary_artifacts_cleanup_attempted',
+    'temporary_artifacts_remaining',
+    'transactionPathsWereInitiallyAbsent',
+    'Pre-existing RunId artifacts were preserved; this run did not own them.',
+    'Rollback backup is unavailable; automatic cleanup was withheld.',
     "trading_mode = 'OBSERVE_ONLY'",
     'mt5_access_enabled = $false'
 )) {
     if (-not $protectedIdentitySource.Contains($requiredConfigGate)) {
         throw "Protected identity gate lacks transaction boundary: $requiredConfigGate"
+    }
+}
+foreach ($requiredHelperBoundary in @(
+    "ValidateSet('inspect', 'render', 'validate')",
+    "ValidateSet('INSPECT', 'RENDER', 'VALIDATE_PRE_REPLACE', 'VALIDATE_POST_REPLACE')",
+    'ReadToEndAsync()',
+    '...[TRUNCATED]',
+    'Rejected non-transaction cleanup path',
+    'Unexpected transaction directory was not removed'
+)) {
+    if (-not $protectedHelperSource.Contains($requiredHelperBoundary)) {
+        throw "Protected identity helper lacks diagnostic or cleanup boundary: $requiredHelperBoundary"
     }
 }
 foreach ($forbiddenConfigGate in @(
@@ -189,6 +216,114 @@ foreach ($forbiddenConfigGate in @(
 )) {
     if ($protectedIdentitySource.Contains($forbiddenConfigGate)) {
         throw "Protected identity gate contains forbidden action: $forbiddenConfigGate"
+    }
+}
+$combinedProtectedSource = $protectedIdentitySource + $protectedHelperSource
+foreach ($forbiddenConfigHelper in @(
+    'MetaTrader5', 'initialize()', 'login(', 'order_check', 'order_send',
+    'trading_lab.service', 'start_gateway', 'start_automaton', 'Invoke-Expression'
+)) {
+    if ($combinedProtectedSource.Contains($forbiddenConfigHelper)) {
+        throw "Protected identity helper contains forbidden action: $forbiddenConfigHelper"
+    }
+}
+
+$preValidationCall = $protectedIdentitySource.IndexOf(
+    "Invoke-ProtectedHelper 'validate' 'VALIDATE_PRE_REPLACE'"
+)
+$replaceCall = $protectedIdentitySource.IndexOf('[System.IO.File]::Replace($tempPath, $configPath')
+$postValidationCall = $protectedIdentitySource.IndexOf(
+    "Invoke-ProtectedHelper 'validate' 'VALIDATE_POST_REPLACE'",
+    [Math]::Max(0, $replaceCall)
+)
+$rollbackCall = $protectedIdentitySource.IndexOf(
+    '[System.IO.File]::Replace($backupPath, $configPath, $failedPath',
+    [Math]::Max(0, $postValidationCall)
+)
+if ($preValidationCall -lt 0 -or $replaceCall -le $preValidationCall -or
+    $postValidationCall -le $replaceCall -or $rollbackCall -le $postValidationCall) {
+    throw 'Protected identity transaction does not order pre-validation, replace, canonical validation, and rollback.'
+}
+
+$testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('.automaton-protected-helper-' + [guid]::NewGuid().ToString('N'))
+[void][System.IO.Directory]::CreateDirectory($testRoot)
+try {
+    $childPath = Join-Path $testRoot 'diagnostic-child.ps1'
+    [System.IO.File]::WriteAllText(
+        $childPath,
+        "[Console]::Out.WriteLine('token=stdout-secret')`r`n" +
+        "[Console]::Error.WriteLine('Traceback: candidate validation failed password=stderr-secret')`r`n" +
+        'exit 7',
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    foreach ($case in @(
+        [pscustomobject]@{ operation = 'inspect'; stage = 'INSPECT' },
+        [pscustomobject]@{ operation = 'render'; stage = 'RENDER' },
+        [pscustomobject]@{ operation = 'validate'; stage = 'VALIDATE_PRE_REPLACE' },
+        [pscustomobject]@{ operation = 'validate'; stage = 'VALIDATE_POST_REPLACE' }
+    )) {
+        $diagnostic = Invoke-ProtectedIdentityHelperProcess `
+            -Operation $case.operation `
+            -Stage $case.stage `
+            -Executable 'powershell.exe' `
+            -Arguments "-NoLogo -NoProfile -ExecutionPolicy Bypass -File `"$childPath`"" `
+            -WorkingDirectory $testRoot
+        if ($diagnostic.succeeded -or $diagnostic.exit_code -ne 7 -or
+            $diagnostic.operation -ne $case.operation -or $diagnostic.stage -ne $case.stage) {
+            throw "Protected helper failure lost its operation/stage/exit code: $($case.operation)."
+        }
+        if (-not $diagnostic.stderr.Contains('Traceback: candidate validation failed') -or
+            $diagnostic.stderr.Contains('stderr-secret') -or
+            $diagnostic.stdout.Contains('stdout-secret')) {
+            throw "Protected helper failure did not preserve sanitized diagnostics: $($case.operation)."
+        }
+    }
+    $arbitraryOperationRejected = $false
+    try {
+        Invoke-ProtectedIdentityHelperProcess `
+            -Operation 'arbitrary' `
+            -Stage 'INSPECT' `
+            -Executable 'powershell.exe' `
+            -Arguments '-NoLogo -NoProfile' `
+            -WorkingDirectory $testRoot | Out-Null
+    } catch { $arbitraryOperationRejected = $true }
+    if (-not $arbitraryOperationRejected) {
+        throw 'Protected helper operation allowlist accepted an arbitrary operation.'
+    }
+    $bounded = ConvertTo-ProtectedHelperDiagnostic ('x' * 9000)
+    if ($bounded.Length -ne 8192 -or -not $bounded.EndsWith('...[TRUNCATED]')) {
+        throw 'Protected helper diagnostics are not bounded to 8 KiB.'
+    }
+    $exactRedaction = ConvertTo-ProtectedHelperDiagnostic 'known-sensitive-value' @('known-sensitive-value')
+    if ($exactRedaction -ne '[REDACTED]') {
+        throw 'Protected helper did not redact an explicitly known sensitive value.'
+    }
+
+    $cleanupRunId = [guid]::NewGuid()
+    $cleanupPrefix = ".trading.identity-$($cleanupRunId.ToString('D').ToLowerInvariant())"
+    $cleanupPaths = @(
+        (Join-Path $testRoot "$cleanupPrefix.tmp"),
+        (Join-Path $testRoot "$cleanupPrefix.backup"),
+        (Join-Path $testRoot "$cleanupPrefix.failed")
+    )
+    [System.IO.File]::WriteAllText($cleanupPaths[0], 'canary')
+    $cleanup = Remove-ProtectedIdentityTransactionArtifacts `
+        $cleanupPaths -ExpectedParent $testRoot -RunId $cleanupRunId
+    if (-not $cleanup.attempted -or -not $cleanup.removed -or
+        @($cleanup.remaining).Count -ne 0 -or [System.IO.File]::Exists($cleanupPaths[0])) {
+        throw 'Successful transaction cleanup was not reported from filesystem state.'
+    }
+    [void][System.IO.Directory]::CreateDirectory($cleanupPaths[2])
+    $incomplete = Remove-ProtectedIdentityTransactionArtifacts `
+        $cleanupPaths -ExpectedParent $testRoot -RunId $cleanupRunId
+    if ($incomplete.removed -or @($incomplete.remaining).Count -ne 1 -or
+        -not [System.IO.Directory]::Exists($cleanupPaths[2])) {
+        throw 'Incomplete transaction cleanup did not fail closed with the remaining artifact.'
+    }
+    [System.IO.Directory]::Delete($cleanupPaths[2], $false)
+} finally {
+    if ([System.IO.Directory]::Exists($testRoot)) {
+        [System.IO.Directory]::Delete($testRoot, $true)
     }
 }
 foreach ($legacyApplySemantic in @(

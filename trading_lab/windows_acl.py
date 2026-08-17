@@ -323,6 +323,7 @@ def _targets(
         "scripts/TradingLabAclBootstrap.ps1",
         "scripts/Set-MT5ReadOnlyAuthorizationAcl.ps1",
         "scripts/Set-MT5ReadOnlyProtectedIdentity.ps1",
+        "scripts/ProtectedIdentityGateHelpers.ps1",
         "config/windows-acl-policy.json",
         "config/trading.security.example.json",
         "config/trading.example.yaml", "requirements-mt5.txt",
