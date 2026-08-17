@@ -245,6 +245,148 @@ if ($preValidationCall -lt 0 -or $replaceCall -le $preValidationCall -or
     throw 'Protected identity transaction does not order pre-validation, replace, canonical validation, and rollback.'
 }
 
+$prepareCondition = "if (-not `$Apply -or `$report.initial_state -eq 'KNOWN_PLACEHOLDER')"
+$dryRunCondition = 'if (-not $Apply)'
+$applyPlaceholderCondition = "elseif (`$report.initial_state -eq 'KNOWN_PLACEHOLDER')"
+$prepareIndex = $protectedIdentitySource.IndexOf($prepareCondition)
+$dryRunIndex = $protectedIdentitySource.IndexOf($dryRunCondition, [Math]::Max(0, $prepareIndex))
+$applyPlaceholderIndex = $protectedIdentitySource.IndexOf(
+    $applyPlaceholderCondition,
+    [Math]::Max(0, $dryRunIndex)
+)
+if ($prepareIndex -lt 0 -or $dryRunIndex -le $prepareIndex -or
+    $applyPlaceholderIndex -le $dryRunIndex) {
+    throw 'Protected identity gate lacks the reviewed dry-run/apply branch structure.'
+}
+$inspectCall = $protectedIdentitySource.IndexOf("Invoke-ProtectedHelper 'inspect' 'INSPECT'")
+if ($inspectCall -lt 0 -or $inspectCall -ge $prepareIndex) {
+    throw 'Dry-run does not inspect the canonical config before candidate preparation.'
+}
+$dryKnownPlaceholderPath = $protectedIdentitySource.Substring(
+    $inspectCall,
+    $applyPlaceholderIndex - $inspectCall
+)
+$dryHelperCalls = [regex]::Matches($dryKnownPlaceholderPath, 'Invoke-ProtectedHelper\s+''').Count
+if ($dryHelperCalls -ne 3) {
+    throw "Dry-run KNOWN_PLACEHOLDER path must contain exactly three helper calls; found $dryHelperCalls."
+}
+$prepareBlock = $protectedIdentitySource.Substring($prepareIndex, $dryRunIndex - $prepareIndex)
+$dryRunBlock = $protectedIdentitySource.Substring(
+    $dryRunIndex,
+    $applyPlaceholderIndex - $dryRunIndex
+)
+foreach ($requiredDryPreparation in @(
+    "Invoke-ProtectedHelper 'render' 'RENDER'",
+    "Invoke-ProtectedHelper 'validate' 'VALIDATE_PRE_REPLACE'",
+    '[string]$validated.candidate_sha256 -eq $report.hash_candidate',
+    '$preReplaceAcl.sddl -ne $beforeAcl.sddl',
+    '$preReplaceHash -ne $report.hash_before',
+    'Rendered candidate is not the exact regular non-reparse transaction file.'
+)) {
+    if (-not $prepareBlock.Contains($requiredDryPreparation)) {
+        throw "Dry-run candidate preparation lacks boundary: $requiredDryPreparation"
+    }
+}
+foreach ($requiredDryReport in @(
+    '$report.real_loader_validated = $false',
+    '$report.hash_after = $report.hash_before'
+)) {
+    if (-not $dryRunBlock.Contains($requiredDryReport)) {
+        throw "Dry-run report semantics lack boundary: $requiredDryReport"
+    }
+}
+foreach ($dryDefault in @(
+    'controlled_replace_performed = $false',
+    'set_acl_call_count = 0',
+    'config_modified = $false',
+    'rollback_attempted = $false'
+)) {
+    if (-not $protectedIdentitySource.Contains($dryDefault)) {
+        throw "Dry-run report lacks immutable default: $dryDefault"
+    }
+}
+if (-not $prepareBlock.Contains('$report.candidate_validated = (')) {
+    throw 'Dry-run does not persist successful builder candidate validation.'
+}
+foreach ($forbiddenDryMutation in @(
+    '[System.IO.File]::Replace',
+    'Set-Acl',
+    'VALIDATE_POST_REPLACE',
+    'rollback_attempted'
+)) {
+    if ($dryRunBlock.Contains($forbiddenDryMutation)) {
+        throw "Dry-run branch contains forbidden mutation or post-validation: $forbiddenDryMutation"
+    }
+}
+$applyPlaceholderEnd = $protectedIdentitySource.IndexOf(
+    "`n    } else {",
+    [Math]::Max(0, $applyPlaceholderIndex)
+)
+if ($applyPlaceholderEnd -le $applyPlaceholderIndex) {
+    throw 'Apply placeholder branch boundary was not found.'
+}
+$commonCleanupIndex = $protectedIdentitySource.IndexOf(
+    '$cleanup = Remove-ProtectedIdentityTransactionArtifacts',
+    [Math]::Max(0, $applyPlaceholderEnd)
+)
+$dryPassIndex = $protectedIdentitySource.IndexOf(
+    "`$report.status = if (`$Apply) { 'PASS' } else { 'DRY_RUN_PASS' }",
+    [Math]::Max(0, $commonCleanupIndex)
+)
+if ($commonCleanupIndex -le $applyPlaceholderEnd -or $dryPassIndex -le $commonCleanupIndex) {
+    throw 'Dry-run cleanup is not common, verified, and ordered before DRY_RUN_PASS.'
+}
+$commonFinalization = $protectedIdentitySource.Substring(
+    $applyPlaceholderEnd,
+    $dryPassIndex - $applyPlaceholderEnd
+)
+foreach ($requiredDryFinalization in @(
+    '$report.acl_after_sddl = $finalAcl.sddl',
+    'Set-CleanupReport $cleanup',
+    'if (-not $report.temporary_artifacts_removed)',
+    'temporary_artifacts_remaining'
+)) {
+    if (-not ($commonFinalization.Contains($requiredDryFinalization) -or
+        $protectedIdentitySource.Contains($requiredDryFinalization))) {
+        throw "Dry-run finalization lacks verified evidence: $requiredDryFinalization"
+    }
+}
+$applyPlaceholderBlock = $protectedIdentitySource.Substring(
+    $applyPlaceholderIndex,
+    $applyPlaceholderEnd - $applyPlaceholderIndex
+)
+foreach ($requiredApplyMutation in @(
+    '[System.IO.File]::Replace($tempPath, $configPath, $backupPath, $true)',
+    'Set-Acl -LiteralPath $configPath -AclObject $originalAcl',
+    "Invoke-ProtectedHelper 'validate' 'VALIDATE_POST_REPLACE'"
+)) {
+    if (-not $applyPlaceholderBlock.Contains($requiredApplyMutation)) {
+        throw "Apply path lost transaction stage: $requiredApplyMutation"
+    }
+}
+if (-not $protectedIdentitySource.Contains('if ($Apply -and $replacePerformed)')) {
+    throw 'Rollback is not structurally restricted to an Apply replacement.'
+}
+if (-not $protectedIdentitySource.Contains("`$report.status = 'FAIL_CLOSED'")) {
+    throw 'Helper or cleanup failures are not guaranteed to fail closed.'
+}
+$catchIndex = $protectedIdentitySource.IndexOf('} catch {', $dryPassIndex)
+$finallyIndex = $protectedIdentitySource.IndexOf('} finally {', [Math]::Max(0, $catchIndex))
+if ($catchIndex -lt 0 -or $finallyIndex -le $catchIndex) {
+    throw 'Protected identity failure handler was not found.'
+}
+$failureHandler = $protectedIdentitySource.Substring($catchIndex, $finallyIndex - $catchIndex)
+foreach ($requiredFailureBoundary in @(
+    'if ($Apply -and $replacePerformed)',
+    'Remove-ProtectedIdentityTransactionArtifacts',
+    '$report.error = $primaryError',
+    '$report.status = ''FAIL_CLOSED'''
+)) {
+    if (-not $failureHandler.Contains($requiredFailureBoundary)) {
+        throw "Dry-run render/validate failure handling lacks boundary: $requiredFailureBoundary"
+    }
+}
+
 $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('.automaton-protected-helper-' + [guid]::NewGuid().ToString('N'))
 [void][System.IO.Directory]::CreateDirectory($testRoot)
 try {
@@ -346,11 +488,11 @@ foreach ($newApplySemantic in @(
     }
 }
 
-$dryRunIndex = $source.IndexOf('if (-not $Apply)')
-if ($dryRunIndex -lt 0) { throw 'ACL script has no explicit dry-run exit.' }
+$aclDryRunIndex = $source.IndexOf('if (-not $Apply)')
+if ($aclDryRunIndex -lt 0) { throw 'ACL script has no explicit dry-run exit.' }
 foreach ($mutation in @('New-Item -ItemType Directory', 'WriteAllText', 'Set-Acl -LiteralPath')) {
     $mutationIndex = $source.IndexOf($mutation)
-    if ($mutationIndex -ge 0 -and $mutationIndex -lt $dryRunIndex) {
+    if ($mutationIndex -ge 0 -and $mutationIndex -lt $aclDryRunIndex) {
         throw "ACL dry-run can reach mutation before its exit: $mutation"
     }
 }

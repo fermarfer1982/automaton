@@ -263,15 +263,17 @@ try {
         throw 'Protected identity candidate did not pass schema prevalidation.'
     }
 
-    if (-not $Apply) {
-        $report.candidate_validated = [bool]$inspection.candidate_schema_validated
-        $report.real_loader_validated = ($report.initial_state -eq 'EXACT_TARGET')
-        $report.hash_after = $report.hash_before
-    } elseif ($report.initial_state -eq 'KNOWN_PLACEHOLDER') {
+    if (-not $Apply -or $report.initial_state -eq 'KNOWN_PLACEHOLDER') {
         $rendered = Invoke-ProtectedHelper 'render' 'RENDER' "-B -m trading_lab.protected_identity_config render --config `"$configPath`" --output `"$tempPath`""
         if ([string]$rendered.source_sha256 -ne $report.hash_before -or
             [string]$rendered.candidate_sha256 -ne $report.hash_candidate) {
             throw 'Protected config changed between inspect and render.'
+        }
+        $tempItem = Get-Item -LiteralPath $tempPath -Force -ErrorAction Stop
+        if ($tempItem.PSIsContainer -or
+            ($tempItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or
+            (Get-CanonicalPath $tempItem.FullName) -ne (Get-CanonicalPath $tempPath)) {
+            throw 'Rendered candidate is not the exact regular non-reparse transaction file.'
         }
         $validated = Invoke-ProtectedHelper 'validate' 'VALIDATE_PRE_REPLACE' "-B -m trading_lab.protected_identity_config validate --mode pre-replace --baseline `"$configPath`" --candidate `"$tempPath`""
         $report.candidate_validated = ([string]$validated.status -eq 'PASS' -and
@@ -284,6 +286,12 @@ try {
         if ($preReplaceAcl.sddl -ne $beforeAcl.sddl -or $preReplaceHash -ne $report.hash_before) {
             throw 'Protected config content or ACL changed before controlled replace.'
         }
+    }
+
+    if (-not $Apply) {
+        $report.real_loader_validated = $false
+        $report.hash_after = $report.hash_before
+    } elseif ($report.initial_state -eq 'KNOWN_PLACEHOLDER') {
         [System.IO.File]::Replace($tempPath, $configPath, $backupPath, $true)
         $replacePerformed = $true
         $report.controlled_replace_performed = $true

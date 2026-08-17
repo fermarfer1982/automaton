@@ -1094,12 +1094,21 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn("--mode post-replace", protected_identity)
         self.assertIn("VALIDATE_PRE_REPLACE", protected_identity)
         self.assertIn("VALIDATE_POST_REPLACE", protected_identity)
+        self.assertIn(
+            "if (-not $Apply -or $report.initial_state -eq 'KNOWN_PLACEHOLDER')",
+            protected_identity,
+        )
+        self.assertIn("$report.real_loader_validated = $false", protected_identity)
+        self.assertIn("$report.hash_after = $report.hash_before", protected_identity)
         self.assertIn("_build_mt5_security_config", python_helper)
         self.assertIn("CANONICAL_WORKSPACE", python_helper)
         self.assertIn("load_mt5_security_config(candidate)", python_helper)
         self.assertIn("CANONICAL_CONFIG_PATH", python_helper)
         self.assertIn("ReadToEndAsync()", powershell_helper)
         self.assertIn("...[TRUNCATED]", powershell_helper)
+        self.assertIn('with destination.open("xb")', python_helper)
+        self.assertIn('destination.name.startswith(".trading.identity-")', python_helper)
+        self.assertIn('destination.name.endswith(".tmp")', python_helper)
 
 
 if __name__ == "__main__":
