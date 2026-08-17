@@ -9,12 +9,13 @@ $pythonBaseOnlyPath = Join-Path $workspace 'scripts\Test-PythonBaseOnlyRuntimeAc
 $pythonStagingOnlyPath = Join-Path $workspace 'scripts\Test-PythonStagingOnlyRuntimeAcl.ps1'
 $pythonFinalOnlyPath = Join-Path $workspace 'scripts\Test-PythonFinalOnlyRuntimeAcl.ps1'
 $gatewayHealthOnlyPath = Join-Path $workspace 'scripts\Test-GatewayHealthOnly.ps1'
+$mt5ReadOnlyPath = Join-Path $workspace 'scripts\Test-MT5ReadOnlyPreflight.ps1'
 $securityAppendOnlyPath = Join-Path $workspace 'scripts\Test-SecurityAppendOnly.ps1'
 $auditAppendOnlyPath = Join-Path $workspace 'scripts\Test-AuditJournalAppendOnly.ps1'
 $collectorPath = Join-Path $workspace 'scripts\Collect-RuntimeAclResults.ps1'
 $paths = @(
     $agentPath, $gatewayPath, $pythonBaseOnlyPath, $pythonStagingOnlyPath,
-    $pythonFinalOnlyPath, $securityAppendOnlyPath, $auditAppendOnlyPath,
+    $pythonFinalOnlyPath, $mt5ReadOnlyPath, $securityAppendOnlyPath, $auditAppendOnlyPath,
     $collectorPath
 )
 
@@ -59,6 +60,7 @@ $healthAst = [System.Management.Automation.Language.Parser]::ParseFile(
 )
 Assert-True ($healthParseErrors.Count -eq 0) 'Gateway health-only harness has AST errors.'
 $gatewayHealthOnly = [System.IO.File]::ReadAllText($gatewayHealthOnlyPath)
+$mt5ReadOnly = $sources[$mt5ReadOnlyPath]
 $securityAppendOnly = $sources[$securityAppendOnlyPath]
 $auditAppendOnly = $sources[$auditAppendOnlyPath]
 
@@ -695,6 +697,121 @@ Assert-True ($gatewayHealthOnly.Contains(".Replace(`$SensitiveValue, '[REDACTED]
 Assert-True ($gatewayHealthOnly.Contains("`$process.Kill()")) 'Gateway health-only cleanup must retain bounded forced termination of its process object.'
 Assert-True (-not $gatewayHealthOnly.Contains('Stop-Process')) 'Gateway health-only cleanup must not address arbitrary processes.'
 
+foreach ($forbiddenReadOnly in @(
+    'runas.exe', 'Start-Process', 'Stop-Process', 'TaskKill', 'taskkill.exe',
+    'Set-Acl', 'icacls', 'takeown', 'Invoke-WebRequest', 'Invoke-RestMethod',
+    'HttpClient', 'TcpClient', 'UdpClient', 'import MetaTrader5',
+    '.login(', '.symbol_select(', '.market_book_add(', '.market_book_release(',
+    '.copy_ticks_from(', '.order_check(', '.order_send(', 'DEMO_EXECUTION'
+)) {
+    Assert-True (-not $mt5ReadOnly.Contains($forbiddenReadOnly)) "MT5 read-only forbidden action: $forbiddenReadOnly"
+}
+foreach ($requiredReadOnly in @(
+    "`$expectedGatewaySid = 'S-1-5-21-568964486-193631783-1609210587-1007'",
+    "`$finalRoot = 'C:\automaton\.venv'",
+    "`$pythonExecutable = 'C:\automaton\.venv\Scripts\python.exe'",
+    "mode = 'MT5_READ_ONLY_PREFLIGHT'", "symbol = 'XAUUSD'",
+    "trading_mode = 'OBSERVE_ONLY'", "status = 'FAIL_INITIALIZING'",
+    'mt5-read-only-preflight-$normalizedRunId.json',
+    '-m trading_lab.mt5_read_only_entrypoint',
+    "`$startInfo.EnvironmentVariables['TRADING_MODE'] = 'OBSERVE_ONLY'",
+    "`$startInfo.EnvironmentVariables['MT5_ACCESS_ENABLED'] = 'false'",
+    "`$startInfo.EnvironmentVariables['MT5_READ_ONLY_PREFLIGHT'] = 'true'",
+    "`$startInfo.EnvironmentVariables['PYTHONDONTWRITEBYTECODE'] = '1'",
+    'Get-FinalRuntimeFingerprint', 'runtime_fingerprint_verified',
+    'filesystem_runtime_modified', 'acl_modified',
+    '[System.Diagnostics.ProcessStartInfo]::new()', 'UseShellExecute = $false',
+    '$process.StandardOutput.ReadToEndAsync()',
+    '$process.StandardError.ReadToEndAsync()',
+    'Receive-PreflightStreamCapture', 'Get-SanitizedBoundedProcessText',
+    'Test-PreflightChildBoundary', 'Copy-PreflightEvidence',
+    'mt5_initialize_called', 'mt5_initialize_result', 'mt5_shutdown_called',
+    'account_login_match', 'account_server_match', 'account_demo_verified',
+    'symbol_info_read', 'tick_read', 'audit_chain_valid',
+    'unexpected_capability_called', 'order_check_called', 'order_send_called',
+    'login_called', 'symbol_select_called', 'automaton_started',
+    'preflight_process_exit_code', 'timeout_observed', 'orphan_processes',
+    '[System.IO.FileMode]::CreateNew', '# BEGIN_RUNTIME_GUARD',
+    '# BEGIN_DURABLE_REPORT_FINALLY', '$process.Kill()',
+    'Write-ExclusiveJson $reportPath $report'
+)) {
+    Assert-True ($mt5ReadOnly.Contains($requiredReadOnly)) "MT5 read-only invariant missing: $requiredReadOnly"
+}
+$readOnlyReportIndex = $mt5ReadOnly.IndexOf('$report = [ordered]@{')
+$readOnlyGuardIndex = $mt5ReadOnly.IndexOf('# BEGIN_RUNTIME_GUARD')
+$readOnlyIdentityIndex = $mt5ReadOnly.IndexOf('$effectiveIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()')
+$readOnlyBeforeFingerprint = $mt5ReadOnly.IndexOf('$beforeFingerprint = Get-FinalRuntimeFingerprint')
+$readOnlyStartIndex = $mt5ReadOnly.IndexOf('if (-not $process.Start())')
+$readOnlyStdoutIndex = $mt5ReadOnly.IndexOf('$process.StandardOutput.ReadToEndAsync()')
+$readOnlyStderrIndex = $mt5ReadOnly.IndexOf('$process.StandardError.ReadToEndAsync()')
+$readOnlyWaitIndex = $mt5ReadOnly.IndexOf("`$stage = 'PREFLIGHT_PROCESS_WAIT'")
+$readOnlyFinallyIndex = $mt5ReadOnly.IndexOf('# BEGIN_DURABLE_REPORT_FINALLY')
+$readOnlyAfterFingerprint = $mt5ReadOnly.IndexOf('$afterFingerprint = Get-FinalRuntimeFingerprint')
+$readOnlyReportWriteIndex = $mt5ReadOnly.LastIndexOf('Write-ExclusiveJson $reportPath $report')
+Assert-True ($readOnlyReportIndex -ge 0 -and $readOnlyReportIndex -lt $readOnlyGuardIndex) 'MT5 read-only failure envelope must precede runtime work.'
+Assert-True ($readOnlyGuardIndex -lt $readOnlyIdentityIndex) 'MT5 read-only identity check must be guarded.'
+Assert-True ($readOnlyBeforeFingerprint -lt $readOnlyStartIndex) 'MT5 read-only fingerprint must precede child startup.'
+Assert-True ($readOnlyStartIndex -lt $readOnlyStdoutIndex -and $readOnlyStdoutIndex -lt $readOnlyWaitIndex) 'MT5 read-only stdout must drain asynchronously before waiting.'
+Assert-True ($readOnlyStartIndex -lt $readOnlyStderrIndex -and $readOnlyStderrIndex -lt $readOnlyWaitIndex) 'MT5 read-only stderr must drain asynchronously before waiting.'
+Assert-True (-not ($mt5ReadOnly -match '\.ReadToEnd\s*\(')) 'MT5 read-only harness must never synchronously drain child streams.'
+Assert-True ($readOnlyFinallyIndex -gt $readOnlyStartIndex -and $readOnlyAfterFingerprint -gt $readOnlyFinallyIndex) 'MT5 read-only after-fingerprint must run during finalization.'
+Assert-True ($readOnlyReportWriteIndex -gt $readOnlyFinallyIndex) 'MT5 read-only report must be written from finalization.'
+
+$readOnlyAst = $null
+$readOnlyTokens = $null
+$readOnlyParseErrors = $null
+$readOnlyAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    $mt5ReadOnlyPath, [ref]$readOnlyTokens, [ref]$readOnlyParseErrors
+)
+Assert-True ($readOnlyParseErrors.Count -eq 0) 'MT5 read-only harness has AST errors.'
+$childBoundaryAst = $readOnlyAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Test-PreflightChildBoundary'
+}, $true)
+Assert-True ($null -ne $childBoundaryAst) 'MT5 read-only child-boundary function is missing.'
+. ([scriptblock]::Create($childBoundaryAst.Extent.Text))
+$normalizedRunId = '11111111-2222-4333-8444-555555555555'
+$expectedGatewaySid = 'S-1-5-21-568964486-193631783-1609210587-1007'
+$pythonExecutable = 'C:\automaton\.venv\Scripts\python.exe'
+$validReadOnlyChild = [pscustomobject]@{
+    schema_version = 1; mode = 'MT5_READ_ONLY_PREFLIGHT'; run_id = $normalizedRunId
+    effective_sid = $expectedGatewaySid; status = 'PASS'; python_executable = $pythonExecutable
+    trading_mode = 'OBSERVE_ONLY'; mt5_package_version = '5.0.6090'
+    mt5_imported = $true; mt5_initialize_called = $true; mt5_initialize_result = $true
+    mt5_accessed = $true; mt5_shutdown_called = $true; terminal_connected = $true
+    terminal_path_match = $true; account_info_read = $true; account_login_match = $true
+    account_server_match = $true; account_demo_verified = $true; symbol = 'XAUUSD'
+    symbol_info_read = $true; symbol_exists = $true; tick_read = $true; audit_chain_valid = $true
+    unexpected_capability_called = $false; order_check_called = $false
+    order_send_called = $false; login_called = $false; symbol_select_called = $false
+    market_book_add_called = $false; market_book_release_called = $false
+    copy_ticks_from_called = $false; automaton_started = $false; gateway_started = $false
+    acl_verified = $true; acl_modified = $false; filesystem_runtime_modified = $false
+    process_stopped_cleanly = $true; orphan_processes = 0
+}
+Assert-True (Test-PreflightChildBoundary $validReadOnlyChild) 'Valid MT5 read-only child evidence must pass.'
+foreach ($field in @(
+    'order_check_called', 'order_send_called', 'login_called', 'symbol_select_called',
+    'unexpected_capability_called', 'filesystem_runtime_modified', 'acl_modified'
+)) {
+    $violation = $validReadOnlyChild | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+    $violation.$field = $true
+    Assert-True (-not (Test-PreflightChildBoundary $violation)) "MT5 read-only $field violation must fail."
+}
+$wrongReadOnlyAccount = $validReadOnlyChild | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+$wrongReadOnlyAccount.account_login_match = $false
+Assert-True (-not (Test-PreflightChildBoundary $wrongReadOnlyAccount)) 'MT5 read-only account mismatch must fail.'
+$wrongReadOnlyServer = $validReadOnlyChild | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+$wrongReadOnlyServer.account_server_match = $false
+Assert-True (-not (Test-PreflightChildBoundary $wrongReadOnlyServer)) 'MT5 read-only server mismatch must fail.'
+$nonDemoReadOnly = $validReadOnlyChild | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+$nonDemoReadOnly.account_demo_verified = $false
+Assert-True (-not (Test-PreflightChildBoundary $nonDemoReadOnly)) 'MT5 read-only non-DEMO evidence must fail.'
+$runtimeMutationReadOnly = $validReadOnlyChild | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+$runtimeMutationReadOnly.filesystem_runtime_modified = $true
+Assert-True (-not (Test-PreflightChildBoundary $runtimeMutationReadOnly)) 'MT5 read-only runtime mutation must fail.'
+
 $earlyExitFunctionAst = $healthAst.Find({
     param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
@@ -828,6 +945,14 @@ Assert-True `
     GATEWAY_HEALTH_ONLY_ASYNC_STREAM_CAPTURE = 'PASS'
     GATEWAY_HEALTH_ONLY_EARLY_EXIT_CLASSIFICATION = 'PASS'
     GATEWAY_HEALTH_ONLY_BOUNDED_DIAGNOSTICS = 'PASS'
+    MT5_READ_ONLY_PREFLIGHT_AST = 'PASS'
+    MT5_READ_ONLY_PREFLIGHT_EXACT_SID_PYTHON = 'PASS'
+    MT5_READ_ONLY_PREFLIGHT_ASYNC_PROCESS = 'PASS'
+    MT5_READ_ONLY_PREFLIGHT_RUNTIME_IMMUTABLE = 'PASS'
+    MT5_READ_ONLY_PREFLIGHT_EXACT_ACCOUNT_SERVER_DEMO = 'PASS'
+    MT5_READ_ONLY_PREFLIGHT_EXACT_XAUUSD = 'PASS'
+    MT5_READ_ONLY_PREFLIGHT_FORBIDDEN_CAPABILITIES = 'PASS'
+    MT5_READ_ONLY_PREFLIGHT_DURABLE_REPORT = 'PASS'
     SECURITY_APPEND_ONLY_PROBE_AST = 'PASS'
     SECURITY_APPEND_ONLY_EXACT_PATH = 'PASS'
     SECURITY_APPEND_ONLY_REQUIRED_RIGHTS = 'PASS'

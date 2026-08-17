@@ -772,6 +772,89 @@ class SourceBoundaryTests(unittest.TestCase):
             health_probe,
         )
 
+    def test_mt5_read_only_preflight_has_a_structural_capability_boundary(self) -> None:
+        adapter = (ROOT / "trading_lab" / "mt5_read_only.py").read_text(
+            encoding="utf-8"
+        )
+        entrypoint = (
+            ROOT / "trading_lab" / "mt5_read_only_entrypoint.py"
+        ).read_text(encoding="utf-8")
+        harness = (
+            ROOT / "scripts" / "Test-MT5ReadOnlyPreflight.ps1"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(adapter)
+        entrypoint_tree = ast.parse(entrypoint)
+
+        forbidden_invocations = {
+            "login", "symbol_select", "market_book_add", "market_book_release",
+            "copy_ticks_from", "order_check", "order_send",
+        }
+        for source_tree, label in ((tree, "adapter"), (entrypoint_tree, "entrypoint")):
+            invoked_attributes = {
+                node.func.attr
+                for node in ast.walk(source_tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            }
+            self.assertTrue(
+                forbidden_invocations.isdisjoint(invoked_attributes),
+                f"forbidden MT5 invocation in {label}",
+            )
+
+        self.assertIn("class MT5ReadOnlyAdapter", adapter)
+        self.assertIn("class MT5ReadOnlyBindings", adapter)
+        self.assertIn('__slots__ = ("_bindings", "_ledger")', adapter)
+        self.assertIn('module = importlib.import_module("MetaTrader5")', adapter)
+        self.assertIn("bindings = _bindings_from_module(module)", adapter)
+        self.assertNotIn("self._mt5", adapter)
+        self.assertNotIn("getattr(", adapter)
+        for capability in (
+            "initialize", "version", "terminal_info", "account_info",
+            "symbol_info", "symbol_info_tick", "shutdown", "last_error",
+        ):
+            self.assertIn(f'"{capability}"', adapter)
+        for prohibited in forbidden_invocations:
+            self.assertNotIn(f"def {prohibited}(", adapter)
+            self.assertNotIn(f".{prohibited}(", adapter + entrypoint + harness)
+
+        self.assertIn("TradingMode.OBSERVE_ONLY", adapter)
+        self.assertIn("account.trade_mode) == adapter.demo_trade_mode", adapter)
+        self.assertIn("int(account.login) == config.authorized_account", adapter)
+        self.assertIn("str(account.server) == config.authorized_server", adapter)
+        self.assertIn("adapter.symbol_info(EXACT_SYMBOL)", adapter)
+        self.assertIn("adapter.symbol_info_tick(EXACT_SYMBOL)", adapter)
+        self.assertNotIn("GOLD", adapter + entrypoint + harness)
+        self.assertNotIn("XAUUSDm", adapter + entrypoint + harness)
+        self.assertIn("mt5_read_only_preflight_started", adapter)
+        self.assertIn("mt5_identity_verified", adapter)
+        self.assertIn("mt5_read_only_preflight_stopped", adapter)
+
+        for forbidden_harness in (
+            "runas.exe", "Start-Process", "Stop-Process", "taskkill",
+            "Set-Acl", "Invoke-WebRequest", "HttpClient", "0.0.0.0",
+            "import MetaTrader5", ".login(", ".symbol_select(",
+            ".order_check(", ".order_send(",
+        ):
+            self.assertNotIn(forbidden_harness, harness)
+        for required_harness in (
+            "S-1-5-21-568964486-193631783-1609210587-1007",
+            "C:\\automaton\\.venv\\Scripts\\python.exe",
+            "MT5_READ_ONLY_PREFLIGHT", "Get-FinalRuntimeFingerprint",
+            "$process.StandardOutput.ReadToEndAsync()",
+            "$process.StandardError.ReadToEndAsync()",
+            "$process.Kill()", "[System.IO.FileMode]::CreateNew",
+            "filesystem_runtime_modified", "acl_modified", "orphan_processes",
+        ):
+            self.assertIn(required_harness, harness)
+        self.assertNotRegex(harness, r"\.ReadToEnd\s*\(")
+        self.assertLess(
+            harness.index("$beforeFingerprint = Get-FinalRuntimeFingerprint"),
+            harness.index("if (-not $process.Start())"),
+        )
+        self.assertGreater(
+            harness.index("$afterFingerprint = Get-FinalRuntimeFingerprint"),
+            harness.index("# BEGIN_DURABLE_REPORT_FINALLY"),
+        )
+
     def test_machine_runtime_acl_resume_is_exact_target_and_dry_run_safe(self) -> None:
         installer = (ROOT / "scripts" / "Install-TradingLabPythonRuntime.ps1").read_text(
             encoding="utf-8"
