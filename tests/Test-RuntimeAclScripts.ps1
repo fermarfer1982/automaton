@@ -10,12 +10,14 @@ $pythonStagingOnlyPath = Join-Path $workspace 'scripts\Test-PythonStagingOnlyRun
 $pythonFinalOnlyPath = Join-Path $workspace 'scripts\Test-PythonFinalOnlyRuntimeAcl.ps1'
 $gatewayHealthOnlyPath = Join-Path $workspace 'scripts\Test-GatewayHealthOnly.ps1'
 $mt5ReadOnlyPath = Join-Path $workspace 'scripts\Test-MT5ReadOnlyPreflight.ps1'
+$mt5ReadOnlyAuthorizationPath = Join-Path $workspace 'scripts\New-MT5ReadOnlyAuthorization.ps1'
 $securityAppendOnlyPath = Join-Path $workspace 'scripts\Test-SecurityAppendOnly.ps1'
 $auditAppendOnlyPath = Join-Path $workspace 'scripts\Test-AuditJournalAppendOnly.ps1'
 $collectorPath = Join-Path $workspace 'scripts\Collect-RuntimeAclResults.ps1'
 $paths = @(
     $agentPath, $gatewayPath, $pythonBaseOnlyPath, $pythonStagingOnlyPath,
-    $pythonFinalOnlyPath, $mt5ReadOnlyPath, $securityAppendOnlyPath, $auditAppendOnlyPath,
+    $pythonFinalOnlyPath, $mt5ReadOnlyPath, $mt5ReadOnlyAuthorizationPath,
+    $securityAppendOnlyPath, $auditAppendOnlyPath,
     $collectorPath
 )
 
@@ -61,6 +63,7 @@ $healthAst = [System.Management.Automation.Language.Parser]::ParseFile(
 Assert-True ($healthParseErrors.Count -eq 0) 'Gateway health-only harness has AST errors.'
 $gatewayHealthOnly = [System.IO.File]::ReadAllText($gatewayHealthOnlyPath)
 $mt5ReadOnly = $sources[$mt5ReadOnlyPath]
+$mt5ReadOnlyAuthorization = $sources[$mt5ReadOnlyAuthorizationPath]
 $securityAppendOnly = $sources[$securityAppendOnlyPath]
 $auditAppendOnly = $sources[$auditAppendOnlyPath]
 
@@ -706,6 +709,38 @@ foreach ($forbiddenReadOnly in @(
 )) {
     Assert-True (-not $mt5ReadOnly.Contains($forbiddenReadOnly)) "MT5 read-only forbidden action: $forbiddenReadOnly"
 }
+foreach ($forbiddenAuthorization in @(
+    'Set-Acl', 'icacls', 'takeown', 'runas.exe', 'Start-Process',
+    'import MetaTrader5', '.initialize(', '.login(', '.symbol_select(',
+    '.order_check(', '.order_send(', 'DEMO_EXECUTION'
+)) {
+    Assert-True (-not $mt5ReadOnlyAuthorization.Contains($forbiddenAuthorization)) "MT5 authorization forbidden action: $forbiddenAuthorization"
+}
+foreach ($requiredAuthorization in @(
+    '#Requires -RunAsAdministrator',
+    '[Parameter(Mandatory = $true)]', '[string] $RunId',
+    "`$workspace = 'C:\automaton'",
+    "`$configPath = 'C:\ProgramData\AutomatonMT5Lab\control\trading.yaml'",
+    "`$authorizationRoot = 'C:\ProgramData\AutomatonMT5Lab\control\demo-authorization'",
+    'mt5-read-only-authorization-$normalizedRunId.json',
+    '[System.IO.FileMode]::CreateNew', 'Get-LocalUser -Name',
+    "'S-1-5-32-544'", 'Get-LocalGroupMember',
+    'status --porcelain=v1 --untracked-files=all',
+    '-m trading_lab.mt5_read_only_authorization render',
+    '-m trading_lab.mt5_read_only_authorization verify-artifact',
+    'AUTHORIZATION_LIFETIME_MINUTES=15', 'TRADING_MODE=OBSERVE_ONLY'
+)) {
+    Assert-True ($mt5ReadOnlyAuthorization.Contains($requiredAuthorization)) "MT5 authorization invariant missing: $requiredAuthorization"
+}
+$authorizationTokens = $null
+$authorizationParseErrors = $null
+$authorizationAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    $mt5ReadOnlyAuthorizationPath,
+    [ref]$authorizationTokens,
+    [ref]$authorizationParseErrors
+)
+Assert-True ($authorizationParseErrors.Count -eq 0) 'MT5 authorization script has AST errors.'
+Assert-True ($authorizationAst.ParamBlock.Parameters.Count -eq 1) 'MT5 authorization script must accept only RunId.'
 foreach ($requiredReadOnly in @(
     "`$expectedGatewaySid = 'S-1-5-21-568964486-193631783-1609210587-1007'",
     "`$finalRoot = 'C:\automaton\.venv'",
@@ -725,7 +760,13 @@ foreach ($requiredReadOnly in @(
     '$process.StandardError.ReadToEndAsync()',
     'Receive-PreflightStreamCapture', 'Get-SanitizedBoundedProcessText',
     'Test-PreflightChildBoundary', 'Copy-PreflightEvidence',
-    'mt5_initialize_called', 'mt5_initialize_result', 'mt5_shutdown_called',
+    'mt5_initialize_called', 'mt5_initialize_result', 'mt5_initialize_succeeded',
+    'mt5_shutdown_called', 'kill_switch_readable', 'authorization_required',
+    'authorization_present', 'authorization_valid', 'authorization_id',
+    'authorization_run_id_match', 'authorization_not_expired',
+    'authorization_issuer_match', 'authorization_gateway_sid_match',
+    'authorization_config_hash_match', 'authorization_code_hash_match',
+    'mt5-read-only-authorization-$normalizedRunId.json',
     'account_login_match', 'account_server_match', 'account_demo_verified',
     'symbol_info_read', 'tick_read', 'audit_chain_valid',
     'unexpected_capability_called', 'order_check_called', 'order_send_called',
@@ -779,10 +820,17 @@ $validReadOnlyChild = [pscustomobject]@{
     effective_sid = $expectedGatewaySid; status = 'PASS'; python_executable = $pythonExecutable
     trading_mode = 'OBSERVE_ONLY'; mt5_package_version = '5.0.6090'
     mt5_imported = $true; mt5_initialize_called = $true; mt5_initialize_result = $true
+    mt5_initialize_succeeded = $true
     mt5_accessed = $true; mt5_shutdown_called = $true; terminal_connected = $true
     terminal_path_match = $true; account_info_read = $true; account_login_match = $true
     account_server_match = $true; account_demo_verified = $true; symbol = 'XAUUSD'
     symbol_info_read = $true; symbol_exists = $true; tick_read = $true; audit_chain_valid = $true
+    kill_switch_present = $false; kill_switch_readable = $null
+    authorization_required = $true; authorization_present = $true; authorization_valid = $true
+    authorization_id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+    authorization_run_id_match = $true; authorization_not_expired = $true
+    authorization_issuer_match = $true; authorization_gateway_sid_match = $true
+    authorization_config_hash_match = $true; authorization_code_hash_match = $true
     unexpected_capability_called = $false; order_check_called = $false
     order_send_called = $false; login_called = $false; symbol_select_called = $false
     market_book_add_called = $false; market_book_release_called = $false

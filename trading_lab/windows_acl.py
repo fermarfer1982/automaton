@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -42,6 +44,7 @@ KNOWN_TARGET_KEYS = frozenset({
     "control_demo_authorization_file",
     "control_directory",
     "control_kill_switch",
+    "control_mt5_read_only_authorization_file",
     "gateway_logs",
     "ipc_directory",
     "ipc_key",
@@ -213,6 +216,9 @@ def _targets(
     config_path: Path,
     config: GatewayBootstrapConfig | SecurityConfig,
     include_automaton_state: bool,
+    *,
+    kill_switch_present: bool,
+    read_only_authorization_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     workspace = Path(__file__).resolve().parents[1]
     if any(item is None for item in (
@@ -240,10 +246,29 @@ def _targets(
         (config.security_log_dir / "security.log", "security_log_file", "append_file", False, True),  # type: ignore[operator]
         (workspace, "workspace_code", "workspace_code", True, True),
     ]
-    if config.kill_switch_path.exists():
+    if kill_switch_present:
         raw.append((config.kill_switch_path, "control_kill_switch", "control_file", False, True))
     if config.demo_authorization_path.exists():
         raw.append((config.demo_authorization_path, "control_demo_authorization_file", "control_file", False, True))
+    if read_only_authorization_path is not None:
+        authorization_path = Path(os.path.abspath(read_only_authorization_path))
+        authorization_root = Path(os.path.abspath(config.demo_authorization_path.parent))
+        if (
+            authorization_path.parent != authorization_root
+            or not re.fullmatch(
+                r"mt5-read-only-authorization-[0-9a-f]{8}-[0-9a-f]{4}-"
+                r"[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json",
+                authorization_path.name,
+            )
+        ):
+            raise ValueError("MT5 read-only authorization path is outside the protected domain")
+        raw.append((
+            authorization_path,
+            "control_mt5_read_only_authorization_file",
+            "control_file",
+            False,
+            True,
+        ))
     for relative in (
         "trading_lab", "config", "src/trading", "src/index.ts", "src/config.ts",
         "src/agent/loop.ts", "src/agent/tools.ts", "src/conway/inference.ts",
@@ -268,9 +293,13 @@ def _targets(
         raw.append((config.automaton_state_dir, "automaton_state", "automaton_state", True, True))
     deduplicated: dict[tuple[str, str], dict[str, Any]] = {}
     for path, policy_key, role, is_directory, require_protected in raw:
-        key = (str(path.resolve()), role)
+        # Never resolve security targets through a symlink/junction before the
+        # PowerShell probe sees them.  The probe must inspect the asserted path
+        # itself so a reparse point cannot be laundered into its destination.
+        asserted_path = str(Path(os.path.abspath(path)))
+        key = (os.path.normcase(asserted_path), role)
         deduplicated[key] = {
-            "path": str(path.resolve()),
+            "path": asserted_path,
             "policy_key": policy_key,
             "role": role,
             "is_directory": is_directory,
@@ -487,17 +516,34 @@ def verify_windows_acl(
     *,
     include_automaton_state: bool = True,
     require_current_gateway: bool = False,
+    kill_switch_present: bool | None = None,
+    read_only_authorization_path: Path | None = None,
 ) -> AclVerification:
     powershell = shutil.which("powershell.exe") or shutil.which("powershell")
     if powershell is None:
         return AclVerification(False, "PowerShell is unavailable for Windows ACL verification")
     try:
+        if kill_switch_present is None:
+            # Security callers must never infer absence through Path.exists(),
+            # which collapses AccessDenied and some I/O failures into False.
+            from .mt5_read_only_controls import KillSwitchState, probe_kill_switch
+
+            kill_switch_present = (
+                probe_kill_switch(config.kill_switch_path)
+                is KillSwitchState.PRESENT_READABLE
+            )
         policy = load_windows_acl_policy()
         request = {
             "gateway_identity": config.gateway_windows_identity,
             "automaton_identity": config.automaton_windows_identity,
             "maintenance_identity": policy.maintenance_identity,
-            "targets": _targets(Path(config_path), config, include_automaton_state),
+            "targets": _targets(
+                Path(config_path),
+                config,
+                include_automaton_state,
+                kill_switch_present=kill_switch_present,
+                read_only_authorization_path=read_only_authorization_path,
+            ),
         }
         completed = subprocess.run(
             [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", _ACL_PROBE],
@@ -519,5 +565,12 @@ def verify_windows_acl(
             maintenance_policy=policy,
             require_current_gateway=require_current_gateway,
         )
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, TypeError, ValueError):
+    except (
+        OSError,
+        RuntimeError,
+        subprocess.TimeoutExpired,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ):
         return AclVerification(False, "Windows ACL verification failed closed")

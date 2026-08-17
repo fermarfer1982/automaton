@@ -27,6 +27,7 @@ Este perfil es un laboratorio aislado y *fail-closed*. No hereda las capacidades
 21. **S21 — Perfil sin capacidades externas.** Shell, instalaciones, pagos, wallet, replicación, social, orquestación y `git push` quedan fuera del allowlist.
 22. **S22 — ACL por dominio.** No existe un árbol global de datos Gateway con `Modify`; control/IPC son read-only, SQLite se reconoce mutable y journal/security log usan privilegio append propuesto pendiente de validación real post-apply.
 23. **S23 — Acceso MT5 explícito.** `MT5_ACCESS_ENABLED` es un control protegido e independiente de `TRADING_MODE`, con valor predeterminado `false`. Mientras esté deshabilitado, el proceso no importa ni accede a MetaTrader5 y solo expone salud autenticada; el entorno puede restringir el valor protegido, pero nunca habilitarlo.
+24. **S24 — Diagnóstico MT5 autorizado por ejecución.** El preflight read-only no habilita MT5 en el Gateway normal. Solo puede llamar a `initialize(path=...)` en `OBSERVE_ONLY` cuando un administrador humano canónico haya creado una autorización protegida, no expirada y ligada exactamente al `RunId`, cuenta, servidor, símbolo, terminal, commit y hashes de código/configuración. La variable `MT5_READ_ONLY_PREFLIGHT=true` solo selecciona el modo del proceso y nunca constituye autorización.
 
 ## Pruebas que sostienen el límite
 

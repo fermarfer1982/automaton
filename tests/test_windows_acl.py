@@ -295,6 +295,31 @@ class WindowsAclTests(unittest.TestCase):
             snapshot["targets"][2]["rules"][2] = rule(GATEWAY, unsafe)  # type: ignore[index]
             self.assertFalse(verify(snapshot).passed)
 
+    def test_mt5_read_only_authorization_file_is_exact_read_only_and_agent_denied(self) -> None:
+        authorization = target(
+            "C:/control/demo-authorization/mt5-read-only-authorization-id.json",
+            "control_mt5_read_only_authorization_file",
+            "control_file",
+            GATEWAY,
+            READ_RIGHTS,
+            is_directory=False,
+        )
+        snapshot = safe_snapshot()
+        snapshot["targets"].append(authorization)  # type: ignore[union-attr]
+        self.assertTrue(verify(snapshot).passed)
+
+        writable = copy.deepcopy(snapshot)
+        writable["targets"][-1]["rules"][2] = rule(GATEWAY, MODIFY_RIGHTS)  # type: ignore[index]
+        self.assertFalse(verify(writable).passed)
+
+        agent_readable = copy.deepcopy(snapshot)
+        agent_readable["targets"][-1]["rules"].append(rule(AGENT, READ_RIGHTS))  # type: ignore[index,union-attr]
+        self.assertFalse(verify(agent_readable).passed)
+
+        reparse = copy.deepcopy(snapshot)
+        reparse["targets"][-1]["reparse"] = True  # type: ignore[index]
+        self.assertFalse(verify(reparse).passed)
+
     def test_rejects_ipc_key_write_delete_or_execute(self) -> None:
         for unsafe in (MODIFY_RIGHTS, READ_RIGHTS | 32, READ_RIGHTS | 65536):
             snapshot = safe_snapshot()

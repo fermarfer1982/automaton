@@ -782,14 +782,30 @@ class SourceBoundaryTests(unittest.TestCase):
         harness = (
             ROOT / "scripts" / "Test-MT5ReadOnlyPreflight.ps1"
         ).read_text(encoding="utf-8")
+        controls = (
+            ROOT / "trading_lab" / "mt5_read_only_controls.py"
+        ).read_text(encoding="utf-8")
+        authorization_helper = (
+            ROOT / "trading_lab" / "mt5_read_only_authorization.py"
+        ).read_text(encoding="utf-8")
+        authorization_script = (
+            ROOT / "scripts" / "New-MT5ReadOnlyAuthorization.ps1"
+        ).read_text(encoding="utf-8")
         tree = ast.parse(adapter)
         entrypoint_tree = ast.parse(entrypoint)
+        controls_tree = ast.parse(controls)
+        authorization_tree = ast.parse(authorization_helper)
 
         forbidden_invocations = {
             "login", "symbol_select", "market_book_add", "market_book_release",
             "copy_ticks_from", "order_check", "order_send",
         }
-        for source_tree, label in ((tree, "adapter"), (entrypoint_tree, "entrypoint")):
+        for source_tree, label in (
+            (tree, "adapter"),
+            (entrypoint_tree, "entrypoint"),
+            (controls_tree, "controls"),
+            (authorization_tree, "authorization"),
+        ):
             invoked_attributes = {
                 node.func.attr
                 for node in ast.walk(source_tree)
@@ -827,6 +843,17 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn("mt5_read_only_preflight_started", adapter)
         self.assertIn("mt5_identity_verified", adapter)
         self.assertIn("mt5_read_only_preflight_stopped", adapter)
+        self.assertIn("mt5_read_only_authorization_accepted", adapter)
+        self.assertIn("probe_kill_switch", controls)
+        self.assertNotIn("initialized_attempted", adapter)
+        self.assertIn("if adapter is not None and mt5_initialize_succeeded:", adapter)
+        for binding in (
+            "purpose", "run_id", "authorization_id", "issued_at_utc",
+            "expires_at_utc", "issuer_sid", "gateway_sid", "authorized_account",
+            "authorized_server", "authorized_symbol", "terminal_path", "git_commit",
+            "config_sha256", "entrypoint_sha256", "runner_sha256", "harness_sha256",
+        ):
+            self.assertIn(binding, controls)
 
         for forbidden_harness in (
             "runas.exe", "Start-Process", "Stop-Process", "taskkill",
@@ -835,6 +862,21 @@ class SourceBoundaryTests(unittest.TestCase):
             ".order_check(", ".order_send(",
         ):
             self.assertNotIn(forbidden_harness, harness)
+        for forbidden_authorization in (
+            "Set-Acl", "icacls", "takeown", "runas.exe", "Start-Process",
+            "import MetaTrader5", ".initialize(", ".login(", ".symbol_select(",
+            ".order_check(", ".order_send(", "DEMO_EXECUTION",
+        ):
+            self.assertNotIn(forbidden_authorization, authorization_script)
+        self.assertIn("[System.IO.FileMode]::CreateNew", authorization_script)
+        self.assertIn("Get-LocalUser -Name", authorization_script)
+        self.assertIn("S-1-5-32-544", authorization_script)
+        self.assertIn("status --porcelain=v1 --untracked-files=all", authorization_script)
+        self.assertIn("AUTHORIZATION_LIFETIME_MINUTES=15", authorization_script)
+        self.assertIn(
+            "mt5-read-only-authorization-$normalizedRunId.json",
+            authorization_script,
+        )
         for required_harness in (
             "S-1-5-21-568964486-193631783-1609210587-1007",
             "C:\\automaton\\.venv\\Scripts\\python.exe",
@@ -843,6 +885,12 @@ class SourceBoundaryTests(unittest.TestCase):
             "$process.StandardError.ReadToEndAsync()",
             "$process.Kill()", "[System.IO.FileMode]::CreateNew",
             "filesystem_runtime_modified", "acl_modified", "orphan_processes",
+            "authorization_required", "authorization_present", "authorization_valid",
+            "authorization_run_id_match", "authorization_not_expired",
+            "authorization_issuer_match", "authorization_gateway_sid_match",
+            "authorization_config_hash_match", "authorization_code_hash_match",
+            "kill_switch_readable", "mt5_initialize_succeeded",
+            "mt5-read-only-authorization-$normalizedRunId.json",
         ):
             self.assertIn(required_harness, harness)
         self.assertNotRegex(harness, r"\.ReadToEnd\s*\(")

@@ -16,6 +16,8 @@ $workspace = 'C:\automaton'
 $finalRoot = 'C:\automaton\.venv'
 $pythonExecutable = 'C:\automaton\.venv\Scripts\python.exe'
 $configPath = 'C:\ProgramData\AutomatonMT5Lab\control\trading.yaml'
+$authorizationRoot = 'C:\ProgramData\AutomatonMT5Lab\control\demo-authorization'
+$authorizationPath = Join-Path $authorizationRoot "mt5-read-only-authorization-$normalizedRunId.json"
 $operationalRoot = 'C:\ProgramData\AutomatonMT5Lab\operational'
 $runtimeTemp = Join-Path $operationalRoot 'runtime-tmp'
 $reportRoot = Join-Path $operationalRoot 'mt5-read-only-results'
@@ -39,6 +41,7 @@ $report = [ordered]@{
     mt5_imported = $false
     mt5_initialize_called = $false
     mt5_initialize_result = $false
+    mt5_initialize_succeeded = $false
     mt5_accessed = $false
     mt5_shutdown_called = $false
     terminal_connected = $false
@@ -62,6 +65,17 @@ $report = [ordered]@{
     ask = $null
     spread = $null
     kill_switch_present = $false
+    kill_switch_readable = $null
+    authorization_required = $true
+    authorization_present = $false
+    authorization_valid = $false
+    authorization_id = $null
+    authorization_run_id_match = $false
+    authorization_not_expired = $false
+    authorization_issuer_match = $false
+    authorization_gateway_sid_match = $false
+    authorization_config_hash_match = $false
+    authorization_code_hash_match = $false
     audit_chain_valid = $false
     audit_events_recorded = @()
     unexpected_capability_called = $false
@@ -288,13 +302,19 @@ function Copy-PreflightEvidence([object] $Child, [System.Collections.IDictionary
     $fields = @(
         'effective_sid', 'status', 'failure_code', 'failure_stage', 'runtime_error',
         'python_executable', 'trading_mode', 'mt5_package_version', 'mt5_terminal_version',
-        'mt5_imported', 'mt5_initialize_called', 'mt5_initialize_result', 'mt5_accessed',
+        'mt5_imported', 'mt5_initialize_called', 'mt5_initialize_result',
+        'mt5_initialize_succeeded', 'mt5_accessed',
         'mt5_shutdown_called', 'terminal_connected', 'terminal_trade_allowed',
         'terminal_path_match', 'account_info_read', 'account_login_match',
         'account_server_match', 'account_name_match', 'account_trade_mode',
         'account_demo_verified', 'symbol', 'symbol_info_read', 'symbol_exists',
         'symbol_digits', 'symbol_trade_tick_size', 'symbol_trade_mode', 'tick_read',
-        'tick_time', 'bid', 'ask', 'spread', 'kill_switch_present', 'audit_chain_valid',
+        'tick_time', 'bid', 'ask', 'spread', 'kill_switch_present',
+        'kill_switch_readable', 'authorization_required', 'authorization_present',
+        'authorization_valid', 'authorization_id', 'authorization_run_id_match',
+        'authorization_not_expired', 'authorization_issuer_match',
+        'authorization_gateway_sid_match', 'authorization_config_hash_match',
+        'authorization_code_hash_match', 'audit_chain_valid',
         'audit_events_recorded', 'unexpected_capability_called', 'order_check_called',
         'order_send_called', 'login_called', 'symbol_select_called',
         'market_book_add_called', 'market_book_release_called', 'copy_ticks_from_called',
@@ -323,6 +343,7 @@ function Test-PreflightChildBoundary([object] $Child) {
             [bool]$Child.mt5_imported -and
             [bool]$Child.mt5_initialize_called -and
             [bool]$Child.mt5_initialize_result -and
+            [bool]$Child.mt5_initialize_succeeded -and
             [bool]$Child.mt5_accessed -and
             [bool]$Child.mt5_shutdown_called -and
             [bool]$Child.terminal_connected -and
@@ -334,6 +355,18 @@ function Test-PreflightChildBoundary([object] $Child) {
             $Child.symbol -eq 'XAUUSD' -and
             [bool]$Child.symbol_info_read -and [bool]$Child.symbol_exists -and
             [bool]$Child.tick_read -and [bool]$Child.audit_chain_valid -and
+            [bool]$Child.authorization_required -and
+            [bool]$Child.authorization_present -and
+            [bool]$Child.authorization_valid -and
+            -not [string]::IsNullOrWhiteSpace([string]$Child.authorization_id) -and
+            [bool]$Child.authorization_run_id_match -and
+            [bool]$Child.authorization_not_expired -and
+            [bool]$Child.authorization_issuer_match -and
+            [bool]$Child.authorization_gateway_sid_match -and
+            [bool]$Child.authorization_config_hash_match -and
+            [bool]$Child.authorization_code_hash_match -and
+            (([bool]$Child.kill_switch_present -and [bool]$Child.kill_switch_readable) -or
+             (-not [bool]$Child.kill_switch_present -and $null -eq $Child.kill_switch_readable)) -and
             -not [bool]$Child.unexpected_capability_called -and
             -not [bool]$Child.order_check_called -and
             -not [bool]$Child.order_send_called -and
@@ -371,10 +404,17 @@ try {
     if (-not (Test-ExactPath $pythonExecutable 'C:\automaton\.venv\Scripts\python.exe')) {
         throw 'FINAL_PYTHON_EXACT=FAIL'
     }
-    foreach ($requiredDirectory in @($workspace, $finalRoot, $operationalRoot, $runtimeTemp)) {
+    foreach ($requiredDirectory in @(
+        $workspace, $finalRoot, $authorizationRoot, $operationalRoot, $runtimeTemp
+    )) {
         Assert-NoReparsePoint $requiredDirectory $true
     }
-    foreach ($requiredFile in @($pythonExecutable, $configPath)) {
+    Assert-PathConfined $authorizationPath $authorizationRoot
+    if (-not (Get-CanonicalPath $authorizationPath).Equals(
+        (Get-CanonicalPath (Join-Path $authorizationRoot "mt5-read-only-authorization-$normalizedRunId.json")),
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) { throw 'MT5_READ_ONLY_AUTHORIZATION_PATH_EXACT=FAIL' }
+    foreach ($requiredFile in @($pythonExecutable, $configPath, $authorizationPath)) {
         Assert-NoReparsePoint $requiredFile $false
     }
     if (-not [System.IO.Directory]::Exists($reportRoot)) {

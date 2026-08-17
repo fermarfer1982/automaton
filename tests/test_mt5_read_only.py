@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -21,10 +23,23 @@ from trading_lab.mt5_read_only import (
     execute_mt5_read_only_preflight,
     load_mt5_read_only_adapter,
 )
+from trading_lab.mt5_read_only_controls import (
+    KillSwitchState,
+    MT5ReadOnlyControlError,
+    ReadOnlyAuthorizationFile,
+    authorization_path,
+    probe_kill_switch,
+    render_authorization,
+)
 from trading_lab.windows_acl import AclVerification
 
 
 GATEWAY_SID = "S-1-5-21-1-2-3-1007"
+MAINTENANCE_SID = "S-1-5-21-1-2-3-1008"
+RUN_ID = "11111111-2222-4333-8444-555555555555"
+AUTHORIZATION_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+NOW = datetime(2026, 8, 17, 12, 0, tzinfo=UTC)
+WORKSPACE = Path(__file__).resolve().parents[1]
 
 
 class FakeMT5Module:
@@ -112,28 +127,72 @@ class MT5ReadOnlyPreflightTests(unittest.TestCase):
             security_config(self.root),
             authorized_account_name="Authorized Demo",
             mt5_access_enabled=False,
+            demo_authorization_path=(
+                self.root / "control" / "demo-authorization" / "authorization.json"
+            ),
+            kill_switch_path=self.root / "control" / "STOP_TRADING",
         )
         self.config.mt5_terminal_path.write_bytes(b"test terminal placeholder")
         self.module = FakeMT5Module(self.root)
+        self.authorization = render_authorization(
+            config=self.config,
+            config_path=self.config_path,
+            workspace=WORKSPACE,
+            run_id=RUN_ID,
+            authorization_id=AUTHORIZATION_ID,
+            issuer_sid=MAINTENANCE_SID,
+            gateway_sid=GATEWAY_SID,
+            issued_at=NOW,
+        )
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def run_preflight(self, *, adapter: MT5ReadOnlyAdapter | None = None, config=None):
+    def authorization_reader(self, path: Path) -> ReadOnlyAuthorizationFile:
+        content = json.dumps(
+            self.authorization, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return ReadOnlyAuthorizationFile(
+            path=path,
+            content=content,
+            sha256=hashlib.sha256(content).hexdigest(),
+        )
+
+    def run_preflight(
+        self,
+        *,
+        adapter: MT5ReadOnlyAdapter | None = None,
+        config=None,
+        acl_verifier=None,
+        authorization_reader=None,
+        kill_switch_probe=None,
+        audit_factory=None,
+        now: datetime = NOW + timedelta(minutes=1),
+    ):
         selected_config = self.config if config is None else config
         selected_adapter = adapter_for(self.module) if adapter is None else adapter
-        return execute_mt5_read_only_preflight(
-            self.config_path,
-            "11111111-2222-4333-8444-555555555555",
-            config_loader=lambda _path: selected_config,
-            acl_verifier=lambda *_args, **_kwargs: AclVerification(
+        kwargs = {
+            "config_loader": lambda _path: selected_config,
+            "acl_verifier": acl_verifier or (lambda *_args, **_kwargs: AclVerification(
                 True,
                 "strict",
                 gateway_sid=GATEWAY_SID,
                 current_sid=GATEWAY_SID,
-            ),
-            adapter_loader=lambda: selected_adapter,
-            package_version_provider=lambda: "5.0.6090",
+                maintenance_sid=MAINTENANCE_SID,
+            )),
+            "adapter_loader": lambda: selected_adapter,
+            "package_version_provider": lambda: "5.0.6090",
+            "authorization_reader": authorization_reader or self.authorization_reader,
+            "now_provider": lambda: now,
+        }
+        if kill_switch_probe is not None:
+            kwargs["kill_switch_probe"] = kill_switch_probe
+        if audit_factory is not None:
+            kwargs["audit_factory"] = audit_factory
+        return execute_mt5_read_only_preflight(
+            self.config_path,
+            RUN_ID,
+            **kwargs,
         )
 
     def test_exact_account_server_demo_terminal_and_xauusd_pass(self) -> None:
@@ -154,6 +213,11 @@ class MT5ReadOnlyPreflightTests(unittest.TestCase):
         self.assertEqual(0.01, report["symbol_trade_tick_size"])
         self.assertAlmostEqual(0.10, report["spread"])
         self.assertTrue(report["mt5_shutdown_called"])
+        self.assertTrue(report["mt5_initialize_succeeded"])
+        self.assertTrue(report["authorization_required"])
+        self.assertTrue(report["authorization_present"])
+        self.assertTrue(report["authorization_valid"])
+        self.assertEqual(AUTHORIZATION_ID, report["authorization_id"])
         self.assertTrue(report["process_stopped_cleanly"])
         self.assertTrue(report["audit_chain_valid"])
         self.assertFalse(report["order_check_called"])
@@ -163,6 +227,7 @@ class MT5ReadOnlyPreflightTests(unittest.TestCase):
         self.assertEqual(
             [
                 "mt5_read_only_preflight_started",
+                "mt5_read_only_authorization_accepted",
                 "mt5_identity_verified",
                 "mt5_read_only_preflight_stopped",
             ],
@@ -197,15 +262,17 @@ class MT5ReadOnlyPreflightTests(unittest.TestCase):
                 self.assertFalse(report["order_send_called"])
                 self.module = FakeMT5Module(self.root)
 
-    def test_initialize_false_still_calls_last_error_and_shutdown(self) -> None:
+    def test_initialize_false_calls_last_error_but_not_shutdown(self) -> None:
         self.module.initialize_result = False
         report = self.run_preflight()
         self.assertEqual("FAIL", report["status"])
         self.assertEqual("MT5_READ_ONLY_INITIALIZE_FAILED", report["failure_code"])
-        self.assertEqual(["initialize", "last_error", "shutdown"], [
+        self.assertEqual(["initialize", "last_error"], [
             call[0] for call in self.module.calls
         ])
-        self.assertTrue(report["mt5_shutdown_called"])
+        self.assertTrue(report["mt5_initialize_called"])
+        self.assertFalse(report["mt5_initialize_succeeded"])
+        self.assertFalse(report["mt5_shutdown_called"])
 
     def test_missing_read_payloads_fail_and_shutdown(self) -> None:
         cases = (
@@ -240,6 +307,7 @@ class MT5ReadOnlyPreflightTests(unittest.TestCase):
             "11111111-2222-4333-8444-555555555555",
             config_loader=lambda _path: self.config,
             acl_verifier=lambda *_args, **_kwargs: AclVerification(False, "unsafe"),
+            authorization_reader=self.authorization_reader,
             adapter_loader=loader,
             package_version_provider=lambda: "5.0.6090",
         )
@@ -283,7 +351,8 @@ class MT5ReadOnlyPreflightTests(unittest.TestCase):
         self.assertEqual("MT5_READ_ONLY_UNEXPECTED_CAPABILITY", report["failure_code"])
         self.assertTrue(report["unexpected_capability_called"])
         self.assertTrue(report["login_called"])
-        self.assertTrue(report["mt5_shutdown_called"])
+        self.assertFalse(report["mt5_initialize_succeeded"])
+        self.assertFalse(report["mt5_shutdown_called"])
 
     def test_runtime_error_redacts_credentials(self) -> None:
         secret_error = RuntimeError(
@@ -296,6 +365,9 @@ class MT5ReadOnlyPreflightTests(unittest.TestCase):
             self.assertNotIn(secret, serialized)
         self.assertNotIn("Authorized Demo", serialized)
         self.assertIn("[REDACTED]", report["runtime_error"])
+        self.assertTrue(report["mt5_initialize_called"])
+        self.assertFalse(report["mt5_initialize_succeeded"])
+        self.assertFalse(report["mt5_shutdown_called"])
 
     def test_audit_failure_prevents_mt5_import(self) -> None:
         class BrokenAudit:
@@ -311,8 +383,13 @@ class MT5ReadOnlyPreflightTests(unittest.TestCase):
             "11111111-2222-4333-8444-555555555555",
             config_loader=lambda _path: self.config,
             acl_verifier=lambda *_args, **_kwargs: AclVerification(
-                True, "strict", gateway_sid=GATEWAY_SID, current_sid=GATEWAY_SID
+                True,
+                "strict",
+                gateway_sid=GATEWAY_SID,
+                current_sid=GATEWAY_SID,
+                maintenance_sid=MAINTENANCE_SID,
             ),
+            authorization_reader=self.authorization_reader,
             adapter_loader=loader,
             package_version_provider=lambda: "5.0.6090",
             audit_factory=lambda _config: BrokenAudit(),
@@ -325,7 +402,7 @@ class MT5ReadOnlyPreflightTests(unittest.TestCase):
         report = self.run_preflight()
         verification = HashChainAuditLog(self.config.audit_path).verify()
         self.assertTrue(verification.valid)
-        self.assertEqual(3, verification.records)
+        self.assertEqual(4, verification.records)
         text = self.config.audit_path.read_text(encoding="utf-8")
         self.assertNotIn(str(self.config.authorized_account), text)
         self.assertNotIn(self.config.authorized_server, text)
@@ -338,6 +415,220 @@ class MT5ReadOnlyPreflightTests(unittest.TestCase):
         report = self.run_preflight()
         self.assertEqual("PASS", report["status"])
         self.assertTrue(report["kill_switch_present"])
+        self.assertTrue(report["kill_switch_readable"])
+
+    def test_kill_switch_absence_is_explicit_and_acl_receives_authoritative_state(self) -> None:
+        observed: dict[str, object] = {}
+
+        def verifier(*_args, **kwargs):
+            observed.update(kwargs)
+            return AclVerification(
+                True,
+                "strict",
+                gateway_sid=GATEWAY_SID,
+                current_sid=GATEWAY_SID,
+                maintenance_sid=MAINTENANCE_SID,
+            )
+
+        report = self.run_preflight(acl_verifier=verifier)
+        self.assertEqual("PASS", report["status"])
+        self.assertFalse(report["kill_switch_present"])
+        self.assertIsNone(report["kill_switch_readable"])
+        self.assertIs(observed["kill_switch_present"], False)
+        self.assertEqual(
+            authorization_path(self.config, RUN_ID),
+            observed["read_only_authorization_path"],
+        )
+
+    def test_kill_switch_probe_distinguishes_absent_present_and_reparse(self) -> None:
+        self.assertIs(KillSwitchState.ABSENT, probe_kill_switch(self.config.kill_switch_path))
+        self.config.kill_switch_path.parent.mkdir(parents=True, exist_ok=True)
+        self.config.kill_switch_path.write_bytes(b"")
+        self.assertIs(
+            KillSwitchState.PRESENT_READABLE,
+            probe_kill_switch(self.config.kill_switch_path),
+        )
+        self.config.kill_switch_path.unlink()
+        link_target = self.config.kill_switch_path.parent / "target"
+        link_target.write_text("stop", encoding="ascii")
+        try:
+            self.config.kill_switch_path.symlink_to(link_target)
+        except OSError:
+            self.skipTest("symlink creation is unavailable")
+        with self.assertRaises(MT5ReadOnlyControlError) as raised:
+            probe_kill_switch(self.config.kill_switch_path)
+        self.assertEqual("KILL_SWITCH_UNREADABLE", raised.exception.code)
+
+    def test_kill_switch_access_or_io_error_never_becomes_absent(self) -> None:
+        loader = Mock()
+        for error in (PermissionError("denied"), OSError("device error")):
+            with self.subTest(error=type(error).__name__):
+                probe = Mock(side_effect=MT5ReadOnlyControlError(
+                    "KILL_SWITCH_UNREADABLE", "KILL_SWITCH", str(error)
+                ))
+                report = execute_mt5_read_only_preflight(
+                    self.config_path,
+                    RUN_ID,
+                    config_loader=lambda _path: self.config,
+                    kill_switch_probe=probe,
+                    adapter_loader=loader,
+                )
+                self.assertEqual("KILL_SWITCH_UNREADABLE", report["failure_code"])
+                self.assertFalse(report["mt5_initialize_called"])
+        loader.assert_not_called()
+
+    def test_unknown_kill_switch_state_and_acl_failure_block_initialize(self) -> None:
+        loader = Mock()
+        report = execute_mt5_read_only_preflight(
+            self.config_path,
+            RUN_ID,
+            config_loader=lambda _path: self.config,
+            kill_switch_probe=lambda _path: "UNKNOWN",
+            adapter_loader=loader,
+        )
+        self.assertEqual("KILL_SWITCH_UNREADABLE", report["failure_code"])
+        loader.assert_not_called()
+        report = self.run_preflight(
+            acl_verifier=lambda *_args, **_kwargs: AclVerification(False, "unsafe")
+        )
+        self.assertEqual("MT5_READ_ONLY_ACL_FAILED", report["failure_code"])
+        self.assertFalse(report["mt5_initialize_called"])
+
+    def test_authorization_missing_even_with_environment_gate_blocks_initialize(self) -> None:
+        loader = Mock()
+
+        def missing(_path):
+            raise MT5ReadOnlyControlError(
+                "MT5_READ_ONLY_AUTHORIZATION_MISSING",
+                "AUTHORIZATION_FILE",
+                "missing",
+            )
+
+        with patch.dict("os.environ", {"MT5_READ_ONLY_PREFLIGHT": "true"}):
+            report = execute_mt5_read_only_preflight(
+                self.config_path,
+                RUN_ID,
+                config_loader=lambda _path: self.config,
+                authorization_reader=missing,
+                adapter_loader=loader,
+            )
+        self.assertEqual("MT5_READ_ONLY_AUTHORIZATION_MISSING", report["failure_code"])
+        self.assertFalse(report["authorization_present"])
+        self.assertFalse(report["mt5_initialize_called"])
+        loader.assert_not_called()
+
+    def test_authorization_exact_binding_mismatches_fail_before_initialize(self) -> None:
+        cases = (
+            ("purpose", "OTHER"),
+            ("run_id", "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"),
+            ("issuer_sid", "S-1-5-21-9-9-9-1000"),
+            ("gateway_sid", "S-1-5-21-9-9-9-1001"),
+            ("authorized_account", 98765432),
+            ("authorized_server", "Other-Demo"),
+            ("authorized_symbol", "XAUUSDm"),
+            ("terminal_path", str(self.root / "other" / "terminal64.exe")),
+            ("git_commit", "0" * 40),
+            ("config_sha256", "0" * 64),
+            ("runner_sha256", "0" * 64),
+            ("harness_sha256", "0" * 64),
+        )
+        original = dict(self.authorization)
+        for field, value in cases:
+            with self.subTest(field=field):
+                self.authorization = {**original, field: value}
+                report = self.run_preflight()
+                self.assertEqual("FAIL", report["status"])
+                self.assertEqual(
+                    "MT5_READ_ONLY_AUTHORIZATION_INVALID", report["failure_code"]
+                )
+                self.assertFalse(report["authorization_valid"])
+                self.assertFalse(report["mt5_initialize_called"])
+                self.assertEqual([], self.module.calls)
+        self.authorization = original
+
+    def test_authorization_expired_or_future_fails_before_initialize(self) -> None:
+        expired = self.run_preflight(now=NOW + timedelta(minutes=16))
+        self.assertEqual("MT5_READ_ONLY_AUTHORIZATION_INVALID", expired["failure_code"])
+        self.assertFalse(expired["authorization_not_expired"])
+        future = self.run_preflight(now=NOW - timedelta(seconds=1))
+        self.assertEqual("MT5_READ_ONLY_AUTHORIZATION_INVALID", future["failure_code"])
+        self.assertFalse(future["authorization_not_expired"])
+        self.assertEqual([], self.module.calls)
+
+    def test_authorization_reader_cannot_redirect_outside_protected_path(self) -> None:
+        expected_reader = self.authorization_reader
+
+        def redirected(path: Path):
+            artifact = expected_reader(path)
+            return replace(artifact, path=self.root / "outside.json")
+
+        report = self.run_preflight(authorization_reader=redirected)
+        self.assertEqual("MT5_READ_ONLY_AUTHORIZATION_PATH_INVALID", report["failure_code"])
+        self.assertFalse(report["mt5_initialize_called"])
+
+    def test_initialize_raise_and_false_never_shutdown(self) -> None:
+        self.module.initialize = Mock(side_effect=RuntimeError("initialize failed"))
+        report = self.run_preflight(adapter=adapter_for(self.module))
+        self.assertTrue(report["mt5_initialize_called"])
+        self.assertFalse(report["mt5_initialize_succeeded"])
+        self.assertFalse(report["mt5_shutdown_called"])
+        self.module = FakeMT5Module(self.root)
+        self.module.initialize_result = False
+        report = self.run_preflight()
+        self.assertTrue(report["mt5_initialize_called"])
+        self.assertFalse(report["mt5_initialize_succeeded"])
+        self.assertFalse(report["mt5_shutdown_called"])
+
+    def test_every_post_initialize_identity_and_market_failure_shutdowns(self) -> None:
+        cases = (
+            ("account", "login", 99, "MT5_READ_ONLY_ACCOUNT_MISMATCH"),
+            ("account", "server", "Other", "MT5_READ_ONLY_SERVER_MISMATCH"),
+            ("account", "trade_mode", 2, "MT5_READ_ONLY_NOT_DEMO"),
+            ("symbol", "name", "OTHER", "MT5_READ_ONLY_SYMBOL_MISMATCH"),
+            ("tick", "bid", -1.0, "MT5_READ_ONLY_TICK_INVALID"),
+        )
+        for object_name, field, value, code in cases:
+            with self.subTest(code=code):
+                setattr(getattr(self.module, object_name), field, value)
+                report = self.run_preflight()
+                self.assertEqual(code, report["failure_code"])
+                self.assertTrue(report["mt5_initialize_succeeded"])
+                self.assertTrue(report["mt5_shutdown_called"])
+                self.assertEqual("shutdown", self.module.calls[-1][0])
+                self.module = FakeMT5Module(self.root)
+
+    def test_post_initialize_audit_failure_still_shutdowns(self) -> None:
+        class FailsIdentityAudit:
+            def __init__(self):
+                self.events = 0
+
+            def verify(self):
+                return SimpleNamespace(valid=True)
+
+            def append(self, event, _payload):
+                self.events += 1
+                if event == "mt5_identity_verified":
+                    raise RuntimeError("identity audit unavailable")
+
+        report = self.run_preflight(audit_factory=lambda _config: FailsIdentityAudit())
+        self.assertEqual("FAIL", report["status"])
+        self.assertTrue(report["mt5_initialize_succeeded"])
+        self.assertTrue(report["mt5_shutdown_called"])
+        self.assertEqual("shutdown", self.module.calls[-1][0])
+
+    def test_shutdown_failure_is_fail_closed_and_preserves_primary_error(self) -> None:
+        self.module.shutdown = Mock(side_effect=RuntimeError("shutdown unavailable"))
+        report = self.run_preflight(adapter=adapter_for(self.module))
+        self.assertEqual("MT5_READ_ONLY_SHUTDOWN_FAILED", report["failure_code"])
+        self.assertFalse(report["process_stopped_cleanly"])
+
+        self.module = FakeMT5Module(self.root)
+        self.module.account.login = 999
+        self.module.shutdown = Mock(side_effect=RuntimeError("shutdown unavailable"))
+        report = self.run_preflight(adapter=adapter_for(self.module))
+        self.assertEqual("MT5_READ_ONLY_ACCOUNT_MISMATCH", report["failure_code"])
+        self.assertTrue(report["mt5_shutdown_called"])
+        self.assertFalse(report["process_stopped_cleanly"])
 
     def test_lazy_loader_copies_explicit_bindings_without_real_mt5_import(self) -> None:
         with patch(

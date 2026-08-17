@@ -153,6 +153,47 @@ Política de firewall a aplicar manualmente:
 - Gateway: salida únicamente al terminal/broker MT5 necesario;
 - GitHub, PyPI y NPM: solo durante mantenimiento humano, nunca en runtime.
 
+## Preflight MT5 de solo lectura
+
+Hay dos planos de autorización independientes. `mt5_access_enabled=false`
+bloquea el import y el acceso a MT5 en el Gateway HTTP normal. El diagnóstico
+`MT5_READ_ONLY_PREFLIGHT` es una capacidad separada, de una sola ejecución y no
+puede habilitar el Gateway, trading, `login()`, `symbol_select()`,
+`order_check()` ni `order_send()`.
+
+Antes de un preflight, el administrador de mantenimiento canónico crea con
+`scripts\New-MT5ReadOnlyAuthorization.ps1 -RunId <UUID>` un fichero nuevo y
+exclusivo en:
+
+```text
+C:\ProgramData\AutomatonMT5Lab\control\demo-authorization\
+mt5-read-only-authorization-<UUID>.json
+```
+
+El artefacto schema 1 contiene exclusivamente `purpose`, los UUID de ejecución
+y autorización, emisión/expiración UTC, SIDs del issuer y Gateway,
+`OBSERVE_ONLY`, `gateway_mt5_access_required=false`, cuenta/servidor/símbolo y
+terminal exactos, commit Git y SHA-256 de configuración, entrypoint, runner,
+harness, controles, verificador ACL y script emisor. No contiene contraseñas,
+claves IPC/API ni tokens. Su lease exacto es de 15 minutos y no se renueva.
+
+El emisor exige el usuario local de mantenimiento configurado, habilitado y
+miembro directo de Administrators; rechaza Agent/Gateway, worktree sucio,
+configuración distinta de `OBSERVE_ONLY`, `mt5_access_enabled=true`, rutas no
+canónicas y colisiones. Crea con `FileMode.CreateNew` y no cambia ACL. Si el
+fichero resultante no da al Gateway solo Read, da al Agent cero acceso y
+mantiene SYSTEM/Administrators conforme al modelo protegido, falla cerrado y
+el artefacto no autoriza nada.
+
+El harness acepta únicamente `-RunId`, deriva esa ruta exacta y exige antes de
+importar MT5: identidad Gateway, ACL y auditoría válidas, estado inequívoco del
+kill switch y autorización válida/no expirada con todos sus bindings. Un kill
+switch presente y legible no bloquea este diagnóstico sin trading; ausencia es
+un estado distinto, y cualquier AccessDenied, error I/O, reparse point o tipo
+inválido falla antes de `initialize()`. Después de un `initialize()` exitoso,
+todos los caminos ejecutan `shutdown()`; si initialize devuelve false o lanza,
+no se llama a shutdown.
+
 ## Evidencia y ciclo de investigación
 
 El heartbeat consulta health cada 30 s sin LLM, velas cerradas M1 sin iniciar

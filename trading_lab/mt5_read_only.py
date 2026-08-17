@@ -8,6 +8,7 @@ import stat
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -16,6 +17,15 @@ from .audit import HashChainAuditLog
 from .config import SecurityConfig, load_mt5_security_config
 from .domain import TradingMode
 from .health_only import EXPECTED_MT5_PACKAGE_VERSION, mt5_package_metadata_version
+from .mt5_read_only_controls import (
+    KillSwitchState,
+    MT5ReadOnlyControlError,
+    authorization_path,
+    parse_authorization,
+    probe_kill_switch,
+    read_authorization_file,
+    validate_authorization,
+)
 from .sqlite_audit import DualAuditLog
 from .windows_acl import AclVerification, verify_windows_acl
 
@@ -209,6 +219,7 @@ def _new_report(run_id: str) -> dict[str, object]:
         "mt5_imported": False,
         "mt5_initialize_called": False,
         "mt5_initialize_result": False,
+        "mt5_initialize_succeeded": False,
         "mt5_accessed": False,
         "mt5_shutdown_called": False,
         "terminal_connected": False,
@@ -232,6 +243,17 @@ def _new_report(run_id: str) -> dict[str, object]:
         "ask": None,
         "spread": None,
         "kill_switch_present": False,
+        "kill_switch_readable": None,
+        "authorization_required": True,
+        "authorization_present": False,
+        "authorization_valid": False,
+        "authorization_id": None,
+        "authorization_run_id_match": False,
+        "authorization_not_expired": False,
+        "authorization_issuer_match": False,
+        "authorization_gateway_sid_match": False,
+        "authorization_config_hash_match": False,
+        "authorization_code_hash_match": False,
         "audit_chain_valid": False,
         "audit_events_recorded": [],
         "unexpected_capability_called": False,
@@ -366,6 +388,10 @@ def execute_mt5_read_only_preflight(
     adapter_loader: Callable[[], MT5ReadOnlyAdapter] = load_mt5_read_only_adapter,
     package_version_provider: Callable[[], str] = mt5_package_metadata_version,
     audit_factory: Callable[[SecurityConfig], object] = _build_audit,
+    kill_switch_probe: Callable[[str | Path], KillSwitchState] = probe_kill_switch,
+    authorization_reader=read_authorization_file,
+    authorization_validator=validate_authorization,
+    now_provider: Callable[[], datetime] = lambda: datetime.now(UTC),
 ) -> dict[str, object]:
     """Run one deterministic MT5 identity/market-data diagnostic and stop."""
     report = _new_report(run_id)
@@ -373,7 +399,7 @@ def execute_mt5_read_only_preflight(
     audit = None
     adapter: MT5ReadOnlyAdapter | None = None
     started_audit = False
-    initialized_attempted = False
+    mt5_initialize_succeeded = False
     primary_error: BaseException | None = None
     stage = "CONFIG"
     recorded_events: list[str] = []
@@ -403,6 +429,12 @@ def execute_mt5_read_only_preflight(
                 "CONFIG",
                 "MT5 read-only preflight requires OBSERVE_ONLY.",
             )
+        if config.mt5_access_enabled:
+            _fail(
+                "MT5_READ_ONLY_GATEWAY_ACCESS_MUST_REMAIN_DISABLED",
+                "CONFIG",
+                "Gateway MT5 access must remain disabled during read-only preflight.",
+            )
         if config.allowed_symbol != EXACT_SYMBOL:
             _fail(
                 "MT5_READ_ONLY_SYMBOL_CONFIG_INVALID",
@@ -410,7 +442,37 @@ def execute_mt5_read_only_preflight(
                 "MT5 read-only preflight permits only exact XAUUSD.",
             )
         _validate_terminal_executable(config.mt5_terminal_path)
-        report["kill_switch_present"] = config.kill_switch_path.exists()
+
+        stage = "KILL_SWITCH"
+        kill_switch_state = kill_switch_probe(config.kill_switch_path)
+        if kill_switch_state not in {
+            KillSwitchState.ABSENT,
+            KillSwitchState.PRESENT_READABLE,
+        }:
+            raise MT5ReadOnlyControlError(
+                "KILL_SWITCH_UNREADABLE",
+                "KILL_SWITCH",
+                "Kill-switch probe returned an unknown state.",
+            )
+        report["kill_switch_present"] = (
+            kill_switch_state is KillSwitchState.PRESENT_READABLE
+        )
+        report["kill_switch_readable"] = (
+            True if kill_switch_state is KillSwitchState.PRESENT_READABLE else None
+        )
+
+        stage = "AUTHORIZATION_FILE"
+        protected_authorization_path = authorization_path(config, run_id)
+        authorization_file = authorization_reader(protected_authorization_path)
+        if _canonical_windows_path(authorization_file.path) != _canonical_windows_path(
+            protected_authorization_path
+        ):
+            raise MT5ReadOnlyControlError(
+                "MT5_READ_ONLY_AUTHORIZATION_PATH_INVALID",
+                "AUTHORIZATION_FILE",
+                "Authorization reader returned an unexpected path.",
+            )
+        report["authorization_present"] = True
 
         stage = "ACL"
         acl = acl_verifier(
@@ -418,8 +480,15 @@ def execute_mt5_read_only_preflight(
             config,
             include_automaton_state=False,
             require_current_gateway=True,
+            kill_switch_present=report["kill_switch_present"],
+            read_only_authorization_path=protected_authorization_path,
         )
-        if not acl.passed or not acl.current_sid:
+        if (
+            not acl.passed
+            or not acl.current_sid
+            or not acl.gateway_sid
+            or not acl.maintenance_sid
+        ):
             _fail(
                 "MT5_READ_ONLY_ACL_FAILED",
                 "ACL",
@@ -441,10 +510,43 @@ def execute_mt5_read_only_preflight(
             "mode": MODE,
             "trading_mode": TradingMode.OBSERVE_ONLY.value,
             "kill_switch_present": report["kill_switch_present"],
+            "kill_switch_readable": report["kill_switch_readable"],
+            "authorization_required": True,
             "read_only": True,
         })
         recorded_events.append("mt5_read_only_preflight_started")
         started_audit = True
+
+        stage = "AUTHORIZATION"
+        authorization = parse_authorization(authorization_file.content)
+        report["authorization_id"] = authorization.authorization_id
+        try:
+            authorization_evidence = authorization_validator(
+                authorization,
+                config=config,
+                config_path=Path(config_path),
+                workspace=Path(__file__).resolve().parents[1],
+                run_id=run_id,
+                issuer_sid=acl.maintenance_sid,
+                gateway_sid=acl.gateway_sid,
+                now=now_provider(),
+            )
+        except MT5ReadOnlyControlError as exc:
+            report.update(exc.evidence)
+            raise
+        report.update(authorization_evidence)
+        report["authorization_valid"] = True
+        _audit_append(audit, "mt5_read_only_authorization_accepted", {
+            "authorization_id": authorization.authorization_id,
+            "run_id": run_id,
+            "issuer_sid": authorization.issuer_sid,
+            "issued_at_utc": authorization.issued_at_utc,
+            "expires_at_utc": authorization.expires_at_utc,
+            "authorization_sha256": authorization_file.sha256,
+            "purpose": MODE,
+            "read_only": True,
+        })
+        recorded_events.append("mt5_read_only_authorization_accepted")
 
         stage = "MT5_PACKAGE"
         package_version = package_version_provider()
@@ -470,7 +572,6 @@ def execute_mt5_read_only_preflight(
         stage = "MT5_INITIALIZE"
         report["mt5_initialize_called"] = True
         report["mt5_accessed"] = True
-        initialized_attempted = True
         initialized = adapter.initialize(config.mt5_terminal_path)
         report["mt5_initialize_result"] = initialized
         if not initialized:
@@ -483,6 +584,8 @@ def execute_mt5_read_only_preflight(
                 "MT5_INITIALIZE",
                 "MetaTrader5 initialize returned false.",
             )
+        mt5_initialize_succeeded = True
+        report["mt5_initialize_succeeded"] = True
 
         stage = "MT5_VERSION"
         report["mt5_terminal_version"] = _safe_terminal_version(adapter.version())
@@ -639,7 +742,7 @@ def execute_mt5_read_only_preflight(
         report["mt5_imported"] = bool(
             report["mt5_imported"] or "MetaTrader5" in sys.modules
         )
-        if isinstance(exc, MT5ReadOnlyPreflightFailure):
+        if isinstance(exc, (MT5ReadOnlyPreflightFailure, MT5ReadOnlyControlError)):
             report["failure_code"] = exc.code
             report["failure_stage"] = exc.stage
         else:
@@ -648,7 +751,7 @@ def execute_mt5_read_only_preflight(
         report["runtime_error"] = sanitized(exc)
     finally:
         shutdown_error: BaseException | None = None
-        if adapter is not None and initialized_attempted:
+        if adapter is not None and mt5_initialize_succeeded:
             report["mt5_shutdown_called"] = True
             try:
                 adapter.shutdown()
@@ -682,6 +785,7 @@ def execute_mt5_read_only_preflight(
                     "status": "PASS" if primary_error is None else "FAIL",
                     "trading_mode": TradingMode.OBSERVE_ONLY.value,
                     "mt5_initialize_called": report["mt5_initialize_called"],
+                    "mt5_initialize_succeeded": report["mt5_initialize_succeeded"],
                     "mt5_shutdown_called": report["mt5_shutdown_called"],
                     "unexpected_capability_called": report[
                         "unexpected_capability_called"
@@ -702,6 +806,9 @@ def execute_mt5_read_only_preflight(
         if (
             primary_error is None
             and report["status"] == "PASS_PENDING_SHUTDOWN"
+            and report["authorization_required"]
+            and report["authorization_present"]
+            and report["authorization_valid"]
             and report["mt5_shutdown_called"]
             and report["process_stopped_cleanly"]
             and report["audit_chain_valid"]
