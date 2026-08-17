@@ -101,6 +101,8 @@ const PROTECTED_FILES: readonly string[] = Object.freeze([
   "scripts/Initialize-TradingLabAcl.ps1",
   "scripts/Apply-TradingLabAclGate.ps1",
   "scripts/TradingLabAclBootstrap.ps1",
+  "scripts/Set-MT5ReadOnlyAuthorizationAcl.ps1",
+  "scripts/Set-MT5ReadOnlyProtectedIdentity.ps1",
   "scripts/New-TradingLabUsers.ps1",
   "scripts/Test-AgentRuntimeAcl.ps1",
   "scripts/Test-GatewayRuntimeAcl.ps1",

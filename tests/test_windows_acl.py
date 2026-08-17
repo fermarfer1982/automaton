@@ -14,8 +14,10 @@ from trading_lab.windows_acl import (
     READ_EXECUTE_RIGHTS,
     READ_RIGHTS,
     SYSTEM_SID,
+    MT5_READ_ONLY_AUTHORIZATION_NAME,
     MaintenanceAccessPolicy,
     WindowsAclPolicy,
+    discover_mt5_read_only_authorizations,
     evaluate_acl_snapshot,
     load_windows_acl_policy,
 )
@@ -203,6 +205,52 @@ def safe_snapshot() -> dict[str, object]:
                 APPEND_ONLY_RIGHTS,
                 is_directory=False,
             ),
+            {
+                "path": "C:/control/demo-authorization",
+                "policy_key": "control_demo_authorization",
+                "role": "authorization_directory",
+                "is_directory": True,
+                "actual_is_directory": True,
+                "require_protected": True,
+                "exists": True,
+                "protected": True,
+                "reparse": False,
+                "owner_sid": ADMINISTRATORS_SID,
+                "rules": [
+                    rule(SYSTEM_SID, FULL_CONTROL_RIGHTS, inheritance_flags=INHERITANCE),
+                    rule(ADMINISTRATORS_SID, FULL_CONTROL_RIGHTS, inheritance_flags=INHERITANCE),
+                    rule(GATEWAY, READ_EXECUTE_RIGHTS),
+                    rule(
+                        GATEWAY,
+                        READ_RIGHTS,
+                        inheritance_flags="ObjectInherit",
+                        propagation_flags="InheritOnly",
+                    ),
+                ],
+            },
+        ],
+    }
+
+
+def authorization_file() -> dict[str, object]:
+    return {
+        "path": (
+            "C:/control/demo-authorization/"
+            "mt5-read-only-authorization-01234567-89ab-4cde-8fab-0123456789ab.json"
+        ),
+        "policy_key": "control_mt5_read_only_authorization_file",
+        "role": "authorization_file",
+        "is_directory": False,
+        "actual_is_directory": False,
+        "require_protected": False,
+        "exists": True,
+        "protected": False,
+        "reparse": False,
+        "owner_sid": ADMINISTRATORS_SID,
+        "rules": [
+            rule(SYSTEM_SID, FULL_CONTROL_RIGHTS, inherited=True),
+            rule(ADMINISTRATORS_SID, FULL_CONTROL_RIGHTS, inherited=True),
+            rule(GATEWAY, READ_RIGHTS, inherited=True),
         ],
     }
 
@@ -296,14 +344,7 @@ class WindowsAclTests(unittest.TestCase):
             self.assertFalse(verify(snapshot).passed)
 
     def test_mt5_read_only_authorization_file_is_exact_read_only_and_agent_denied(self) -> None:
-        authorization = target(
-            "C:/control/demo-authorization/mt5-read-only-authorization-id.json",
-            "control_mt5_read_only_authorization_file",
-            "control_file",
-            GATEWAY,
-            READ_RIGHTS,
-            is_directory=False,
-        )
+        authorization = authorization_file()
         snapshot = safe_snapshot()
         snapshot["targets"].append(authorization)  # type: ignore[union-attr]
         self.assertTrue(verify(snapshot).passed)
@@ -319,6 +360,55 @@ class WindowsAclTests(unittest.TestCase):
         reparse = copy.deepcopy(snapshot)
         reparse["targets"][-1]["reparse"] = True  # type: ignore[index]
         self.assertFalse(verify(reparse).passed)
+
+    def test_authorization_parent_child_inheritance_is_exact(self) -> None:
+        snapshot = safe_snapshot()
+        snapshot["targets"].append(authorization_file())  # type: ignore[union-attr]
+        self.assertTrue(verify(snapshot).passed)
+
+        for field, value in (
+            ("inheritance_flags", "ContainerInherit, ObjectInherit"),
+            ("propagation_flags", "None"),
+            ("rights", MODIFY_RIGHTS),
+        ):
+            unsafe = copy.deepcopy(snapshot)
+            unsafe["targets"][-2]["rules"][3][field] = value  # type: ignore[index]
+            self.assertFalse(verify(unsafe).passed)
+
+    def test_authorization_parent_rejects_agent_or_unexpected_sid(self) -> None:
+        for sid in (AGENT, "S-1-5-11"):
+            snapshot = safe_snapshot()
+            snapshot["targets"][-1]["rules"].append(rule(sid, READ_RIGHTS))  # type: ignore[index,union-attr]
+            self.assertFalse(verify(snapshot).passed)
+
+    def test_authorization_artifact_name_pattern_is_strict(self) -> None:
+        valid = "mt5-read-only-authorization-01234567-89ab-4cde-8fab-0123456789ab.json"
+        self.assertIsNotNone(MT5_READ_ONLY_AUTHORIZATION_NAME.fullmatch(valid))
+        for invalid in (
+            "authorization.json",
+            "anything.json",
+            "../mt5-read-only-authorization-01234567-89ab-4cde-8fab-0123456789ab.json",
+            "mt5-read-only-authorization-01234567-89ab-4cde-8fab-0123456789ab.JSON",
+        ):
+            self.assertIsNone(MT5_READ_ONLY_AUTHORIZATION_NAME.fullmatch(invalid))
+
+    def test_authorization_directory_accepts_empty_and_only_strict_regular_files(self) -> None:
+        valid = "mt5-read-only-authorization-01234567-89ab-4cde-8fab-0123456789ab.json"
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual((), discover_mt5_read_only_authorizations(directory))
+            path = Path(directory) / valid
+            path.write_text("{}", encoding="utf-8")
+            self.assertEqual((path,), discover_mt5_read_only_authorizations(directory))
+
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "authorization.json").write_text("{}", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                discover_mt5_read_only_authorizations(directory)
+
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / valid).mkdir()
+            with self.assertRaises(ValueError):
+                discover_mt5_read_only_authorizations(directory)
 
     def test_rejects_ipc_key_write_delete_or_execute(self) -> None:
         for unsafe in (MODIFY_RIGHTS, READ_RIGHTS | 32, READ_RIGHTS | 65536):

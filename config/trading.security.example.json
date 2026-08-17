@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "trading_mode": "OBSERVE_ONLY",
+  "mt5_access_enabled": false,
   "authorized_account": 0,
   "authorized_server": "REPLACE_WITH_EXACT_DEMO_SERVER",
   "authorized_account_name": null,

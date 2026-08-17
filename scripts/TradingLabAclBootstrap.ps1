@@ -207,6 +207,23 @@ function Initialize-TradingLabBootstrapState(
     if (Test-Path -LiteralPath $secretPath) {
         [void](Assert-ValidIpcSecret $secretPath)
     }
+    $authorizationRoot = Join-Path $LabRoot 'control\demo-authorization'
+    $authorizationArtifacts = @()
+    if (Test-Path -LiteralPath $authorizationRoot) {
+        $authorizationRootItem = Get-Item -LiteralPath $authorizationRoot -Force
+        if (-not $authorizationRootItem.PSIsContainer -or
+            ($authorizationRootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            throw 'Bootstrap authorization root must be a regular non-reparse directory.'
+        }
+        $authorizationArtifacts = @(Get-ChildItem -LiteralPath $authorizationRoot -Force)
+        foreach ($artifact in $authorizationArtifacts) {
+            if ($artifact.PSIsContainer -or
+                $artifact.Name -cnotmatch '^mt5-read-only-authorization-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$' -or
+                ($artifact.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                throw "Unexpected authorization artifact in bootstrap state: $($artifact.FullName)"
+            }
+        }
+    }
     $directories = @(
         $LabRoot,
         (Join-Path $LabRoot 'control'),
@@ -268,6 +285,9 @@ function Initialize-TradingLabBootstrapState(
         ipc_secret_length = $secret.encoded_length
         trading_mode = 'OBSERVE_ONLY'
         account_configured = $false
+        authorization_artifact_pattern = 'mt5-read-only-authorization-<UUID>.json'
+        authorization_artifact_count = $authorizationArtifacts.Count
+        authorization_artifacts_created = 0
     }
 }
 

@@ -236,7 +236,9 @@ def _build_gateway_bootstrap_config(
         mode = TradingMode(raw.get("trading_mode", TradingMode.OBSERVE_ONLY.value))
     except ValueError as exc:
         raise ConfigError("trading_mode is invalid") from exc
-    mt5_access_enabled = raw.get("mt5_access_enabled", False)
+    if "mt5_access_enabled" not in raw:
+        raise ConfigError("mt5_access_enabled must be present as an explicit boolean")
+    mt5_access_enabled = raw["mt5_access_enabled"]
     if not isinstance(mt5_access_enabled, bool):
         raise ConfigError("mt5_access_enabled must be an explicit boolean")
 
@@ -431,9 +433,7 @@ def _build_risk_limits(raw: dict[str, Any]) -> RiskLimits:
     return risk
 
 
-def load_mt5_security_config(path: str | Path) -> SecurityConfig:
-    """Load the complete fail-closed MT5 account, symbol, terminal, and risk domain."""
-    raw, workspace = _load_raw_security_config(path)
+def _build_mt5_security_config(raw: dict[str, Any], workspace: Path) -> SecurityConfig:
     bootstrap = _build_gateway_bootstrap_config(raw, workspace)
 
     account = _positive_int(raw.get("authorized_account"), "authorized_account")
@@ -479,6 +479,12 @@ def load_mt5_security_config(path: str | Path) -> SecurityConfig:
         log_dir=bootstrap.log_dir,
         security_log_dir=bootstrap.security_log_dir,
     )
+
+
+def load_mt5_security_config(path: str | Path) -> SecurityConfig:
+    """Load the complete fail-closed MT5 account, symbol, terminal, and risk domain."""
+    raw, workspace = _load_raw_security_config(path)
+    return _build_mt5_security_config(raw, workspace)
 
 
 def load_security_config(path: str | Path) -> SecurityConfig:

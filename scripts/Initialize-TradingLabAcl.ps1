@@ -51,7 +51,6 @@ $control = Join-Path $root 'control'
 $configFile = Join-Path $control 'trading.yaml'
 $killSwitchFile = Join-Path $control 'STOP_TRADING'
 $demoAuthorization = Join-Path $control 'demo-authorization'
-$demoAuthorizationFile = Join-Path $demoAuthorization 'authorization.json'
 $ipc = Join-Path $root 'ipc'
 $apiKeyFile = Join-Path $ipc 'automaton.key'
 $operational = Join-Path $root 'operational'
@@ -195,6 +194,42 @@ function New-AclProposal(
     }
 }
 
+function New-DemoAuthorizationAclProposal {
+    return [pscustomobject]@{
+        path = $demoAuthorization
+        policy_key = $null
+        domain = 'human_mt5_read_only_authorization_directory'
+        inheritance_protected = $true
+        inherited_aces_preserved = $false
+        deny_aces = 0
+        child_propagation = 'Gateway ObjectInherit+InheritOnly to files only'
+        owner = 'BUILTIN\Administrators'
+        entries = @(
+            [pscustomobject]@{
+                principal = 'NT AUTHORITY\SYSTEM'; sid = $systemSid.Value
+                rights = 'FullControl'; type = 'Allow'; inheritance_flags = 'ContainerInherit,ObjectInherit'
+                propagation_flags = 'None'
+            }
+            [pscustomobject]@{
+                principal = 'BUILTIN\Administrators'; sid = $administratorsSid.Value
+                rights = 'FullControl'; type = 'Allow'; inheritance_flags = 'ContainerInherit,ObjectInherit'
+                propagation_flags = 'None'
+            }
+            [pscustomobject]@{
+                principal = $gatewaySid.Value; sid = $gatewaySid.Value
+                rights = 'ReadAndExecute,Synchronize'; type = 'Allow'; inheritance_flags = 'None'
+                propagation_flags = 'None'
+            }
+            [pscustomobject]@{
+                principal = $gatewaySid.Value; sid = $gatewaySid.Value
+                rights = 'Read,Synchronize'; type = 'Allow'; inheritance_flags = 'ObjectInherit'
+                propagation_flags = 'InheritOnly'
+            }
+        )
+        representative_targets = @('mt5-read-only-authorization-<UUID>.json')
+    }
+}
+
 $aclProposals = @(
     New-AclProposal $root 'lab_root_navigation' @($gatewaySid, $automatonSid) @(
         'ReadAndExecute', 'ReadAndExecute'
@@ -214,12 +249,7 @@ $aclProposals = @(
     New-AclProposal $killSwitchFile 'human_kill_switch_file' @($gatewaySid) @(
         'Read'
     ) 'None' @('STOP_TRADING')
-    New-AclProposal $demoAuthorization 'human_demo_authorization_directory' @($gatewaySid) @(
-        'ReadAndExecute'
-    ) 'ThisObjectOnly' @('authorization.json')
-    New-AclProposal $demoAuthorizationFile 'human_demo_authorization_file' @($gatewaySid) @(
-        'Read'
-    ) 'None' @('authorization.json')
+    New-DemoAuthorizationAclProposal
     New-AclProposal $ipc 'shared_ipc_directory' @($gatewaySid, $automatonSid) @(
         'ReadAndExecute', 'ReadAndExecute'
     ) 'ThisObjectOnly' @('automaton.key')
@@ -278,7 +308,8 @@ $plan = [pscustomobject]@{
     precreated_by_administrator = @(
         $apiKeyFile, $auditJournalFile, $securityLogFile
     )
-    optional_human_asserted_files = @($killSwitchFile, $demoAuthorizationFile)
+    optional_human_asserted_files = @($killSwitchFile)
+    authorization_artifact_pattern = 'mt5-read-only-authorization-<UUID>.json'
     acl_proposals = $aclProposals
 }
 $plan | ConvertTo-Json -Depth 8
@@ -330,6 +361,15 @@ foreach ($protectedSourceDirectory in $protectedSourceDirectories) {
 
 $bootstrapTemplate = Join-Path $workspace 'config\trading.bootstrap-observe-only.yaml'
 $preparedState = Initialize-TradingLabBootstrapState $root $state $bootstrapTemplate
+
+$authorizationChildren = @(Get-ChildItem -LiteralPath $demoAuthorization -Force)
+foreach ($authorizationChild in $authorizationChildren) {
+    if ($authorizationChild.PSIsContainer -or
+        $authorizationChild.Name -cnotmatch '^mt5-read-only-authorization-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$' -or
+        ($authorizationChild.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw "Unexpected authorization artifact: $($authorizationChild.FullName)"
+    }
+}
 
 function New-AccessRule(
     [System.Security.Principal.SecurityIdentifier] $Sid,
@@ -401,6 +441,56 @@ function Set-ExactTreeAcl(
     }
 }
 
+function Set-ExactDemoAuthorizationAcl {
+    $security = [System.Security.AccessControl.DirectorySecurity]::new()
+    $security.SetOwner($administratorsSid)
+    $security.SetAccessRuleProtection($true, $false)
+    foreach ($principal in @($systemSid, $administratorsSid)) {
+        $security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+            $principal,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        ))
+    }
+    $security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+        $gatewaySid,
+        [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+        [System.Security.AccessControl.InheritanceFlags]::None,
+        [System.Security.AccessControl.PropagationFlags]::None,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    ))
+    $security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+        $gatewaySid,
+        [System.Security.AccessControl.FileSystemRights]::Read,
+        [System.Security.AccessControl.InheritanceFlags]::ObjectInherit,
+        [System.Security.AccessControl.PropagationFlags]::InheritOnly,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    ))
+    if ($authorizationChildren.Count -gt 0) {
+        $current = Get-Acl -LiteralPath $demoAuthorization -ErrorAction Stop
+        if ($current.Sddl -ne $security.GetSecurityDescriptorSddlForm(
+            [System.Security.AccessControl.AccessControlSections]::All
+        )) {
+            throw 'Existing authorization artifacts require an already-canonical parent ACL.'
+        }
+        return
+    }
+    Set-Acl -LiteralPath $demoAuthorization -AclObject $security
+    if ($ProgressPath) {
+        $progressRecord = [pscustomobject]@{
+            path = $demoAuthorization
+            applied_at_utc = [DateTime]::UtcNow.ToString('o')
+        }
+        [System.IO.File]::AppendAllText(
+            $ProgressPath,
+            (($progressRecord | ConvertTo-Json -Compress) + [Environment]::NewLine),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+    }
+}
+
 $read = [System.Security.AccessControl.FileSystemRights]::Read
 $readExecute = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
 $modify = [System.Security.AccessControl.FileSystemRights]::Modify
@@ -431,10 +521,7 @@ Set-ExactAcl $configFile @($gatewaySid) @($read) $false $false
 if (Test-Path -LiteralPath $killSwitchFile -PathType Leaf) {
     Set-ExactAcl $killSwitchFile @($gatewaySid) @($read) $false $false
 }
-Set-ExactAcl $demoAuthorization @($gatewaySid) @($readExecute) $true $false
-if (Test-Path -LiteralPath $demoAuthorizationFile -PathType Leaf) {
-    Set-ExactAcl $demoAuthorizationFile @($gatewaySid) @($read) $false $false
-}
+Set-ExactDemoAuthorizationAcl
 Set-ExactAcl $ipc @($gatewaySid, $automatonSid) @($readExecute, $readExecute) $true $false
 Set-ExactAcl $apiKeyFile @($gatewaySid, $automatonSid) @($read, $read) $false $false
 Set-ExactTreeAcl $operational @($gatewaySid) @($modify) 'operational'

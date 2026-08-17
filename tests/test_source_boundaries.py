@@ -50,6 +50,8 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn('"scripts/Initialize-TradingLabAcl.ps1"', source)
         self.assertIn('"scripts/Apply-TradingLabAclGate.ps1"', source)
         self.assertIn('"scripts/TradingLabAclBootstrap.ps1"', source)
+        self.assertIn('"scripts/Set-MT5ReadOnlyAuthorizationAcl.ps1"', source)
+        self.assertIn('"scripts/Set-MT5ReadOnlyProtectedIdentity.ps1"', source)
         self.assertIn('"scripts/New-TradingLabUsers.ps1"', source)
         self.assertIn('"scripts/Test-AgentRuntimeAcl.ps1"', source)
         self.assertIn('"scripts/Test-GatewayRuntimeAcl.ps1"', source)
@@ -667,7 +669,8 @@ class SourceBoundaryTests(unittest.TestCase):
         )
         lazy_provider = service.index("from .providers import MT5ExecutionProvider")
         self.assertLess(disabled_guard, lazy_provider)
-        self.assertIn('raw.get("mt5_access_enabled", False)', config)
+        self.assertIn('raw["mt5_access_enabled"]', config)
+        self.assertIn('if "mt5_access_enabled" not in raw:', config)
         self.assertIn("MT5_ACCESS_ENABLED=true requires", config)
         bootstrap_builder = config[
             config.index("def _build_gateway_bootstrap_config("):
@@ -684,7 +687,7 @@ class SourceBoundaryTests(unittest.TestCase):
         ):
             self.assertNotIn(mt5_only_field, bootstrap_builder)
         complete_loader = config[
-            config.index("def load_mt5_security_config("):
+            config.index("def _build_mt5_security_config("):
             config.index("def load_security_config(")
         ]
         for required_mt5_gate in (
@@ -696,6 +699,11 @@ class SourceBoundaryTests(unittest.TestCase):
             "_build_risk_limits(raw)",
         ):
             self.assertIn(required_mt5_gate, complete_loader)
+        public_loader = config[
+            config.index("def load_mt5_security_config("):
+            config.index("def load_security_config(")
+        ]
+        self.assertIn("return _build_mt5_security_config(raw, workspace)", public_loader)
         self.assertIn('"MetaTrader5" in sys.modules', health_only)
         self.assertIn('metadata.version("MetaTrader5")', health_only)
         self.assertIn('"mt5_status": "IMPORTED_UNEXPECTEDLY"', health_only)
@@ -1058,6 +1066,27 @@ class SourceBoundaryTests(unittest.TestCase):
             self.assertNotIn(forbidden, verifier)
         for mt5_boundary in ("MetaTrader5", "order_check", "order_send"):
             self.assertNotIn(mt5_boundary, verifier)
+
+    def test_mt5_read_only_precondition_gates_have_no_runtime_or_trading_actions(self) -> None:
+        authorization_acl = (
+            ROOT / "scripts" / "Set-MT5ReadOnlyAuthorizationAcl.ps1"
+        ).read_text(encoding="utf-8")
+        protected_identity = (
+            ROOT / "scripts" / "Set-MT5ReadOnlyProtectedIdentity.ps1"
+        ).read_text(encoding="utf-8")
+        helper = (
+            ROOT / "trading_lab" / "protected_identity_config.py"
+        ).read_text(encoding="utf-8")
+        combined = authorization_acl + protected_identity + helper
+        for forbidden in (
+            "import MetaTrader5", "from MetaTrader5", "initialize(", "login(",
+            "order_check", "order_send", "trading_lab.service", "start_gateway",
+            "start_automaton", "runas", "Invoke-Expression",
+        ):
+            self.assertNotIn(forbidden, combined)
+        self.assertIn("FileMode]::CreateNew", authorization_acl)
+        self.assertIn("[System.IO.File]::Replace", protected_identity)
+        self.assertIn("load_mt5_security_config", helper)
 
 
 if __name__ == "__main__":

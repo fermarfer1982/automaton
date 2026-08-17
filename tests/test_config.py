@@ -21,6 +21,7 @@ class SecurityConfigTests(unittest.TestCase):
         return {
             "schema_version": 1,
             "trading_mode": "OBSERVE_ONLY",
+            "mt5_access_enabled": False,
             "authorized_account": 12345678,
             "authorized_server": "Broker-Demo",
             "allowed_symbol": "XAUUSD",
@@ -62,7 +63,7 @@ class SecurityConfigTests(unittest.TestCase):
             config = load_security_config(self.write(directory, payload))
             self.assertEqual(TradingMode.OBSERVE_ONLY, config.trading_mode)
 
-    def test_mt5_access_defaults_disabled_and_environment_cannot_escalate(self) -> None:
+    def test_mt5_access_explicit_false_cannot_be_escalated_by_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = load_security_config(self.write(directory, self.valid_config()))
         self.assertFalse(config.mt5_access_enabled)
@@ -70,6 +71,23 @@ class SecurityConfigTests(unittest.TestCase):
         self.assertFalse(resolve_mt5_access_enabled(config, {"MT5_ACCESS_ENABLED": "false"}))
         with self.assertRaises(ConfigError):
             resolve_mt5_access_enabled(config, {"MT5_ACCESS_ENABLED": "true"})
+
+    def test_mt5_access_must_not_be_inferred_when_key_is_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            payload = self.valid_config()
+            payload.pop("mt5_access_enabled")
+            with self.assertRaisesRegex(ConfigError, "must be present"):
+                load_gateway_bootstrap_config(self.write(directory, payload))
+
+    def test_all_distributed_security_templates_explicitly_disable_mt5(self) -> None:
+        root = Path(__file__).resolve().parents[1] / "config"
+        json_template = json.loads(
+            (root / "trading.security.example.json").read_text(encoding="utf-8")
+        )
+        self.assertIs(json_template["mt5_access_enabled"], False)
+        for name in ("trading.example.yaml", "trading.bootstrap-observe-only.yaml"):
+            text = (root / name).read_text(encoding="utf-8")
+            self.assertIn("mt5_access_enabled: false", text)
 
     def test_mt5_access_requires_explicit_boolean_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

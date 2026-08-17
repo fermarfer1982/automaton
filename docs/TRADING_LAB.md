@@ -161,6 +161,29 @@ bloquea el import y el acceso a MT5 en el Gateway HTTP normal. El diagnóstico
 puede habilitar el Gateway, trading, `login()`, `symbol_select()`,
 `order_check()` ni `order_send()`.
 
+Antes de emitir la primera autorización se completan dos gates humanos
+independientes, ambos dry-run por defecto:
+
+```powershell
+.\scripts\Set-MT5ReadOnlyAuthorizationAcl.ps1 -RunId <UUID> [-Apply]
+.\scripts\Set-MT5ReadOnlyProtectedIdentity.ps1 -RunId <UUID> [-Apply]
+```
+
+El primero migra únicamente el parent `control\demo-authorization` al modelo
+de lectura heredada para ficheros con nombre UUID estricto. El segundo reemplaza
+de forma transaccional solo los placeholders conocidos por cuenta `107554164`,
+servidor `MetaQuotes-Demo` y `mt5_access_enabled: false`, manteniendo XAUUSD,
+terminal exacto y `OBSERVE_ONLY`. Rechaza terceros estados, conserva la ACL
+exacta del YAML, valida con `load_mt5_security_config` y revierte el contenido
+si falla el replace, ACL o reload. Ninguno importa ni accede a MT5.
+
+Sus reportes independientes se escriben en:
+
+```text
+C:\ProgramData\AutomatonMT5Lab\maintenance\mt5-read-only-preconditions\authorization-acl-<UUID>.json
+C:\ProgramData\AutomatonMT5Lab\maintenance\mt5-read-only-preconditions\protected-identity-<UUID>.json
+```
+
 Antes de un preflight, el administrador de mantenimiento canónico crea con
 `scripts\New-MT5ReadOnlyAuthorization.ps1 -RunId <UUID>` un fichero nuevo y
 exclusivo en:

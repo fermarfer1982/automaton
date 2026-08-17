@@ -61,6 +61,11 @@ try {
     if (-not $result.config_created -or -not $result.ipc_secret_created) {
         throw 'Case A did not create a fresh bootstrap.'
     }
+    if ($result.authorization_artifact_count -ne 0 -or
+        $result.authorization_artifacts_created -ne 0 -or
+        $result.authorization_artifact_pattern -ne 'mt5-read-only-authorization-<UUID>.json') {
+        throw 'Case A bootstrap authorization semantics are not empty and human-created only.'
+    }
     [void](Assert-ExactBootstrapConfig (Join-Path $lab 'control\trading.yaml') $templatePath)
     $caseASecretPath = Join-Path $lab 'ipc\automaton.key'
     [void](Assert-ValidIpcSecret $caseASecretPath)
@@ -136,6 +141,23 @@ try {
     Remove-TestRoot $caseE
 }
 
+$caseAuthorization = New-TestRoot 'authorization-names'
+try {
+    $lab = Join-Path $caseAuthorization 'lab'
+    $state = Join-Path $caseAuthorization 'agent\.automaton'
+    [void](Initialize-TradingLabBootstrapState $lab $state $templatePath)
+    [System.IO.File]::WriteAllText(
+        (Join-Path $lab 'control\demo-authorization\authorization.json'),
+        '{}',
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $failed = $false
+    try { [void](Initialize-TradingLabBootstrapState $lab $state $templatePath) } catch { $failed = $true }
+    if (-not $failed) { throw 'Bootstrap accepted legacy authorization.json.' }
+} finally {
+    Remove-TestRoot $caseAuthorization
+}
+
 if ((Resolve-AclApplyFailureStatus 'NOT_RUN' 0) -ne 'NOT_RUN') {
     throw 'Case F pre-apply failure status is incorrect.'
 }
@@ -179,4 +201,6 @@ try {
     CASE_G_PARTIAL_APPLY_STATUS = 'PASS'
     MAINTENANCE_POLICY_CANONICAL = 'PASS'
     MAINTENANCE_TARGET_ALLOWLIST_EXACT = 'PASS'
+    AUTHORIZATION_ARTIFACTS_HUMAN_CREATED_ONLY = 'PASS'
+    LEGACY_AUTHORIZATION_JSON_REJECTED = 'PASS'
 } | ConvertTo-Json

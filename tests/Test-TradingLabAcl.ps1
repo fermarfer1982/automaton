@@ -20,6 +20,20 @@ if ($applyErrors.Count -ne 0) {
     throw "ACL apply gate has PowerShell AST errors: $($applyErrors -join '; ')"
 }
 $applySource = [System.IO.File]::ReadAllText($applyGatePath)
+$authorizationAclPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\Set-MT5ReadOnlyAuthorizationAcl.ps1'
+$protectedIdentityPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\Set-MT5ReadOnlyProtectedIdentity.ps1'
+foreach ($maintenanceScript in @($authorizationAclPath, $protectedIdentityPath)) {
+    $maintenanceTokens = $null
+    $maintenanceErrors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile(
+        $maintenanceScript, [ref]$maintenanceTokens, [ref]$maintenanceErrors
+    )
+    if ($maintenanceErrors.Count -ne 0) {
+        throw "MT5 precondition script has PowerShell AST errors: $($maintenanceErrors -join '; ')"
+    }
+}
+$authorizationAclSource = [System.IO.File]::ReadAllText($authorizationAclPath)
+$protectedIdentitySource = [System.IO.File]::ReadAllText($protectedIdentityPath)
 foreach ($forbidden in @('Start-Process -Credential', 'runas.exe', '.order_send(', '.order_check(', 'import MetaTrader5')) {
     if ($applySource.Contains($forbidden)) {
         throw "ACL apply gate contains forbidden runtime action: $forbidden"
@@ -101,6 +115,100 @@ if ($source.Contains("gateway_writable_data") -or $source.Contains("Join-Path `$
 }
 if ($source.Contains('WriteAllText($killSwitchFile') -or $source.Contains('WriteAllText($demoAuthorizationFile')) {
     throw 'ACL bootstrap must not assert the presence-based kill switch or DEMO authorization.'
+}
+
+foreach ($requiredAuthorizationPolicy in @(
+    "[System.Security.AccessControl.InheritanceFlags]::ObjectInherit",
+    "[System.Security.AccessControl.PropagationFlags]::InheritOnly",
+    "[System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'",
+    'mt5-read-only-authorization-<UUID>.json',
+    'Set-ExactDemoAuthorizationAcl'
+)) {
+    if (-not $source.Contains($requiredAuthorizationPolicy)) {
+        throw "Canonical ACL source lacks RunId authorization policy: $requiredAuthorizationPolicy"
+    }
+}
+if ($source.Contains("New-AclProposal `$demoAuthorizationFile") -or
+    $source.Contains("Join-Path `$demoAuthorization 'authorization.json'")) {
+    throw 'Canonical ACL source still models legacy authorization.json as an artifact.'
+}
+foreach ($requiredTargeted in @(
+    '#Requires -RunAsAdministrator',
+    'C:\ProgramData\AutomatonMT5Lab\control\demo-authorization',
+    'KNOWN_LEGACY_DIRECTORY_ONLY',
+    'CANONICAL_RUN_ID_ARTIFACTS',
+    "[System.Security.AccessControl.InheritanceFlags]::ObjectInherit",
+    "[System.Security.AccessControl.PropagationFlags]::InheritOnly",
+    'Set-Acl -LiteralPath $target',
+    'rollback_attempted',
+    'gateway_mutation_rights',
+    'agent_access',
+    'FileMode]::CreateNew'
+)) {
+    if (-not $authorizationAclSource.Contains($requiredTargeted)) {
+        throw "Targeted authorization ACL gate lacks boundary: $requiredTargeted"
+    }
+}
+foreach ($forbiddenTargeted in @(
+    'icacls', '/reset', 'MetaTrader5', 'initialize()', 'order_check', 'order_send',
+    'Start-Process', 'trading_lab.service'
+)) {
+    if ($authorizationAclSource.Contains($forbiddenTargeted)) {
+        throw "Targeted authorization ACL gate contains forbidden action: $forbiddenTargeted"
+    }
+}
+$readOnlyRights = 1179785L
+$forbiddenMutation = 2L -bor 4L -bor 16L -bor 64L -bor 256L -bor 65536L -bor 262144L -bor 524288L
+if (($readOnlyRights -band $forbiddenMutation) -ne 0) {
+    throw 'Gateway inherited Read+Synchronize unexpectedly permits create/write/append/delete/security mutation.'
+}
+foreach ($requiredConfigGate in @(
+    '#Requires -RunAsAdministrator',
+    "mode = 'MT5_READ_ONLY_PROTECTED_IDENTITY'",
+    'trading_lab.protected_identity_config inspect',
+    'trading_lab.protected_identity_config render',
+    'trading_lab.protected_identity_config validate',
+    '[System.IO.File]::Replace',
+    'Set-Acl -LiteralPath $configPath -AclObject $originalAcl',
+    '[System.IO.File]::Replace($backupPath, $configPath, $failedPath, $true)',
+    'Assert-ExactConfigAcl $restoredAcl',
+    'real_loader_validated',
+    'rollback_attempted',
+    'hash_before',
+    'hash_after',
+    "trading_mode = 'OBSERVE_ONLY'",
+    'mt5_access_enabled = $false'
+)) {
+    if (-not $protectedIdentitySource.Contains($requiredConfigGate)) {
+        throw "Protected identity gate lacks transaction boundary: $requiredConfigGate"
+    }
+}
+foreach ($forbiddenConfigGate in @(
+    'MetaTrader5', 'initialize()', 'login(', 'order_check', 'order_send',
+    'trading_lab.service', 'start_gateway', 'start_automaton', 'Invoke-Expression'
+)) {
+    if ($protectedIdentitySource.Contains($forbiddenConfigGate)) {
+        throw "Protected identity gate contains forbidden action: $forbiddenConfigGate"
+    }
+}
+foreach ($legacyApplySemantic in @(
+    'demo_authorization_file_exists = $false',
+    'demo_authorization_gateway_write = $false'
+)) {
+    if ($applySource.Contains($legacyApplySemantic)) {
+        throw "ACL apply gate retains legacy authorization semantics: $legacyApplySemantic"
+    }
+}
+foreach ($newApplySemantic in @(
+    'Assert-ExactAuthorizationDirectoryAcl',
+    'Assert-ExactAuthorizationArtifactAcl',
+    'mt5-read-only-authorization-<UUID>.json',
+    'demo_authorization_artifacts_verified = $true',
+    'demo_authorization_gateway_mutation = $false'
+)) {
+    if (-not $applySource.Contains($newApplySemantic)) {
+        throw "ACL apply gate lacks RunId artifact verification: $newApplySemantic"
+    }
 }
 
 $dryRunIndex = $source.IndexOf('if (-not $Apply)')

@@ -197,6 +197,69 @@ function Assert-ExactMaintenanceAllow($Snapshot) {
     }
 }
 
+function Test-ExactAclRule(
+    $Rule,
+    [string] $Sid,
+    [int64] $Rights,
+    [bool] $Inherited,
+    [string] $InheritanceFlags,
+    [string] $PropagationFlags
+) {
+    return $Rule.sid -eq $Sid -and $Rule.type -eq 'Allow' -and
+        [int64]$Rule.rights -eq $Rights -and [bool]$Rule.inherited -eq $Inherited -and
+        $Rule.inheritance_flags -eq $InheritanceFlags -and
+        $Rule.propagation_flags -eq $PropagationFlags
+}
+
+function Assert-ExactAuthorizationDirectoryAcl($Snapshot) {
+    Assert-RecoveryAndOwner $Snapshot
+    if (@($Snapshot.rules).Count -ne 4) {
+        throw 'Authorization directory must contain exactly four canonical ACEs.'
+    }
+    $expected = @(
+        [pscustomobject]@{ Sid = $systemSid; Rights = $fullControl; Inheritance = 'ContainerInherit, ObjectInherit'; Propagation = 'None' },
+        [pscustomobject]@{ Sid = $administratorsSid; Rights = $fullControl; Inheritance = 'ContainerInherit, ObjectInherit'; Propagation = 'None' },
+        [pscustomobject]@{ Sid = $gatewaySid; Rights = $readExecuteRights; Inheritance = 'None'; Propagation = 'None' },
+        [pscustomobject]@{ Sid = $gatewaySid; Rights = $readRights; Inheritance = 'ObjectInherit'; Propagation = 'InheritOnly' }
+    )
+    $remaining = [System.Collections.Generic.List[object]]::new()
+    foreach ($rule in $Snapshot.rules) { $remaining.Add($rule) }
+    foreach ($item in $expected) {
+        $match = @($remaining | Where-Object {
+            Test-ExactAclRule $_ $item.Sid ([int64]$item.Rights) $false $item.Inheritance $item.Propagation
+        } | Select-Object -First 1)
+        if ($match.Count -ne 1) { throw 'Authorization directory ACL is not canonical.' }
+        [void]$remaining.Remove($match[0])
+    }
+    if ((Get-AllowRights $Snapshot $agentSid) -ne 0 -or
+        ((Get-AllowRights $Snapshot $gatewaySid) -band $writeOrSecurityRights) -ne 0) {
+        throw 'Authorization directory grants forbidden Agent or Gateway mutation rights.'
+    }
+}
+
+function Assert-ExactAuthorizationArtifactAcl($Snapshot) {
+    if ($Snapshot.owner_sid -ne $administratorsSid -or $Snapshot.inheritance_protected) {
+        throw "Authorization artifact owner/inheritance mismatch: $($Snapshot.path)"
+    }
+    if (@($Snapshot.rules).Count -ne 3) {
+        throw "Authorization artifact ACE count mismatch: $($Snapshot.path)"
+    }
+    foreach ($item in @(
+        [pscustomobject]@{ Sid = $systemSid; Rights = $fullControl },
+        [pscustomobject]@{ Sid = $administratorsSid; Rights = $fullControl },
+        [pscustomobject]@{ Sid = $gatewaySid; Rights = $readRights }
+    )) {
+        $match = @($Snapshot.rules | Where-Object {
+            Test-ExactAclRule $_ $item.Sid ([int64]$item.Rights) $true 'None' 'None'
+        })
+        if ($match.Count -ne 1) { throw "Authorization artifact inherited ACL mismatch: $($Snapshot.path)" }
+    }
+    if ((Get-AllowRights $Snapshot $agentSid) -ne 0 -or
+        ((Get-AllowRights $Snapshot $gatewaySid) -band $writeOrSecurityRights) -ne 0) {
+        throw "Authorization artifact grants forbidden Agent or Gateway mutation rights: $($Snapshot.path)"
+    }
+}
+
 function Invoke-Test([string] $Name, [scriptblock] $Command, [string] $LogPath) {
     try {
         & $Command *> $LogPath
@@ -320,9 +383,22 @@ try {
         $snapshots[$entry.Key] = $snapshot
     }
 
+    Assert-ExactAuthorizationDirectoryAcl $snapshots.demo_authorization
+    $authorizationArtifacts = @()
+    foreach ($artifact in @(Get-ChildItem -LiteralPath $targets.demo_authorization -Force)) {
+        if ($artifact.PSIsContainer -or
+            $artifact.Name -cnotmatch '^mt5-read-only-authorization-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$' -or
+            ($artifact.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            throw "Unexpected authorization artifact: $($artifact.FullName)"
+        }
+        $artifactSnapshot = Get-AclSnapshot $artifact.FullName "authorization_artifact_$($artifact.Name)"
+        Assert-ExactAuthorizationArtifactAcl $artifactSnapshot
+        $authorizationArtifacts += $artifactSnapshot
+    }
+
     Assert-NoUnexpectedAllow $snapshots.workspace @($systemSid, $administratorsSid, $gatewaySid, $agentSid)
     Assert-NoUnexpectedAllow $snapshots.programdata @($systemSid, $administratorsSid, $maintenanceSid, $gatewaySid, $agentSid)
-    foreach ($name in @('control', 'config', 'demo_authorization', 'research', 'audit_sqlite', 'audit_journal_directory', 'audit_journal', 'security_log')) {
+    foreach ($name in @('control', 'config', 'research', 'audit_sqlite', 'audit_journal_directory', 'audit_journal', 'security_log')) {
         Assert-NoUnexpectedAllow $snapshots[$name] @($systemSid, $administratorsSid, $gatewaySid)
     }
     foreach ($name in @('operational', 'logs', 'gateway_logs', 'security_logs_directory')) {
@@ -390,11 +466,7 @@ try {
     if (Test-Path -LiteralPath (Join-Path $labRoot 'control\STOP_TRADING')) {
         throw 'Presence-based STOP_TRADING was unexpectedly asserted by bootstrap.'
     }
-    if (Test-Path -LiteralPath (Join-Path $labRoot 'control\demo-authorization\authorization.json')) {
-        throw 'DEMO authorization was unexpectedly created by bootstrap.'
-    }
-
-    $report.acl_snapshots = @($snapshots.Values)
+    $report.acl_snapshots = @($snapshots.Values) + @($authorizationArtifacts)
     $report.checks = [ordered]@{
         workspace_authenticated_users_modify = $authenticatedUsersModify
         agent_workspace_write = $false
@@ -409,9 +481,13 @@ try {
         kill_switch_exists = $false
         kill_switch_agent_write = $false
         kill_switch_gateway_write = $false
-        demo_authorization_file_exists = $false
-        demo_authorization_agent_write = $false
-        demo_authorization_gateway_write = $false
+        demo_authorization_artifact_pattern = 'mt5-read-only-authorization-<UUID>.json'
+        demo_authorization_artifact_count = @($authorizationArtifacts).Count
+        demo_authorization_artifacts_verified = $true
+        demo_authorization_legacy_authorization_json_absent = $true
+        demo_authorization_agent_access = 'NONE'
+        demo_authorization_gateway_read = $true
+        demo_authorization_gateway_mutation = $false
         operational_gateway_modify = $true
         research_gateway_modify = $true
         audit_sqlite_gateway_modify = $true

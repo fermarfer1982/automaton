@@ -26,8 +26,8 @@ permanecer detenidos hasta entonces.
 | `control` | RX | ninguna | ninguna | solo directorio |
 | `control\trading.yaml` | R | ninguna | ninguna | fichero |
 | `control\STOP_TRADING` | R si existe | ninguna | ninguna | fichero humano opcional |
-| `control\demo-authorization` | RX | ninguna | ninguna | solo directorio |
-| `...\authorization.json` | R si existe | ninguna | ninguna | fichero humano opcional |
+| `control\demo-authorization` | RX+Synchronize en el directorio; Read+Synchronize heredable solo a ficheros | ninguna | ninguna | parent protegido |
+| `...\mt5-read-only-authorization-<UUID>.json` | Read+Synchronize heredado | ninguna | ninguna | artifact humano regular, no reparse, nombre estricto |
 | `ipc` | RX | RX | ninguna | solo directorio |
 | `ipc\automaton.key` | R | R | ninguna | fichero; sin execute |
 | `operational` | M | ninguna | FullControl | contenedores y objetos |
@@ -52,10 +52,27 @@ puede coincidir con SYSTEM, Administrators, Gateway ni Agent. Su ACE explícita
 marcadas en la tabla. En cualquier otro target, incluso otro usuario humano,
 es un principal inesperado y la verificación falla cerrada. No se concede
 ninguna ACE a `Authenticated Users`, `Everyone` ni `BUILTIN\Users`.
-El bootstrap no crea `STOP_TRADING` ni `authorization.json`: su ausencia no
-autoriza trading; solo indica que esas dos señales humanas opcionales no han
-sido afirmadas. Si un administrador las crea posteriormente, debe reaplicar o
-validar su ACL exacta antes de iniciar el Gateway.
+El bootstrap no crea `STOP_TRADING` ni ningún artifact de autorización: su
+ausencia no autoriza trading. `demo-authorization` tiene cuatro ACE explícitos
+y ninguna ACE Deny: SYSTEM y Administrators reciben FullControl con
+`ContainerInherit,ObjectInherit`; Gateway recibe RX+Synchronize
+`ThisObjectOnly`; y una segunda ACE Gateway concede Read+Synchronize con
+`ObjectInherit,InheritOnly`. Esta última no usa `ContainerInherit`, por lo que
+solo los ficheros hijos heredan lectura. Gateway no recibe
+Create/WriteData/AppendData/Delete/ChangePermissions/TakeOwnership y Agent no
+recibe acceso.
+
+Para `MT5_READ_ONLY_PREFLIGHT` el único nombre aceptado es
+`mt5-read-only-authorization-<UUID>.json`. `authorization.json`, cualquier otro
+`*.json`, subdirectorios y reparse points se rechazan. Un directorio vacío es
+válido; los artifacts existentes se verifican sin reescribirlos. La ruta
+legacy `demo_authorization_path` sigue reservada al flujo DEMO futuro, pero no
+constituye un artifact válido ni se crea automáticamente en este gate read-only.
+
+Las migraciones se separan: `Set-MT5ReadOnlyAuthorizationAcl.ps1` solo cambia
+el descriptor del parent y escribe su reporte; el gate independiente
+`Set-MT5ReadOnlyProtectedIdentity.ps1` actualiza transaccionalmente la identidad
+broker protegida. Ambos son dry-run por defecto y requieren `-Apply` humano.
 
 La preparación es reanudable: `trading.yaml` preexistente debe coincidir byte a
 byte con la plantilla OBSERVE_ONLY inválida y una key IPC preexistente debe ser
