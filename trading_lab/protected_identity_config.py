@@ -21,7 +21,8 @@ from .config import (
 from .domain import TradingMode
 
 
-TARGET_ACCOUNT = 107554164
+TARGET_ACCOUNT = 10012236003
+PREVIOUS_TARGET_ACCOUNT = 107554164
 TARGET_SERVER = "MetaQuotes-Demo"
 TARGET_SYMBOL = "XAUUSD"
 TARGET_TERMINAL = r"C:\Program Files\MetaTrader 5\terminal64.exe"
@@ -83,10 +84,18 @@ def plan_identity_update(raw: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     server = raw.get("authorized_server")
     if account == 0 and server == "CHANGE_ME":
         state = "KNOWN_PLACEHOLDER"
+    elif (
+        account == PREVIOUS_TARGET_ACCOUNT
+        and server == TARGET_SERVER
+        and access is False
+    ):
+        state = "KNOWN_PREVIOUS_TARGET"
     elif account == TARGET_ACCOUNT and server == TARGET_SERVER and access is False:
         state = "EXACT_TARGET"
     else:
-        raise ConfigError("protected account/server state is neither the known placeholder nor exact target")
+        raise ConfigError(
+            "protected account/server state is not a reviewed identity transition state"
+        )
 
     candidate = copy.deepcopy(raw)
     candidate["authorized_account"] = TARGET_ACCOUNT

@@ -170,10 +170,11 @@ independientes, ambos dry-run por defecto:
 ```
 
 El primero migra únicamente el parent `control\demo-authorization` al modelo
-de lectura heredada para ficheros con nombre UUID estricto. El segundo reemplaza
-de forma transaccional solo los placeholders conocidos por cuenta `107554164`,
-servidor `MetaQuotes-Demo` y `mt5_access_enabled: false`, manteniendo XAUUSD,
-terminal exacto y `OBSERVE_ONLY`. Rechaza terceros estados, conserva la ACL
+de lectura heredada para ficheros con nombre UUID estricto. El segundo implementa
+la rotación unidireccional revisada `107554164` → `10012236003` exclusivamente en
+`MetaQuotes-Demo` con `mt5_access_enabled: false`; también admite el placeholder
+de bootstrap conocido y mantiene XAUUSD, terminal exacto y `OBSERVE_ONLY`. No
+admite rotaciones arbitrarias. Rechaza terceros estados, conserva la ACL
 exacta del YAML, valida con `load_mt5_security_config` y revierte el contenido
 si falla el replace, ACL o reload. Ninguno importa ni accede a MT5.
 

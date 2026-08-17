@@ -42,7 +42,7 @@ $report = [ordered]@{
     initial_state = $null
     mt5_access_enabled_initially_present = $null
     target = [ordered]@{
-        authorized_account = 107554164
+        authorized_account = 10012236003
         authorized_server = 'MetaQuotes-Demo'
         allowed_symbol = 'XAUUSD'
         mt5_terminal_path = 'C:\Program Files\MetaTrader 5\terminal64.exe'
@@ -262,8 +262,12 @@ try {
     if (-not [bool]$inspection.candidate_schema_validated) {
         throw 'Protected identity candidate did not pass schema prevalidation.'
     }
+    $migrationRequired = @('KNOWN_PLACEHOLDER', 'KNOWN_PREVIOUS_TARGET') -contains $report.initial_state
+    if (-not $migrationRequired -and $report.initial_state -ne 'EXACT_TARGET') {
+        throw 'Protected identity helper returned an unreviewed transition state.'
+    }
 
-    if (-not $Apply -or $report.initial_state -eq 'KNOWN_PLACEHOLDER') {
+    if (-not $Apply -or $migrationRequired) {
         $rendered = Invoke-ProtectedHelper 'render' 'RENDER' "-B -m trading_lab.protected_identity_config render --config `"$configPath`" --output `"$tempPath`""
         if ([string]$rendered.source_sha256 -ne $report.hash_before -or
             [string]$rendered.candidate_sha256 -ne $report.hash_candidate) {
@@ -291,7 +295,7 @@ try {
     if (-not $Apply) {
         $report.real_loader_validated = $false
         $report.hash_after = $report.hash_before
-    } elseif ($report.initial_state -eq 'KNOWN_PLACEHOLDER') {
+    } elseif ($migrationRequired) {
         [System.IO.File]::Replace($tempPath, $configPath, $backupPath, $true)
         $replacePerformed = $true
         $report.controlled_replace_performed = $true

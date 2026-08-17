@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 from trading_lab.config import ConfigError
 from trading_lab.protected_identity_config import (
+    CONTROLLED_KEYS,
+    PREVIOUS_TARGET_ACCOUNT,
     TARGET_ACCOUNT,
     TARGET_MODE,
     TARGET_SERVER,
@@ -68,14 +70,41 @@ class ProtectedIdentityConfigTests(unittest.TestCase):
         for key in set(raw) - {"authorized_account", "authorized_server"}:
             self.assertEqual(raw[key], candidate[key])
 
+    def test_reviewed_previous_identity_becomes_only_new_exact_target(self) -> None:
+        raw = placeholder()
+        raw.update({
+            "authorized_account": PREVIOUS_TARGET_ACCOUNT,
+            "authorized_server": TARGET_SERVER,
+            "mt5_access_enabled": False,
+        })
+        before = copy.deepcopy(raw)
+        state, candidate = plan_identity_update(raw)
+        self.assertEqual("KNOWN_PREVIOUS_TARGET", state)
+        self.assertEqual(10012236003, TARGET_ACCOUNT)
+        self.assertEqual(TARGET_ACCOUNT, candidate["authorized_account"])
+        self.assertEqual(TARGET_SERVER, candidate["authorized_server"])
+        self.assertIs(candidate["mt5_access_enabled"], False)
+        for key in set(before) - CONTROLLED_KEYS:
+            self.assertEqual(before[key], candidate[key], key)
+        self.assertEqual(26081101, candidate["magic_number"])
+        self.assertEqual(TARGET_MODE, candidate["trading_mode"])
+        self.assertEqual(TARGET_SYMBOL, candidate["allowed_symbol"])
+        self.assertEqual(TARGET_TERMINAL, candidate["mt5_terminal_path"])
+
     def test_exact_target_is_idempotent(self) -> None:
         _, exact = plan_identity_update(placeholder())
         state, second = plan_identity_update(exact)
         self.assertEqual("EXACT_TARGET", state)
         self.assertEqual(exact, second)
+        self.assertEqual(10012236003, second["authorized_account"])
 
     def test_unexpected_account_or_server_fails_closed(self) -> None:
-        cases = ((42, "CHANGE_ME"), (0, "Other-Demo"), (TARGET_ACCOUNT, "CHANGE_ME"))
+        cases = (
+            (42, TARGET_SERVER),
+            (0, "Other-Demo"),
+            (TARGET_ACCOUNT, "Other-Demo"),
+            (PREVIOUS_TARGET_ACCOUNT, "Other-Demo"),
+        )
         for account, server in cases:
             with self.subTest(account=account, server=server):
                 raw = placeholder()
@@ -97,13 +126,29 @@ class ProtectedIdentityConfigTests(unittest.TestCase):
                 with self.assertRaises(ConfigError):
                     plan_identity_update(raw)
 
+        for account in (PREVIOUS_TARGET_ACCOUNT, TARGET_ACCOUNT):
+            with self.subTest(account=account, mt5_access_enabled=True):
+                raw = placeholder()
+                raw.update({
+                    "authorized_account": account,
+                    "authorized_server": TARGET_SERVER,
+                    "mt5_access_enabled": True,
+                })
+                with self.assertRaises(ConfigError):
+                    plan_identity_update(raw)
+
     def test_render_is_structured_yaml_and_preserves_uncontrolled_values(self) -> None:
         raw = placeholder()
         rendered = render_candidate(raw)
         parsed = parse_yaml_bytes(rendered)
         self.assertEqual(TARGET_ACCOUNT, parsed["authorized_account"])
+        self.assertEqual(10012236003, parsed["authorized_account"])
         self.assertEqual(TARGET_SERVER, parsed["authorized_server"])
         self.assertEqual(raw["risk"], parsed["risk"])
+        self.assertEqual(26081101, parsed["magic_number"])
+        self.assertEqual(TARGET_MODE, parsed["trading_mode"])
+        self.assertEqual(TARGET_SYMBOL, parsed["allowed_symbol"])
+        self.assertEqual(TARGET_TERMINAL, parsed["mt5_terminal_path"])
         self.assertNotIn("MetaTrader5", sys.modules)
 
     def test_unknown_fields_and_credentials_are_rejected(self) -> None:

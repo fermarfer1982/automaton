@@ -45,6 +45,19 @@ $repairHelperSource = [System.IO.File]::ReadAllText($repairHelperPath)
 $repairVerifierSource = [System.IO.File]::ReadAllText($repairVerifierPath)
 $protectedIdentitySource = [System.IO.File]::ReadAllText($protectedIdentityPath)
 $protectedHelperSource = [System.IO.File]::ReadAllText($protectedHelperPath)
+$protectedIdentityTokens = $null
+$protectedIdentityErrors = $null
+$protectedIdentityAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    $protectedIdentityPath, [ref]$protectedIdentityTokens, [ref]$protectedIdentityErrors
+)
+$protectedIdentityParameters = @($protectedIdentityAst.ParamBlock.Parameters | ForEach-Object {
+    $_.Name.VariablePath.UserPath
+})
+if ($protectedIdentityParameters.Count -ne 2 -or
+    $protectedIdentityParameters[0] -ne 'RunId' -or
+    $protectedIdentityParameters[1] -ne 'Apply') {
+    throw 'Protected identity gate must expose exactly RunId and Apply; arbitrary account input is forbidden.'
+}
 . $protectedHelperPath
 . $repairHelperPath
 foreach ($forbidden in @('Start-Process -Credential', 'runas.exe', '.order_send(', '.order_check(', 'import MetaTrader5')) {
@@ -204,6 +217,7 @@ foreach ($requiredConfigGate in @(
     'Pre-existing RunId artifacts were preserved; this run did not own them.',
     'Rollback backup is unavailable; automatic cleanup was withheld.',
     "trading_mode = 'OBSERVE_ONLY'",
+    'authorized_account = 10012236003',
     'mt5_access_enabled = $false'
 )) {
     if (-not $protectedIdentitySource.Contains($requiredConfigGate)) {
@@ -257,35 +271,37 @@ if ($preValidationCall -lt 0 -or $replaceCall -le $preValidationCall -or
     throw 'Protected identity transaction does not order pre-validation, replace, canonical validation, and rollback.'
 }
 
-$prepareCondition = "if (-not `$Apply -or `$report.initial_state -eq 'KNOWN_PLACEHOLDER')"
+$migrationStateCondition = "`$migrationRequired = @('KNOWN_PLACEHOLDER', 'KNOWN_PREVIOUS_TARGET') -contains `$report.initial_state"
+$prepareCondition = 'if (-not $Apply -or $migrationRequired)'
 $dryRunCondition = 'if (-not $Apply)'
-$applyPlaceholderCondition = "elseif (`$report.initial_state -eq 'KNOWN_PLACEHOLDER')"
+$applyMigrationCondition = 'elseif ($migrationRequired)'
+$migrationStateIndex = $protectedIdentitySource.IndexOf($migrationStateCondition)
 $prepareIndex = $protectedIdentitySource.IndexOf($prepareCondition)
 $dryRunIndex = $protectedIdentitySource.IndexOf($dryRunCondition, [Math]::Max(0, $prepareIndex))
-$applyPlaceholderIndex = $protectedIdentitySource.IndexOf(
-    $applyPlaceholderCondition,
+$applyMigrationIndex = $protectedIdentitySource.IndexOf(
+    $applyMigrationCondition,
     [Math]::Max(0, $dryRunIndex)
 )
-if ($prepareIndex -lt 0 -or $dryRunIndex -le $prepareIndex -or
-    $applyPlaceholderIndex -le $dryRunIndex) {
+if ($migrationStateIndex -lt 0 -or $prepareIndex -le $migrationStateIndex -or
+    $dryRunIndex -le $prepareIndex -or $applyMigrationIndex -le $dryRunIndex) {
     throw 'Protected identity gate lacks the reviewed dry-run/apply branch structure.'
 }
 $inspectCall = $protectedIdentitySource.IndexOf("Invoke-ProtectedHelper 'inspect' 'INSPECT'")
 if ($inspectCall -lt 0 -or $inspectCall -ge $prepareIndex) {
     throw 'Dry-run does not inspect the canonical config before candidate preparation.'
 }
-$dryKnownPlaceholderPath = $protectedIdentitySource.Substring(
+$dryReviewedMigrationPath = $protectedIdentitySource.Substring(
     $inspectCall,
-    $applyPlaceholderIndex - $inspectCall
+    $applyMigrationIndex - $inspectCall
 )
-$dryHelperCalls = [regex]::Matches($dryKnownPlaceholderPath, 'Invoke-ProtectedHelper\s+''').Count
+$dryHelperCalls = [regex]::Matches($dryReviewedMigrationPath, 'Invoke-ProtectedHelper\s+''').Count
 if ($dryHelperCalls -ne 3) {
-    throw "Dry-run KNOWN_PLACEHOLDER path must contain exactly three helper calls; found $dryHelperCalls."
+    throw "Dry-run reviewed migration path must contain exactly three helper calls; found $dryHelperCalls."
 }
 $prepareBlock = $protectedIdentitySource.Substring($prepareIndex, $dryRunIndex - $prepareIndex)
 $dryRunBlock = $protectedIdentitySource.Substring(
     $dryRunIndex,
-    $applyPlaceholderIndex - $dryRunIndex
+    $applyMigrationIndex - $dryRunIndex
 )
 foreach ($requiredDryPreparation in @(
     "Invoke-ProtectedHelper 'render' 'RENDER'",
@@ -330,27 +346,27 @@ foreach ($forbiddenDryMutation in @(
         throw "Dry-run branch contains forbidden mutation or post-validation: $forbiddenDryMutation"
     }
 }
-$applyPlaceholderEnd = $protectedIdentitySource.IndexOf(
+$applyMigrationEnd = $protectedIdentitySource.IndexOf(
     "`n    } else {",
-    [Math]::Max(0, $applyPlaceholderIndex)
+    [Math]::Max(0, $applyMigrationIndex)
 )
-if ($applyPlaceholderEnd -le $applyPlaceholderIndex) {
-    throw 'Apply placeholder branch boundary was not found.'
+if ($applyMigrationEnd -le $applyMigrationIndex) {
+    throw 'Apply reviewed migration branch boundary was not found.'
 }
 $commonCleanupIndex = $protectedIdentitySource.IndexOf(
     '$cleanup = Remove-ProtectedIdentityTransactionArtifacts',
-    [Math]::Max(0, $applyPlaceholderEnd)
+    [Math]::Max(0, $applyMigrationEnd)
 )
 $dryPassIndex = $protectedIdentitySource.IndexOf(
     "`$report.status = if (`$Apply) { 'PASS' } else { 'DRY_RUN_PASS' }",
     [Math]::Max(0, $commonCleanupIndex)
 )
-if ($commonCleanupIndex -le $applyPlaceholderEnd -or $dryPassIndex -le $commonCleanupIndex) {
+if ($commonCleanupIndex -le $applyMigrationEnd -or $dryPassIndex -le $commonCleanupIndex) {
     throw 'Dry-run cleanup is not common, verified, and ordered before DRY_RUN_PASS.'
 }
 $commonFinalization = $protectedIdentitySource.Substring(
-    $applyPlaceholderEnd,
-    $dryPassIndex - $applyPlaceholderEnd
+    $applyMigrationEnd,
+    $dryPassIndex - $applyMigrationEnd
 )
 foreach ($requiredDryFinalization in @(
     '$report.acl_after_sddl = $finalAcl.sddl',
@@ -363,18 +379,33 @@ foreach ($requiredDryFinalization in @(
         throw "Dry-run finalization lacks verified evidence: $requiredDryFinalization"
     }
 }
-$applyPlaceholderBlock = $protectedIdentitySource.Substring(
-    $applyPlaceholderIndex,
-    $applyPlaceholderEnd - $applyPlaceholderIndex
+$applyMigrationBlock = $protectedIdentitySource.Substring(
+    $applyMigrationIndex,
+    $applyMigrationEnd - $applyMigrationIndex
 )
 foreach ($requiredApplyMutation in @(
     '[System.IO.File]::Replace($tempPath, $configPath, $backupPath, $true)',
     'Set-Acl -LiteralPath $configPath -AclObject $originalAcl',
     "Invoke-ProtectedHelper 'validate' 'VALIDATE_POST_REPLACE'"
 )) {
-    if (-not $applyPlaceholderBlock.Contains($requiredApplyMutation)) {
+    if (-not $applyMigrationBlock.Contains($requiredApplyMutation)) {
         throw "Apply path lost transaction stage: $requiredApplyMutation"
     }
+}
+if (-not $protectedIdentitySource.Contains(
+    "if (-not `$migrationRequired -and `$report.initial_state -ne 'EXACT_TARGET')"
+)) {
+    throw 'Protected identity gate does not fail closed on an unreviewed helper state.'
+}
+$exactTargetApplyBlock = $protectedIdentitySource.Substring(
+    $applyMigrationEnd,
+    $commonCleanupIndex - $applyMigrationEnd
+)
+if (-not $exactTargetApplyBlock.Contains(
+    "Invoke-ProtectedHelper 'validate' 'VALIDATE_POST_REPLACE'"
+) -or $exactTargetApplyBlock.Contains('[System.IO.File]::Replace($tempPath, $configPath') -or
+    $exactTargetApplyBlock.Contains('Set-Acl -LiteralPath $configPath')) {
+    throw 'EXACT_TARGET Apply must validate only, without controlled replace or ACL mutation.'
 }
 if (-not $protectedIdentitySource.Contains('if ($Apply -and $replacePerformed)')) {
     throw 'Rollback is not structurally restricted to an Apply replacement.'

@@ -1171,9 +1171,19 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn("VALIDATE_PRE_REPLACE", protected_identity)
         self.assertIn("VALIDATE_POST_REPLACE", protected_identity)
         self.assertIn(
-            "if (-not $Apply -or $report.initial_state -eq 'KNOWN_PLACEHOLDER')",
+            "$migrationRequired = @('KNOWN_PLACEHOLDER', "
+            "'KNOWN_PREVIOUS_TARGET') -contains $report.initial_state",
             protected_identity,
         )
+        self.assertIn(
+            "if (-not $Apply -or $migrationRequired)",
+            protected_identity,
+        )
+        self.assertIn("elseif ($migrationRequired)", protected_identity)
+        self.assertNotIn("[string] $Account", protected_identity)
+        self.assertIn("authorized_account = 10012236003", protected_identity)
+        self.assertIn("PREVIOUS_TARGET_ACCOUNT = 107554164", python_helper)
+        self.assertIn("TARGET_ACCOUNT = 10012236003", python_helper)
         self.assertIn("$report.real_loader_validated = $false", protected_identity)
         self.assertIn("$report.hash_after = $report.hash_before", protected_identity)
         self.assertIn("_build_mt5_security_config", python_helper)
