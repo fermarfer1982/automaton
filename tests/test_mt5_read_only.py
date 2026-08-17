@@ -48,6 +48,7 @@ class FakeMT5Module:
     def __init__(self, root: Path) -> None:
         self.calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
         self.initialize_result = True
+        self.last_error_result: object = (1, "unavailable")
         self.terminal = SimpleNamespace(
             connected=True,
             trade_allowed=True,
@@ -99,7 +100,7 @@ class FakeMT5Module:
 
     def last_error(self):
         self._record("last_error")
-        return 1, "unavailable"
+        return self.last_error_result
 
 
 def adapter_for(module: FakeMT5Module) -> MT5ReadOnlyAdapter:
@@ -214,6 +215,8 @@ class MT5ReadOnlyPreflightTests(unittest.TestCase):
         self.assertAlmostEqual(0.10, report["spread"])
         self.assertTrue(report["mt5_shutdown_called"])
         self.assertTrue(report["mt5_initialize_succeeded"])
+        self.assertIsNone(report["mt5_last_error_code"])
+        self.assertIsNone(report["mt5_last_error_message"])
         self.assertTrue(report["authorization_required"])
         self.assertTrue(report["authorization_present"])
         self.assertTrue(report["authorization_valid"])
@@ -264,15 +267,85 @@ class MT5ReadOnlyPreflightTests(unittest.TestCase):
 
     def test_initialize_false_calls_last_error_but_not_shutdown(self) -> None:
         self.module.initialize_result = False
+        self.module.last_error_result = (-10003, "example")
         report = self.run_preflight()
         self.assertEqual("FAIL", report["status"])
         self.assertEqual("MT5_READ_ONLY_INITIALIZE_FAILED", report["failure_code"])
+        self.assertEqual("MT5_INITIALIZE", report["failure_stage"])
         self.assertEqual(["initialize", "last_error"], [
             call[0] for call in self.module.calls
         ])
+        self.assertEqual(-10003, report["mt5_last_error_code"])
+        self.assertEqual("example", report["mt5_last_error_message"])
         self.assertTrue(report["mt5_initialize_called"])
         self.assertFalse(report["mt5_initialize_succeeded"])
         self.assertFalse(report["mt5_shutdown_called"])
+        for prohibited in (
+            "login", "symbol_select", "market_book_add", "market_book_release",
+            "copy_ticks_from", "order_check", "order_send",
+        ):
+            self.assertFalse(report[f"{prohibited}_called"], prohibited)
+
+    def test_malformed_last_error_preserves_primary_initialize_failure(self) -> None:
+        malformed_values = (
+            None,
+            (),
+            (-10003,),
+            (-10003, "example", "unexpected"),
+            (True, "example"),
+            ("-10003", "example"),
+            (-10003, object()),
+        )
+        for malformed in malformed_values:
+            with self.subTest(last_error=type(malformed).__name__):
+                self.module.initialize_result = False
+                self.module.last_error_result = malformed
+                report = self.run_preflight()
+                self.assertEqual("FAIL", report["status"])
+                self.assertEqual(
+                    "MT5_READ_ONLY_INITIALIZE_FAILED", report["failure_code"]
+                )
+                self.assertEqual("MT5_INITIALIZE", report["failure_stage"])
+                self.assertIsNone(report["mt5_last_error_code"])
+                self.assertIsNone(report["mt5_last_error_message"])
+                self.assertEqual(
+                    ["initialize", "last_error"],
+                    [call[0] for call in self.module.calls],
+                )
+                self.assertFalse(report["mt5_shutdown_called"])
+                self.module = FakeMT5Module(self.root)
+
+    def test_last_error_exception_preserves_primary_initialize_failure(self) -> None:
+        self.module.initialize_result = False
+        self.module.last_error = Mock(side_effect=RuntimeError("secondary diagnostic"))
+        report = self.run_preflight(adapter=adapter_for(self.module))
+        self.assertEqual("FAIL", report["status"])
+        self.assertEqual("MT5_READ_ONLY_INITIALIZE_FAILED", report["failure_code"])
+        self.assertEqual("MT5_INITIALIZE", report["failure_stage"])
+        self.assertEqual(
+            "MetaTrader5 initialize returned false.", report["runtime_error"]
+        )
+        self.assertIsNone(report["mt5_last_error_code"])
+        self.assertIsNone(report["mt5_last_error_message"])
+        self.module.last_error.assert_called_once_with()
+        self.assertFalse(report["mt5_shutdown_called"])
+
+    def test_last_error_message_is_redacted_and_bounded(self) -> None:
+        self.module.initialize_result = False
+        self.module.last_error_result = (
+            -10003,
+            "password=hunter2 server=Broker-Demo C:\\Users\\Operator\\terminal "
+            + ("x" * 700),
+        )
+        report = self.run_preflight()
+        message = report["mt5_last_error_message"]
+        self.assertIsInstance(message, str)
+        self.assertLessEqual(len(message), 512)
+        self.assertNotIn("hunter2", message)
+        self.assertNotIn("Broker-Demo", message)
+        self.assertNotIn("C:\\Users", message)
+        self.assertIn("[REDACTED]", message)
+        self.assertIn("[REDACTED_PATH]", message)
 
     def test_missing_read_payloads_fail_and_shutdown(self) -> None:
         cases = (

@@ -42,6 +42,8 @@ $report = [ordered]@{
     mt5_initialize_called = $false
     mt5_initialize_result = $false
     mt5_initialize_succeeded = $false
+    mt5_last_error_code = $null
+    mt5_last_error_message = $null
     mt5_accessed = $false
     mt5_shutdown_called = $false
     terminal_connected = $false
@@ -303,7 +305,8 @@ function Copy-PreflightEvidence([object] $Child, [System.Collections.IDictionary
         'effective_sid', 'status', 'failure_code', 'failure_stage', 'runtime_error',
         'python_executable', 'trading_mode', 'mt5_package_version', 'mt5_terminal_version',
         'mt5_imported', 'mt5_initialize_called', 'mt5_initialize_result',
-        'mt5_initialize_succeeded', 'mt5_accessed',
+        'mt5_initialize_succeeded', 'mt5_last_error_code',
+        'mt5_last_error_message', 'mt5_accessed',
         'mt5_shutdown_called', 'terminal_connected', 'terminal_trade_allowed',
         'terminal_path_match', 'account_info_read', 'account_login_match',
         'account_server_match', 'account_name_match', 'account_trade_mode',
@@ -344,6 +347,8 @@ function Test-PreflightChildBoundary([object] $Child) {
             [bool]$Child.mt5_initialize_called -and
             [bool]$Child.mt5_initialize_result -and
             [bool]$Child.mt5_initialize_succeeded -and
+            $null -eq $Child.mt5_last_error_code -and
+            $null -eq $Child.mt5_last_error_message -and
             [bool]$Child.mt5_accessed -and
             [bool]$Child.mt5_shutdown_called -and
             [bool]$Child.terminal_connected -and

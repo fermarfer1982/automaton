@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import math
+import operator
 import os
 import re
 import stat
@@ -220,6 +221,8 @@ def _new_report(run_id: str) -> dict[str, object]:
         "mt5_initialize_called": False,
         "mt5_initialize_result": False,
         "mt5_initialize_succeeded": False,
+        "mt5_last_error_code": None,
+        "mt5_last_error_message": None,
         "mt5_accessed": False,
         "mt5_shutdown_called": False,
         "terminal_connected": False,
@@ -278,18 +281,42 @@ _SENSITIVE_ASSIGNMENT = re.compile(
     r"(?i)\b(password|passwd|api[_ -]?key|ipc[_ -]?key|credential|credentials|"
     r"login|account|server|token|secret)\b\s*[:=]\s*[^\s,;]+"
 )
+_MT5_DIAGNOSTIC_PATH = re.compile(r"(?i)(?:[a-z]:\\|\\\\)[^\r\n]*")
+
+
+def _sanitize_bounded_text(message: str, sensitive_values: tuple[str, ...] = ()) -> str:
+    message = message.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    for value in sensitive_values:
+        if value:
+            message = message.replace(value, "[REDACTED]")
+    message = _SENSITIVE_ASSIGNMENT.sub(
+        lambda match: f"{match.group(1)}=[REDACTED]", message
+    )
+    message = " ".join(message.split()).strip()
+    return message[:512]
 
 
 def _sanitize_runtime_error(
     error: BaseException, sensitive_values: tuple[str, ...] = ()
 ) -> str:
-    message = str(error).replace("\r", " ").replace("\n", " ").replace("\t", " ")
-    for value in sensitive_values:
-        if value:
-            message = message.replace(value, "[REDACTED]")
-    message = _SENSITIVE_ASSIGNMENT.sub(lambda match: f"{match.group(1)}=[REDACTED]", message)
-    message = " ".join(message.split()).strip() or type(error).__name__
-    return message[:512]
+    return _sanitize_bounded_text(str(error), sensitive_values) or type(error).__name__[:512]
+
+
+def _safe_mt5_last_error(
+    value: object, sensitive_values: tuple[str, ...] = ()
+) -> tuple[int | None, str | None]:
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        return None, None
+    raw_code, raw_message = value
+    if isinstance(raw_code, bool) or not isinstance(raw_message, str):
+        return None, None
+    try:
+        code = operator.index(raw_code)
+    except (TypeError, ValueError, OverflowError):
+        return None, None
+    path_redacted_message = _MT5_DIAGNOSTIC_PATH.sub("[REDACTED_PATH]", raw_message)
+    message = _sanitize_bounded_text(path_redacted_message, sensitive_values)
+    return code, message or None
 
 
 def _fail(code: str, stage: str, message: str) -> None:
@@ -576,7 +603,16 @@ def execute_mt5_read_only_preflight(
         report["mt5_initialize_result"] = initialized
         if not initialized:
             try:
-                adapter.last_error()
+                diagnostic = adapter.last_error()
+                sensitive_values = (
+                    str(config.authorized_account),
+                    config.authorized_server,
+                    config.authorized_account_name or "",
+                )
+                (
+                    report["mt5_last_error_code"],
+                    report["mt5_last_error_message"],
+                ) = _safe_mt5_last_error(diagnostic, sensitive_values)
             except BaseException:
                 pass
             _fail(

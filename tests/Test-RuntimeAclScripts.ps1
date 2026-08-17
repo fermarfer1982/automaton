@@ -761,6 +761,7 @@ foreach ($requiredReadOnly in @(
     'Receive-PreflightStreamCapture', 'Get-SanitizedBoundedProcessText',
     'Test-PreflightChildBoundary', 'Copy-PreflightEvidence',
     'mt5_initialize_called', 'mt5_initialize_result', 'mt5_initialize_succeeded',
+    'mt5_last_error_code', 'mt5_last_error_message',
     'mt5_shutdown_called', 'kill_switch_readable', 'authorization_required',
     'authorization_present', 'authorization_valid', 'authorization_id',
     'authorization_run_id_match', 'authorization_not_expired',
@@ -811,6 +812,17 @@ $childBoundaryAst = $readOnlyAst.Find({
         $node.Name -eq 'Test-PreflightChildBoundary'
 }, $true)
 Assert-True ($null -ne $childBoundaryAst) 'MT5 read-only child-boundary function is missing.'
+$copyEvidenceAst = $readOnlyAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Copy-PreflightEvidence'
+}, $true)
+Assert-True ($null -ne $copyEvidenceAst) 'MT5 read-only evidence-copy function is missing.'
+foreach ($diagnosticField in @('mt5_last_error_code', 'mt5_last_error_message')) {
+    Assert-True (
+        $copyEvidenceAst.Extent.Text.Contains("'$diagnosticField'")
+    ) "MT5 read-only durable report must copy $diagnosticField."
+}
 . ([scriptblock]::Create($childBoundaryAst.Extent.Text))
 $normalizedRunId = '11111111-2222-4333-8444-555555555555'
 $expectedGatewaySid = 'S-1-5-21-568964486-193631783-1609210587-1007'
@@ -820,7 +832,8 @@ $validReadOnlyChild = [pscustomobject]@{
     effective_sid = $expectedGatewaySid; status = 'PASS'; python_executable = $pythonExecutable
     trading_mode = 'OBSERVE_ONLY'; mt5_package_version = '5.0.6090'
     mt5_imported = $true; mt5_initialize_called = $true; mt5_initialize_result = $true
-    mt5_initialize_succeeded = $true
+    mt5_initialize_succeeded = $true; mt5_last_error_code = $null
+    mt5_last_error_message = $null
     mt5_accessed = $true; mt5_shutdown_called = $true; terminal_connected = $true
     terminal_path_match = $true; account_info_read = $true; account_login_match = $true
     account_server_match = $true; account_demo_verified = $true; symbol = 'XAUUSD'
