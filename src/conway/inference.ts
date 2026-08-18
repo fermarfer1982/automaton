@@ -98,6 +98,10 @@ export function createInferenceClient(
     if (tools && tools.length > 0) {
       body.tools = tools;
       body.tool_choice = "auto";
+
+      if (backend === "openai" && model === "gpt-5.6-luna") {
+        body.reasoning_effort = "none";
+      }
     }
 
     if (backend === "anthropic") {
