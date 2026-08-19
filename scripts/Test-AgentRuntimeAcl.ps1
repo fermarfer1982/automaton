@@ -203,7 +203,9 @@ $controlPath = Join-Path $labRoot 'control'
 $demoAuthorizationPath = Join-Path $controlPath 'demo-authorization'
 $demoAuthorizationFile = Join-Path $demoAuthorizationPath 'authorization.json'
 $killSwitchPath = Join-Path $controlPath 'STOP_TRADING'
-$ipcKeyPath = Join-Path $labRoot 'ipc\automaton.key'
+$automatonKeyPath = Join-Path $labRoot 'ipc\automaton.key'
+$observationKeyPath = Join-Path $labRoot 'ipc\observation.key'
+$researchKeyPath = Join-Path $labRoot 'ipc\research.key'
 $operationalPath = Join-Path $labRoot 'operational'
 $researchPath = Join-Path $labRoot 'research'
 $auditSqlitePath = Join-Path $labRoot 'audit\sqlite'
@@ -212,6 +214,7 @@ $securityLogPath = Join-Path $labRoot 'logs\security\security.log'
 $reportPath = Join-Path $agentStatePath "acl-runtime-results\agent-$normalizedRunId.json"
 $tests = [ordered]@{}
 $unexpectedProtectedAccess = $false
+$criticalUnexpectedAllow = $false
 
 function Add-TestResult(
     [string] $Name,
@@ -255,11 +258,13 @@ function Add-DeniedRightTest(
     [string] $Name,
     [string] $Path,
     [uint32] $Right,
-    [bool] $Directory
+    [bool] $Directory,
+    [bool] $Critical = $false
 ) {
     $probe = Invoke-NativeAccessProbe $Path $Right $Directory
     if ($probe.Allowed) {
         Add-TestResult $Name 'DENY' 'ALLOW' 'PROTECTED_RIGHT_GRANTED_NO_MUTATION_PERFORMED'
+        if ($Critical) { $script:criticalUnexpectedAllow = $true }
     } elseif ($probe.ErrorCode -eq 5) {
         Add-TestResult $Name 'DENY' 'DENY' 'WIN32_ACCESS_DENIED'
     } else {
@@ -365,11 +370,22 @@ Add-DeniedRightTest 'WORKSPACE_MODIFY_CODE' (Join-Path $workspace 'package.json'
 Add-DeniedRightTest 'WORKSPACE_DELETE_CODE' (Join-Path $workspace 'package.json') $DELETE $false
 
 Add-DeniedRightTest 'CONFIG_READ' $configPath $FILE_LIST_DIRECTORY $false
-Add-AllowedFileReadTest 'IPC_READ' $ipcKeyPath $true
-Add-DeniedRightTest 'IPC_WRITE' $ipcKeyPath $FILE_WRITE_DATA $false
-Add-DeniedRightTest 'IPC_TRUNCATE' $ipcKeyPath $FILE_WRITE_DATA $false
-Add-DeniedRightTest 'IPC_DELETE' $ipcKeyPath $DELETE $false
-Add-DeniedRightTest 'IPC_CHANGE_ACL' $ipcKeyPath $WRITE_DAC $false
+Add-DeniedRightTest 'AUTOMATON_KEY_READ' $automatonKeyPath $FILE_LIST_DIRECTORY $false $true
+Add-DeniedRightTest 'AUTOMATON_KEY_WRITE' $automatonKeyPath $FILE_WRITE_DATA $false
+Add-DeniedRightTest 'AUTOMATON_KEY_TRUNCATE' $automatonKeyPath $FILE_WRITE_DATA $false
+Add-DeniedRightTest 'AUTOMATON_KEY_DELETE' $automatonKeyPath $DELETE $false
+Add-DeniedRightTest 'AUTOMATON_KEY_CHANGE_ACL' $automatonKeyPath $WRITE_DAC $false
+
+Add-AllowedFileReadTest 'OBSERVATION_KEY_READ' $observationKeyPath $true
+Add-DeniedRightTest 'OBSERVATION_KEY_WRITE' $observationKeyPath $FILE_WRITE_DATA $false
+Add-DeniedRightTest 'OBSERVATION_KEY_TRUNCATE' $observationKeyPath $FILE_WRITE_DATA $false
+Add-DeniedRightTest 'OBSERVATION_KEY_DELETE' $observationKeyPath $DELETE $false
+Add-DeniedRightTest 'OBSERVATION_KEY_CHANGE_ACL' $observationKeyPath $WRITE_DAC $false
+Add-AllowedFileReadTest 'RESEARCH_KEY_READ' $researchKeyPath $true
+Add-DeniedRightTest 'RESEARCH_KEY_WRITE' $researchKeyPath $FILE_WRITE_DATA $false
+Add-DeniedRightTest 'RESEARCH_KEY_TRUNCATE' $researchKeyPath $FILE_WRITE_DATA $false
+Add-DeniedRightTest 'RESEARCH_KEY_DELETE' $researchKeyPath $DELETE $false
+Add-DeniedRightTest 'RESEARCH_KEY_CHANGE_ACL' $researchKeyPath $WRITE_DAC $false
 
 Add-DeniedRightTest 'OPERATIONAL_ACCESS' $operationalPath $FILE_LIST_DIRECTORY $true
 Add-DeniedRightTest 'RESEARCH_ACCESS' $researchPath $FILE_LIST_DIRECTORY $true
@@ -412,7 +428,9 @@ $report = [ordered]@{
     role = 'AutomatonAgent'
     run_id = $normalizedRunId
     effective_sid = $effectiveSid
-    status = if ($allPassed) { 'PASS' } else { 'FAIL' }
+    status = if ($criticalUnexpectedAllow) {
+        'CRITICAL_UNEXPECTED_ALLOW'
+    } elseif ($allPassed) { 'PASS' } else { 'FAIL' }
     completed_at_utc = [DateTime]::UtcNow.ToString('o')
     tests = $tests
     boundaries = [ordered]@{

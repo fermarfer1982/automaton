@@ -52,7 +52,9 @@ $configFile = Join-Path $control 'trading.yaml'
 $killSwitchFile = Join-Path $control 'STOP_TRADING'
 $demoAuthorization = Join-Path $control 'demo-authorization'
 $ipc = Join-Path $root 'ipc'
-$apiKeyFile = Join-Path $ipc 'automaton.key'
+$automatonKeyFile = Join-Path $ipc 'automaton.key'
+$observationKeyFile = Join-Path $ipc 'observation.key'
+$researchKeyFile = Join-Path $ipc 'research.key'
 $operational = Join-Path $root 'operational'
 $research = Join-Path $root 'research'
 $audit = Join-Path $root 'audit'
@@ -281,10 +283,16 @@ $aclProposals = @(
     New-DemoAuthorizationAclProposal
     New-AclProposal $ipc 'shared_ipc_directory' @($gatewaySid, $automatonSid) @(
         'ReadAndExecute', 'ReadAndExecute'
-    ) 'ThisObjectOnly' @('automaton.key')
-    New-AclProposal $apiKeyFile 'shared_ipc_key_file' @($gatewaySid, $automatonSid) @(
-        'Read', 'Read'
+    ) 'ThisObjectOnly' @('automaton.key', 'observation.key', 'research.key')
+    New-AclProposal $automatonKeyFile 'gateway_automaton_ipc_key_file' @($gatewaySid) @(
+        'Read'
     ) 'None' @('automaton.key')
+    New-AclProposal $observationKeyFile 'shared_observation_ipc_key_file' @($gatewaySid, $automatonSid) @(
+        'Read', 'Read'
+    ) 'None' @('observation.key')
+    New-AclProposal $researchKeyFile 'shared_research_ipc_key_file' @($gatewaySid, $automatonSid) @(
+        'Read', 'Read'
+    ) 'None' @('research.key')
     New-AclProposal $operational 'gateway_operational_data' @($gatewaySid) @(
         'Modify'
     ) 'ContainerInherit,ObjectInherit' @('gateway.lock', 'idempotency', 'lifecycle', 'reconciliation')
@@ -335,7 +343,8 @@ $plan = [pscustomobject]@{
     sqlite_immutable = $false
     append_acl_claim = 'risk reduction only; negative runtime tests required after ACL application'
     precreated_by_administrator = @(
-        $apiKeyFile, $auditJournalFile, $securityLogFile
+        $automatonKeyFile, $observationKeyFile, $researchKeyFile,
+        $auditJournalFile, $securityLogFile
     )
     optional_human_asserted_files = @($killSwitchFile)
     authorization_artifact_pattern = 'mt5-read-only-authorization-<UUID>.json'
@@ -586,7 +595,9 @@ if (Test-Path -LiteralPath $killSwitchFile -PathType Leaf) {
 }
 Set-ExactDemoAuthorizationAcl
 Set-ExactAcl $ipc @($gatewaySid, $automatonSid) @($readExecute, $readExecute) $true $false
-Set-ExactAcl $apiKeyFile @($gatewaySid, $automatonSid) @($read, $read) $false $false
+Set-ExactAcl $automatonKeyFile @($gatewaySid) @($read) $false $false
+Set-ExactAcl $observationKeyFile @($gatewaySid, $automatonSid) @($read, $read) $false $false
+Set-ExactAcl $researchKeyFile @($gatewaySid, $automatonSid) @($read, $read) $false $false
 Set-ExactTreeAcl $operational @($gatewaySid) @($modify) 'operational'
 Set-ExactTreeAcl $research @($gatewaySid) @($modify)
 Set-ExactAcl $audit @($gatewaySid) @($readExecute) $true $false

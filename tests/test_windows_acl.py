@@ -188,10 +188,25 @@ def safe_snapshot() -> dict[str, object]:
                 READ_EXECUTE_RIGHTS,
                 is_directory=True,
             ),
-            shared_target(
+            target(
                 "C:/ipc/automaton.key",
-                "ipc_key",
-                "ipc_file",
+                "ipc_automaton_key",
+                "gateway_ipc_file",
+                GATEWAY,
+                READ_RIGHTS,
+                is_directory=False,
+            ),
+            shared_target(
+                "C:/ipc/observation.key",
+                "ipc_observation_key",
+                "shared_ipc_file",
+                READ_RIGHTS,
+                is_directory=False,
+            ),
+            shared_target(
+                "C:/ipc/research.key",
+                "ipc_research_key",
+                "shared_ipc_file",
                 READ_RIGHTS,
                 is_directory=False,
             ),
@@ -437,17 +452,34 @@ class WindowsAclTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 discover_mt5_read_only_authorizations(directory)
 
-    def test_rejects_ipc_key_write_delete_or_execute(self) -> None:
-        for unsafe in (MODIFY_RIGHTS, READ_RIGHTS | 32, READ_RIGHTS | 65536):
-            snapshot = safe_snapshot()
-            snapshot["targets"][6]["rules"][2] = rule(GATEWAY, unsafe)  # type: ignore[index]
-            self.assertFalse(verify(snapshot).passed)
+    def test_enforces_split_ipc_key_matrix_and_rejects_mutation(self) -> None:
+        self.assertTrue(verify(safe_snapshot()).passed)
+        agent_automaton_read = safe_snapshot()
+        agent_automaton_read["targets"][6]["rules"].append(  # type: ignore[index,union-attr]
+            rule(AGENT, READ_RIGHTS)
+        )
+        self.assertFalse(verify(agent_automaton_read).passed)
+
+        for target_index in (6, 7, 8):
+            for unsafe in (MODIFY_RIGHTS, READ_RIGHTS | 32, READ_RIGHTS | 65536):
+                snapshot = safe_snapshot()
+                snapshot["targets"][target_index]["rules"][2] = rule(  # type: ignore[index]
+                    GATEWAY, unsafe
+                )
+                self.assertFalse(verify(snapshot).passed)
+
+        for target_index in (7, 8):
+            missing_agent = safe_snapshot()
+            missing_agent["targets"][target_index]["rules"] = (  # type: ignore[index]
+                missing_agent["targets"][target_index]["rules"][:-1]  # type: ignore[index]
+            )
+            self.assertFalse(verify(missing_agent).passed)
 
     def test_append_file_allows_append_but_rejects_overwrite_delete_and_modify(self) -> None:
         self.assertTrue(verify(safe_snapshot()).passed)
         for unsafe in (APPEND_ONLY_RIGHTS | 2, APPEND_ONLY_RIGHTS | 65536, MODIFY_RIGHTS):
             snapshot = safe_snapshot()
-            snapshot["targets"][8]["rules"][2] = rule(GATEWAY, unsafe)  # type: ignore[index]
+            snapshot["targets"][10]["rules"][2] = rule(GATEWAY, unsafe)  # type: ignore[index]
             self.assertFalse(verify(snapshot).passed)
 
     def test_rejects_deny_inherited_unexpected_and_missing_admin_recovery_aces(self) -> None:

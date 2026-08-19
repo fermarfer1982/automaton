@@ -209,7 +209,10 @@ Assert-True `
 
 foreach ($required in @(
     'WORKSPACE_READ', 'WORKSPACE_CREATE', 'WORKSPACE_MODIFY_CODE', 'WORKSPACE_DELETE_CODE',
-    'CONFIG_READ', 'IPC_READ', 'IPC_WRITE', 'IPC_TRUNCATE', 'IPC_DELETE', 'IPC_CHANGE_ACL',
+    'CONFIG_READ',
+    'AUTOMATON_KEY_READ', 'AUTOMATON_KEY_WRITE', 'AUTOMATON_KEY_TRUNCATE', 'AUTOMATON_KEY_DELETE', 'AUTOMATON_KEY_CHANGE_ACL',
+    'OBSERVATION_KEY_READ', 'OBSERVATION_KEY_WRITE', 'OBSERVATION_KEY_TRUNCATE', 'OBSERVATION_KEY_DELETE', 'OBSERVATION_KEY_CHANGE_ACL',
+    'RESEARCH_KEY_READ', 'RESEARCH_KEY_WRITE', 'RESEARCH_KEY_TRUNCATE', 'RESEARCH_KEY_DELETE', 'RESEARCH_KEY_CHANGE_ACL',
     'OPERATIONAL_ACCESS', 'RESEARCH_ACCESS', 'AUDIT_SQLITE_ACCESS', 'AUDIT_JOURNAL_ACCESS',
     'SECURITY_LOG_ACCESS', 'STATE_CREATE_WRITE_READ_DELETE',
     'DEMO_AUTH_CREATE', 'DEMO_AUTH_MODIFY', 'DEMO_AUTH_DELETE',
@@ -221,14 +224,23 @@ foreach ($required in @(
 Assert-True `
     ($agent.Contains('READ_SUCCEEDED_CONTENT_NOT_REPORTED')) `
     'Agent IPC read must report success without key content.'
-Assert-True `
-    (-not $agent.Contains('ReadAllText($ipcKeyPath')) `
-    'Agent script must not materialize the IPC key as text.'
+foreach ($credentialPathVariable in @('$automatonKeyPath', '$observationKeyPath', '$researchKeyPath')) {
+    Assert-True `
+        (-not $agent.Contains("ReadAllText($credentialPathVariable")) `
+        "Agent script must not materialize $credentialPathVariable as text."
+}
+Assert-True ($agent.Contains("Add-DeniedRightTest 'AUTOMATON_KEY_READ' `$automatonKeyPath `$FILE_LIST_DIRECTORY `$false `$true")) `
+    'Agent automaton.key read access must be a critical protected-boundary probe.'
+Assert-True ($agent.Contains("'CRITICAL_UNEXPECTED_ALLOW'")) `
+    'Agent unexpected automaton.key access must produce a critical status.'
 
 foreach ($required in @(
     'WORKSPACE_READ', 'WORKSPACE_CREATE', 'WORKSPACE_MODIFY_CODE', 'WORKSPACE_DELETE_CODE',
     'CONFIG_READ', 'CONFIG_OBSERVE_ONLY', 'CONFIG_WRITE', 'CONFIG_TRUNCATE', 'CONFIG_DELETE', 'CONFIG_REPLACE',
-    'IPC_READ', 'IPC_WRITE', 'IPC_TRUNCATE', 'IPC_DELETE', 'IPC_REPLACE', 'IPC_CHANGE_ACL',
+    'AUTOMATON_KEY_READ', 'AUTOMATON_KEY_WRITE', 'AUTOMATON_KEY_TRUNCATE', 'AUTOMATON_KEY_DELETE', 'AUTOMATON_KEY_CHANGE_ACL',
+    'OBSERVATION_KEY_READ', 'OBSERVATION_KEY_WRITE', 'OBSERVATION_KEY_TRUNCATE', 'OBSERVATION_KEY_DELETE', 'OBSERVATION_KEY_CHANGE_ACL',
+    'RESEARCH_KEY_READ', 'RESEARCH_KEY_WRITE', 'RESEARCH_KEY_TRUNCATE', 'RESEARCH_KEY_DELETE', 'RESEARCH_KEY_CHANGE_ACL',
+    'IPC_REPLACE',
     'OPERATIONAL_MODIFY', 'RESEARCH_MODIFY', 'SQLITE_WAL',
     'JOURNAL_APPEND', 'JOURNAL_READ', 'JOURNAL_OVERWRITE', 'JOURNAL_TRUNCATE',
     'JOURNAL_CREATE_OVERWRITE', 'JOURNAL_DELETE', 'JOURNAL_RENAME', 'JOURNAL_REPLACE', 'JOURNAL_CHANGE_ACL',
@@ -301,9 +313,11 @@ foreach ($required in @(
 )) {
     Assert-True ($gateway.Contains($required)) "Structured runtime diagnostic is missing: $required"
 }
-Assert-True `
-    (-not $gateway.Contains('ReadAllText($ipcKeyPath')) `
-    'Gateway script must not materialize the IPC key as text.'
+foreach ($credentialPathVariable in @('$automatonKeyPath', '$observationKeyPath', '$researchKeyPath')) {
+    Assert-True `
+        (-not $gateway.Contains("ReadAllText($credentialPathVariable")) `
+        "Gateway script must not materialize $credentialPathVariable as text."
+}
 Assert-True `
     ($gateway.Contains("trading_mode\s*:\s*OBSERVE_ONLY")) `
     'Gateway runtime test must fail closed unless config remains OBSERVE_ONLY.'
@@ -631,6 +645,8 @@ foreach ($requiredHealthOnly in @(
     "`$expectedGatewaySid = 'S-1-5-21-568964486-193631783-1609210587-1007'",
     "`$finalRoot = 'C:\automaton\.venv'",
     "`$pythonExecutable = 'C:\automaton\.venv\Scripts\python.exe'",
+    "`$apiKeyPath = 'C:\ProgramData\AutomatonMT5Lab\ipc\automaton.key'",
+    "`$researchKeyPath = 'C:\ProgramData\AutomatonMT5Lab\ipc\research.key'",
     "`$listenAddress = '127.0.0.1'", '[ValidateRange(1024, 65535)]',
     "`$startInfo.EnvironmentVariables['TRADING_MODE'] = 'OBSERVE_ONLY'",
     "`$startInfo.EnvironmentVariables['MT5_ACCESS_ENABLED'] = 'false'",
@@ -638,6 +654,7 @@ foreach ($requiredHealthOnly in @(
     '--controlled-stdin-shutdown', '$healthUri = "http://127.0.0.1`:$ListenPort/health"',
     'Invoke-WebRequest', '-UseBasicParsing', '-TimeoutSec 3',
     "-Headers @{ 'X-AUTOMATON-KEY' = `$apiKey }",
+    'automaton_key_validated = $false', 'research_key_validated = $false',
     'Get-FinalRuntimeFingerprint',
     'Assert-LoopbackPortAvailable', '[System.Diagnostics.ProcessStartInfo]::new()',
     'UseShellExecute = $false', 'RedirectStandardInput = $true',
@@ -696,7 +713,12 @@ Assert-True ($healthPollingExitIndex -gt $healthStartIndex -and $healthPollingEx
 Assert-True ($healthShutdownGuardIndex -ge 0 -and $healthShutdownGuardIndex -lt $healthStdinIndex) 'Controlled stdin shutdown must be guarded by a live-process check.'
 Assert-True (-not $gatewayHealthOnly.Contains('Write-Output $apiKey')) 'Gateway health-only harness must not print the IPC key.'
 Assert-True (-not $gatewayHealthOnly.Contains('Write-Host $apiKey')) 'Gateway health-only harness must not host-print the IPC key.'
-Assert-True ($gatewayHealthOnly.Contains(".Replace(`$SensitiveValue, '[REDACTED]')")) 'Gateway health-only errors must redact the exact IPC key value.'
+Assert-True (-not $gatewayHealthOnly.Contains('Write-Output $researchKey')) 'Gateway health-only harness must not print the research key.'
+Assert-True (-not $gatewayHealthOnly.Contains('Write-Host $researchKey')) 'Gateway health-only harness must not host-print the research key.'
+Assert-True ($gatewayHealthOnly.Contains(".Replace(`$sensitiveValue, '[REDACTED]')")) 'Gateway health-only errors must redact every exact credential value.'
+Assert-True ($gatewayHealthOnly.Contains('Get-SanitizedRuntimeError $_ $sensitiveValues')) 'Gateway health-only errors must use the multi-credential redaction set.'
+Assert-True (-not $gatewayHealthOnly.Contains("-Headers @{ 'X-AUTOMATON-RESEARCH-KEY'")) 'Health must not send the research credential header.'
+Assert-True (-not $gatewayHealthOnly.Contains('X-AUTOMATON-API-KEY')) 'Health harness must not add a legacy authentication header.'
 Assert-True ($gatewayHealthOnly.Contains("`$process.Kill()")) 'Gateway health-only cleanup must retain bounded forced termination of its process object.'
 Assert-True (-not $gatewayHealthOnly.Contains('Stop-Process')) 'Gateway health-only cleanup must not address arbitrary processes.'
 
@@ -924,6 +946,8 @@ foreach ($required in @(
     'runtime_acl_canary', 'runtime_acl_append_probe', 'Test-JournalHashChain',
     'Get-CimInstance Win32_Process', 'lab_processes_stopped',
     'trading_mode\s*:\s*OBSERVE_ONLY', 'RUNTIME_ACL_GATE',
+    'AGENT_AUTOMATON_KEY_READ', 'AGENT_OBSERVATION_KEY_READ', 'AGENT_RESEARCH_KEY_READ',
+    'GATEWAY_AUTOMATON_KEY_READ', 'GATEWAY_OBSERVATION_KEY_READ', 'GATEWAY_RESEARCH_KEY_READ',
     'MT5_ACCESSED', 'ORDER_CHECK_EXECUTED', 'ORDER_SEND_EXECUTED',
     'DEMO_EXECUTION_ENABLED', 'TRADING_MODE'
 )) {

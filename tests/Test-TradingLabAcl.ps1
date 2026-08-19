@@ -135,6 +135,45 @@ foreach ($requiredPolicyBoundary in @(
         throw "ACL source does not consume the canonical maintenance policy: $requiredPolicyBoundary"
     }
 }
+foreach ($ipcCredentialBoundary in @(
+    "`$automatonKeyFile = Join-Path `$ipc 'automaton.key'",
+    "`$observationKeyFile = Join-Path `$ipc 'observation.key'",
+    "`$researchKeyFile = Join-Path `$ipc 'research.key'",
+    "New-AclProposal `$ipc 'shared_ipc_directory' @(`$gatewaySid, `$automatonSid)",
+    "New-AclProposal `$automatonKeyFile 'gateway_automaton_ipc_key_file' @(`$gatewaySid)",
+    "New-AclProposal `$observationKeyFile 'shared_observation_ipc_key_file' @(`$gatewaySid, `$automatonSid)",
+    "New-AclProposal `$researchKeyFile 'shared_research_ipc_key_file' @(`$gatewaySid, `$automatonSid)",
+    'Set-ExactAcl $ipc @($gatewaySid, $automatonSid) @($readExecute, $readExecute) $true $false',
+    'Set-ExactAcl $automatonKeyFile @($gatewaySid) @($read) $false $false',
+    'Set-ExactAcl $observationKeyFile @($gatewaySid, $automatonSid) @($read, $read) $false $false',
+    'Set-ExactAcl $researchKeyFile @($gatewaySid, $automatonSid) @($read, $read) $false $false'
+)) {
+    if (-not $source.Contains($ipcCredentialBoundary)) {
+        throw "ACL source lacks split IPC credential boundary: $ipcCredentialBoundary"
+    }
+}
+if ($source.Contains('$apiKeyFile') -or
+    $source.Contains('[System.Security.AccessControl.AccessControlType]::Deny')) {
+    throw 'ACL source contains an ambiguous IPC variable or explicit Deny ACE strategy.'
+}
+foreach ($applyCredentialBoundary in @(
+    "automaton = (Join-Path `$labRoot 'ipc\automaton.key')",
+    "observation = (Join-Path `$labRoot 'ipc\observation.key')",
+    "research = (Join-Path `$labRoot 'ipc\research.key')",
+    'automaton_key_created',
+    'observation_key_created',
+    'research_key_created',
+    'Get-CredentialRollbackSnapshot',
+    'Invoke-CredentialStateRollback',
+    'Credential was not proven to have been created by this gate; refusing deletion.',
+    'Pre-existing credential content changed; refusing content rollback.',
+    'Assert-NoUnexpectedAllow $snapshots.automaton_key @($systemSid, $administratorsSid, $gatewaySid)',
+    '(Get-AllowRights $snapshots.automaton_key $agentSid) -ne 0'
+)) {
+    if (-not $applySource.Contains($applyCredentialBoundary)) {
+        throw "ACL apply gate lacks split credential/rollback boundary: $applyCredentialBoundary"
+    }
+}
 if ($source.Contains('S-1-5-21-568964486-193631783-1609210587-1001')) {
     throw 'Maintenance SID must be resolved from the configured account name, not hardcoded.'
 }

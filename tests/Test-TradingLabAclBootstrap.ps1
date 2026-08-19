@@ -22,7 +22,8 @@ foreach ($required in @(
     '$rng.GetBytes($bytes)',
     '$rng.Dispose()',
     'New-Object byte[] 32',
-    '[System.IO.FileMode]::CreateNew'
+    '[System.IO.FileMode]::CreateNew',
+    '[System.IO.FileAttributes]::ReparsePoint'
 )) {
     if (-not $helperSource.Contains($required)) {
         throw "CSPRNG implementation lacks required boundary: $required"
@@ -58,7 +59,10 @@ try {
     $lab = Join-Path $caseA 'lab'
     $state = Join-Path $caseA 'agent\.automaton'
     $result = Initialize-TradingLabBootstrapState $lab $state $templatePath
-    if (-not $result.config_created -or -not $result.ipc_secret_created) {
+    if (-not $result.config_created -or
+        -not $result.automaton_key_created -or
+        -not $result.observation_key_created -or
+        -not $result.research_key_created) {
         throw 'Case A did not create a fresh bootstrap.'
     }
     if ($result.authorization_artifact_count -ne 0 -or
@@ -67,39 +71,57 @@ try {
         throw 'Case A bootstrap authorization semantics are not empty and human-created only.'
     }
     [void](Assert-ExactBootstrapConfig (Join-Path $lab 'control\trading.yaml') $templatePath)
-    $caseASecretPath = Join-Path $lab 'ipc\automaton.key'
-    [void](Assert-ValidIpcSecret $caseASecretPath)
-    $caseASecret = [System.IO.File]::ReadAllText($caseASecretPath, [System.Text.Encoding]::ASCII)
+    $caseASecrets = [System.Collections.Generic.List[string]]::new()
     try {
-        if (($result | ConvertTo-Json -Depth 5).Contains($caseASecret)) {
-            throw 'Case A exposed the IPC secret through structured output.'
+        $structuredOutput = $result | ConvertTo-Json -Depth 5
+        foreach ($keyName in @('automaton.key', 'observation.key', 'research.key')) {
+            $secretPath = Join-Path $lab "ipc\$keyName"
+            [void](Assert-ValidIpcSecret $secretPath)
+            $secretValue = [System.IO.File]::ReadAllText($secretPath, [System.Text.Encoding]::ASCII)
+            $caseASecrets.Add($secretValue)
+            if ($structuredOutput.Contains($secretValue)) {
+                throw "Case A exposed $keyName through structured output."
+            }
+        }
+        if (@($caseASecrets | Select-Object -Unique).Count -ne 3) {
+            throw 'Case A generated duplicate IPC credential values.'
         }
     } finally {
-        $caseASecret = $null
+        $caseASecrets.Clear()
     }
 } finally {
     Remove-TestRoot $caseA
 }
 
-$caseB = New-TestRoot 'b-d'
+$caseB = New-TestRoot 'b'
 try {
     $lab = Join-Path $caseB 'lab'
     $state = Join-Path $caseB 'agent\.automaton'
     $first = Initialize-TradingLabBootstrapState $lab $state $templatePath
     $configPath = Join-Path $lab 'control\trading.yaml'
-    $secretPath = Join-Path $lab 'ipc\automaton.key'
     $configHashBefore = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
-    $secretHashBefore = (Get-FileHash -LiteralPath $secretPath -Algorithm SHA256).Hash
+    $hashesBefore = @{}
+    foreach ($keyName in @('automaton.key', 'observation.key', 'research.key')) {
+        $hashesBefore[$keyName] = (Get-FileHash -LiteralPath (Join-Path $lab "ipc\$keyName") -Algorithm SHA256).Hash
+    }
     $second = Initialize-TradingLabBootstrapState $lab $state $templatePath
     $configHashAfter = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
-    $secretHashAfter = (Get-FileHash -LiteralPath $secretPath -Algorithm SHA256).Hash
     if (
-        -not $second.config_reused -or -not $second.ipc_secret_reused -or
-        $configHashBefore -ne $configHashAfter -or $secretHashBefore -ne $secretHashAfter
-    ) { throw 'Cases B/D failed idempotent config or secret reuse.' }
+        -not $second.config_reused -or
+        -not $second.automaton_key_reused -or
+        -not $second.observation_key_reused -or
+        -not $second.research_key_reused -or
+        $configHashBefore -ne $configHashAfter
+    ) { throw 'Case B failed idempotent config or credential reuse.' }
+    foreach ($keyName in $hashesBefore.Keys) {
+        $hashAfter = (Get-FileHash -LiteralPath (Join-Path $lab "ipc\$keyName") -Algorithm SHA256).Hash
+        if ($hashAfter -ne $hashesBefore[$keyName]) {
+            throw "Case B replaced $keyName."
+        }
+    }
 } finally {
     $configHashBefore = $null; $configHashAfter = $null
-    $secretHashBefore = $null; $secretHashAfter = $null
+    $hashesBefore = $null; $hashAfter = $null
     Remove-TestRoot $caseB
 }
 
@@ -121,24 +143,121 @@ try {
     Remove-TestRoot $caseC
 }
 
+$caseD = New-TestRoot 'd'
+try {
+    $lab = Join-Path $caseD 'lab'
+    $ipc = Join-Path $lab 'ipc'
+    New-Item -ItemType Directory -Path $ipc -Force | Out-Null
+    $automatonPath = Join-Path $ipc 'automaton.key'
+    [void](New-CryptographicIpcSecret $automatonPath)
+    $hashBefore = (Get-FileHash -LiteralPath $automatonPath -Algorithm SHA256).Hash
+    $result = Initialize-TradingLabBootstrapState $lab (Join-Path $caseD 'agent\.automaton') $templatePath
+    if (-not $result.automaton_key_reused -or
+        -not $result.observation_key_created -or
+        -not $result.research_key_created -or
+        (Get-FileHash -LiteralPath $automatonPath -Algorithm SHA256).Hash -ne $hashBefore) {
+        throw 'Case D did not preserve automaton.key while creating only missing credentials.'
+    }
+} finally {
+    $hashBefore = $null
+    Remove-TestRoot $caseD
+}
+
 $caseE = New-TestRoot 'e'
 try {
     $lab = Join-Path $caseE 'lab'
-    $control = Join-Path $lab 'control'
     $ipc = Join-Path $lab 'ipc'
-    New-Item -ItemType Directory -Path $control | Out-Null
-    New-Item -ItemType Directory -Path $ipc | Out-Null
-    Copy-Item -LiteralPath $templatePath -Destination (Join-Path $control 'trading.yaml')
+    New-Item -ItemType Directory -Path $ipc -Force | Out-Null
     [System.IO.File]::WriteAllText((Join-Path $ipc 'automaton.key'), '')
     $failed = $false
     try {
         [void](Initialize-TradingLabBootstrapState $lab (Join-Path $caseE 'agent\.automaton') $templatePath)
     } catch { $failed = $true }
-    if (-not $failed -or (Test-Path -LiteralPath (Join-Path $lab 'operational'))) {
-        throw 'Case E did not reject an invalid existing secret before further preparation.'
+    if (-not $failed -or
+        (Test-Path -LiteralPath (Join-Path $ipc 'observation.key')) -or
+        (Test-Path -LiteralPath (Join-Path $ipc 'research.key')) -or
+        (Test-Path -LiteralPath (Join-Path $lab 'operational'))) {
+        throw 'Case E did not reject invalid automaton.key before further preparation.'
     }
 } finally {
     Remove-TestRoot $caseE
+}
+
+$caseF = New-TestRoot 'f'
+try {
+    $lab = Join-Path $caseF 'lab'
+    $ipc = Join-Path $lab 'ipc'
+    New-Item -ItemType Directory -Path $ipc -Force | Out-Null
+    [void](New-CryptographicIpcSecret (Join-Path $ipc 'automaton.key'))
+    [System.IO.File]::WriteAllText((Join-Path $ipc 'observation.key'), 'malformed')
+    $failed = $false
+    try { [void](Initialize-TradingLabBootstrapState $lab (Join-Path $caseF 'agent\.automaton') $templatePath) } catch { $failed = $true }
+    if (-not $failed -or (Test-Path -LiteralPath (Join-Path $ipc 'research.key')) -or
+        (Test-Path -LiteralPath (Join-Path $lab 'operational'))) {
+        throw 'Case F did not fail before creating research.key or later bootstrap state.'
+    }
+} finally {
+    Remove-TestRoot $caseF
+}
+
+$caseG = New-TestRoot 'g'
+try {
+    $lab = Join-Path $caseG 'lab'
+    $ipc = Join-Path $lab 'ipc'
+    New-Item -ItemType Directory -Path $ipc -Force | Out-Null
+    [void](New-CryptographicIpcSecret (Join-Path $ipc 'automaton.key'))
+    [System.IO.File]::WriteAllText((Join-Path $ipc 'research.key'), 'malformed')
+    $failed = $false
+    try { [void](Initialize-TradingLabBootstrapState $lab (Join-Path $caseG 'agent\.automaton') $templatePath) } catch { $failed = $true }
+    if (-not $failed -or (Test-Path -LiteralPath (Join-Path $ipc 'observation.key')) -or
+        (Test-Path -LiteralPath (Join-Path $lab 'operational'))) {
+        throw 'Case G did not fail before creating observation.key or later bootstrap state.'
+    }
+} finally {
+    Remove-TestRoot $caseG
+}
+
+$caseH = New-TestRoot 'h'
+try {
+    $lab = Join-Path $caseH 'lab'
+    $ipc = Join-Path $lab 'ipc'
+    New-Item -ItemType Directory -Path $ipc -Force | Out-Null
+    $existingHashes = @{}
+    foreach ($keyName in @('automaton.key', 'observation.key')) {
+        $keyPath = Join-Path $ipc $keyName
+        [void](New-CryptographicIpcSecret $keyPath)
+        $existingHashes[$keyName] = (Get-FileHash -LiteralPath $keyPath -Algorithm SHA256).Hash
+    }
+    $result = Initialize-TradingLabBootstrapState $lab (Join-Path $caseH 'agent\.automaton') $templatePath
+    if (-not $result.automaton_key_reused -or -not $result.observation_key_reused -or
+        -not $result.research_key_created) {
+        throw 'Case H mixed partial-state result flags are incorrect.'
+    }
+    foreach ($keyName in $existingHashes.Keys) {
+        if ((Get-FileHash -LiteralPath (Join-Path $ipc $keyName) -Algorithm SHA256).Hash -ne $existingHashes[$keyName]) {
+            throw "Case H replaced valid existing $keyName."
+        }
+    }
+} finally {
+    $existingHashes = $null
+    Remove-TestRoot $caseH
+}
+
+$caseI = New-TestRoot 'i'
+try {
+    $lab = Join-Path $caseI 'lab'
+    $ipc = Join-Path $lab 'ipc'
+    New-Item -ItemType Directory -Path (Join-Path $ipc 'observation.key') -Force | Out-Null
+    $failed = $false
+    try { [void](Initialize-TradingLabBootstrapState $lab (Join-Path $caseI 'agent\.automaton') $templatePath) } catch { $failed = $true }
+    if (-not $failed -or
+        (Test-Path -LiteralPath (Join-Path $ipc 'automaton.key')) -or
+        (Test-Path -LiteralPath (Join-Path $ipc 'research.key')) -or
+        (Test-Path -LiteralPath (Join-Path $lab 'operational'))) {
+        throw 'Case I accepted a non-file credential path or created later bootstrap state.'
+    }
+} finally {
+    Remove-TestRoot $caseI
 }
 
 $caseAuthorization = New-TestRoot 'authorization-names'
@@ -193,12 +312,16 @@ try {
     CSPRNG_USED = 'PASS'
     SECRET_NOT_LOGGED = 'PASS'
     CASE_A_FRESH_BOOTSTRAP = 'PASS'
-    CASE_B_PARTIAL_CONFIG_RESUME = 'PASS'
+    CASE_B_IDEMPOTENT_THREE_KEY_REUSE = 'PASS'
     CASE_C_CHANGED_CONFIG_FAIL_CLOSED = 'PASS'
-    CASE_D_EXISTING_SECRET_REUSED = 'PASS'
-    CASE_E_INVALID_SECRET_FAIL_CLOSED = 'PASS'
-    CASE_F_PRE_APPLY_STATUS = 'PASS'
-    CASE_G_PARTIAL_APPLY_STATUS = 'PASS'
+    CASE_D_AUTOMATON_PRESERVED_MISSING_KEYS_CREATED = 'PASS'
+    CASE_E_INVALID_AUTOMATON_FAIL_CLOSED = 'PASS'
+    CASE_F_INVALID_OBSERVATION_FAIL_CLOSED = 'PASS'
+    CASE_G_INVALID_RESEARCH_FAIL_CLOSED = 'PASS'
+    CASE_H_MIXED_VALID_PARTIAL_STATE = 'PASS'
+    CASE_I_NON_FILE_KEY_FAIL_CLOSED = 'PASS'
+    PRE_APPLY_STATUS = 'PASS'
+    PARTIAL_APPLY_STATUS = 'PASS'
     MAINTENANCE_POLICY_CANONICAL = 'PASS'
     MAINTENANCE_TARGET_ALLOWLIST_EXACT = 'PASS'
     AUTHORIZATION_ARTIFACTS_HUMAN_CREATED_ONLY = 'PASS'

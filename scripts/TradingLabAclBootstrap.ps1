@@ -66,6 +66,12 @@ function Assert-ExactBootstrapConfig([string] $ConfigPath, [string] $TemplatePat
     if (-not (Test-Path -LiteralPath $TemplatePath -PathType Leaf)) {
         throw 'Reviewed bootstrap template is absent.'
     }
+    foreach ($path in @($ConfigPath, $TemplatePath)) {
+        $item = Get-Item -LiteralPath $path -Force
+        if ($item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            throw 'Bootstrap configuration paths must be regular non-reparse files.'
+        }
+    }
     $configuredBytes = [System.IO.File]::ReadAllBytes($ConfigPath)
     $templateBytes = [System.IO.File]::ReadAllBytes($TemplatePath)
     if (-not (Test-ByteArrayEqual $configuredBytes $templateBytes)) {
@@ -198,14 +204,24 @@ function Initialize-TradingLabBootstrapState(
 ) {
     $createdPaths = [System.Collections.Generic.List[string]]::new()
     $configPath = Join-Path $LabRoot 'control\trading.yaml'
-    $secretPath = Join-Path $LabRoot 'ipc\automaton.key'
+    $secretDefinitions = @(
+        [pscustomobject]@{ name = 'automaton'; path = (Join-Path $LabRoot 'ipc\automaton.key') },
+        [pscustomobject]@{ name = 'observation'; path = (Join-Path $LabRoot 'ipc\observation.key') },
+        [pscustomobject]@{ name = 'research'; path = (Join-Path $LabRoot 'ipc\research.key') }
+    )
+    $appendTargets = @(
+        (Join-Path $LabRoot 'audit\journal\audit.jsonl'),
+        (Join-Path $LabRoot 'logs\security\security.log')
+    )
     # Validate every pre-existing security-sensitive file before creating any
     # additional path.  A corrupt partial state therefore fails without drift.
     if (Test-Path -LiteralPath $configPath) {
         [void](Assert-ExactBootstrapConfig $configPath $TemplatePath)
     }
-    if (Test-Path -LiteralPath $secretPath) {
-        [void](Assert-ValidIpcSecret $secretPath)
+    foreach ($secretDefinition in $secretDefinitions) {
+        if (Test-Path -LiteralPath $secretDefinition.path) {
+            [void](Assert-ValidIpcSecret $secretDefinition.path)
+        }
     }
     $authorizationRoot = Join-Path $LabRoot 'control\demo-authorization'
     $authorizationArtifacts = @()
@@ -221,6 +237,17 @@ function Initialize-TradingLabBootstrapState(
                 $artifact.Name -cnotmatch '^mt5-read-only-authorization-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$' -or
                 ($artifact.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
                 throw "Unexpected authorization artifact in bootstrap state: $($artifact.FullName)"
+            }
+        }
+    }
+    foreach ($appendTarget in $appendTargets) {
+        if (Test-Path -LiteralPath $appendTarget) {
+            if (-not (Test-Path -LiteralPath $appendTarget -PathType Leaf)) {
+                throw "Prepared append target is not a regular file: $appendTarget"
+            }
+            $appendTargetItem = Get-Item -LiteralPath $appendTarget -Force
+            if ($appendTargetItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                throw "Prepared append target cannot be a reparse point: $appendTarget"
             }
         }
     }
@@ -240,6 +267,15 @@ function Initialize-TradingLabBootstrapState(
         $AutomatonStateDir
     )
     foreach ($directory in $directories) {
+        if (Test-Path -LiteralPath $directory) {
+            $directoryItem = Get-Item -LiteralPath $directory -Force
+            if (-not $directoryItem.PSIsContainer -or
+                ($directoryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                throw "Bootstrap directory must be a regular non-reparse directory: $directory"
+            }
+        }
+    }
+    foreach ($directory in $directories) {
         if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
             New-Item -ItemType Directory -Path $directory | Out-Null
             $createdPaths.Add($directory)
@@ -254,25 +290,54 @@ function Initialize-TradingLabBootstrapState(
     }
     $config = Assert-ExactBootstrapConfig $configPath $TemplatePath
 
-    $secret = Initialize-IdempotentIpcSecret $secretPath
-    if ($secret.created) { $createdPaths.Add($secretPath) }
-
-    foreach ($file in @(
-        (Join-Path $LabRoot 'audit\journal\audit.jsonl'),
-        (Join-Path $LabRoot 'logs\security\security.log')
-    )) {
-        if (-not (Test-Path -LiteralPath $file)) {
-            $stream = [System.IO.FileStream]::new(
-                $file,
-                [System.IO.FileMode]::CreateNew,
-                [System.IO.FileAccess]::Write,
-                [System.IO.FileShare]::None
-            )
-            $stream.Dispose()
-            $createdPaths.Add($file)
-        } elseif (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
-            throw "Prepared append target is not a regular file: $file"
+    $secretResults = @{}
+    $createdSecretPaths = [System.Collections.Generic.List[string]]::new()
+    try {
+        foreach ($secretDefinition in $secretDefinitions) {
+            $secretResult = Initialize-IdempotentIpcSecret $secretDefinition.path
+            $secretResults[$secretDefinition.name] = $secretResult
+            if ($secretResult.created) {
+                $createdPaths.Add($secretDefinition.path)
+                $createdSecretPaths.Add($secretDefinition.path)
+            }
         }
+
+        foreach ($file in $appendTargets) {
+            if (-not (Test-Path -LiteralPath $file)) {
+                $stream = [System.IO.FileStream]::new(
+                    $file,
+                    [System.IO.FileMode]::CreateNew,
+                    [System.IO.FileAccess]::Write,
+                    [System.IO.FileShare]::None
+                )
+                $stream.Dispose()
+                $createdPaths.Add($file)
+            } elseif (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+                throw "Prepared append target is not a regular file: $file"
+            }
+        }
+    } catch {
+        $primaryError = $_.Exception.Message
+        $cleanupErrors = [System.Collections.Generic.List[string]]::new()
+        foreach ($createdSecretPath in $createdSecretPaths) {
+            try {
+                $createdSecretItem = Get-Item -LiteralPath $createdSecretPath -Force -ErrorAction Stop
+                if ($createdSecretItem.PSIsContainer -or
+                    ($createdSecretItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                    throw 'Created credential path changed type during rollback.'
+                }
+                [System.IO.File]::Delete($createdSecretPath)
+                if (Test-Path -LiteralPath $createdSecretPath) {
+                    throw 'Created credential remained after rollback.'
+                }
+            } catch {
+                $cleanupErrors.Add("$createdSecretPath`: $($_.Exception.Message)")
+            }
+        }
+        if ($cleanupErrors.Count -ne 0) {
+            throw "Bootstrap failed: $primaryError Credential rollback failed: $($cleanupErrors -join '; ')"
+        }
+        throw
     }
 
     return [pscustomobject]@{
@@ -280,9 +345,15 @@ function Initialize-TradingLabBootstrapState(
         config_created = $configCreated
         config_reused = -not $configCreated
         config_valid = $config.exact_template
-        ipc_secret_created = $secret.created
-        ipc_secret_reused = $secret.reused
-        ipc_secret_length = $secret.encoded_length
+        automaton_key_created = $secretResults.automaton.created
+        automaton_key_reused = $secretResults.automaton.reused
+        automaton_key_length = $secretResults.automaton.encoded_length
+        observation_key_created = $secretResults.observation.created
+        observation_key_reused = $secretResults.observation.reused
+        observation_key_length = $secretResults.observation.encoded_length
+        research_key_created = $secretResults.research.created
+        research_key_reused = $secretResults.research.reused
+        research_key_length = $secretResults.research.encoded_length
         trading_mode = 'OBSERVE_ONLY'
         account_configured = $false
         authorization_artifact_pattern = 'mt5-read-only-authorization-<UUID>.json'

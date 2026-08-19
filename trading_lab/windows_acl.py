@@ -46,8 +46,10 @@ KNOWN_TARGET_KEYS = frozenset({
     "control_kill_switch",
     "control_mt5_read_only_authorization_file",
     "gateway_logs",
+    "ipc_automaton_key",
     "ipc_directory",
-    "ipc_key",
+    "ipc_observation_key",
+    "ipc_research_key",
     "lab_root",
     "logs_root",
     "operational",
@@ -255,6 +257,7 @@ def _targets(
     )):
         raise ValueError("Separated protected paths are required for ACL verification")
     lab_root = config.kill_switch_path.parent.parent
+    ipc_root = config.api_key_path.parent  # type: ignore[union-attr]
     raw: list[tuple[Path, str, str, bool, bool]] = [
         (lab_root, "lab_root", "shared_navigation", True, True),
         (config_path.parent, "control_directory", "gateway_navigation", True, True),
@@ -266,8 +269,10 @@ def _targets(
             True,
             True,
         ),
-        (config.api_key_path.parent, "ipc_directory", "shared_navigation", True, True),  # type: ignore[union-attr]
-        (config.api_key_path, "ipc_key", "ipc_file", False, True),  # type: ignore[arg-type]
+        (ipc_root, "ipc_directory", "shared_navigation", True, True),
+        (config.api_key_path, "ipc_automaton_key", "gateway_ipc_file", False, True),  # type: ignore[arg-type]
+        (ipc_root / "observation.key", "ipc_observation_key", "shared_ipc_file", False, True),
+        (ipc_root / "research.key", "ipc_research_key", "shared_ipc_file", False, True),
         (config.gateway_lock_path.parent, "operational", "gateway_modify", True, True),  # type: ignore[union-attr]
         (config.research_db_path.parent, "research", "gateway_modify", True, True),
         (config.audit_path.parent.parent, "audit_navigation", "gateway_navigation", True, True),
@@ -567,9 +572,12 @@ def evaluate_acl_snapshot(
                 raise ValueError(f"ACL target cannot be a reparse point: {path}")
             if target.get("require_protected", target.get("is_directory")) and not target.get("protected"):
                 raise ValueError(f"directory inheritance is not disabled: {path}")
-            if role in {"workspace_code", "shared_navigation", "ipc_file"}:
+            if role in {"workspace_code", "shared_navigation", "shared_ipc_file"}:
                 required_sids = {gateway_sid, automaton_sid}
                 forbidden_sid = None
+            elif role == "gateway_ipc_file":
+                required_sids = {gateway_sid}
+                forbidden_sid = automaton_sid
             else:
                 required_sid = automaton_sid if role == "automaton_state" else gateway_sid
                 required_sids = {required_sid}
@@ -681,7 +689,7 @@ def evaluate_acl_snapshot(
                         raise ValueError(f"runtime identity read access is denied on {path}")
                     if allow_rights[principal] != required:
                         raise ValueError(f"runtime read rights exceed the exact policy on {path}")
-            elif role == "ipc_file":
+            elif role in {"gateway_ipc_file", "shared_ipc_file"}:
                 for principal in required_sids:
                     rights = allow_rights[principal]
                     if rights & READ_RIGHTS != READ_RIGHTS:

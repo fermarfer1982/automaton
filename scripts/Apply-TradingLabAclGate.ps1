@@ -15,6 +15,11 @@ $gatewaySid = 'S-1-5-21-568964486-193631783-1609210587-1007'
 $usersSid = 'S-1-5-32-545'
 $systemSid = 'S-1-5-18'
 $administratorsSid = 'S-1-5-32-544'
+$credentialFiles = [ordered]@{
+    automaton = (Join-Path $labRoot 'ipc\automaton.key')
+    observation = (Join-Path $labRoot 'ipc\observation.key')
+    research = (Join-Path $labRoot 'ipc\research.key')
+}
 . (Join-Path $PSScriptRoot 'TradingLabFileSystemRights.ps1')
 $fullControl = 2032127L
 $readRights = 131209L
@@ -40,9 +45,19 @@ $report = [ordered]@{
     maintenance_sid = $null
     paths_created = @()
     prepared_state_verified = $false
-    ipc_secret_created = $false
-    ipc_secret_reused = $false
-    ipc_secret_length = $null
+    automaton_key_created = $false
+    automaton_key_reused = $false
+    automaton_key_length = $null
+    observation_key_created = $false
+    observation_key_reused = $false
+    observation_key_length = $null
+    research_key_created = $false
+    research_key_reused = $false
+    research_key_length = $null
+    credential_state_snapshots = @()
+    credential_state_rollback_attempted = $false
+    credential_state_rollback_succeeded = $null
+    credential_state_rollback_errors = @()
     security_descriptors_applied = @()
     acl_snapshots = @()
     checks = [ordered]@{}
@@ -55,6 +70,9 @@ $aclPolicyPath = Join-Path $workspace 'config\windows-acl-policy.json'
 $aclPolicy = $null
 $maintenanceSid = $null
 $progressPath = $ReportPath + '.acl-progress.jsonl'
+$credentialRollbackSnapshots = [ordered]@{}
+$credentialSnapshotsReady = $false
+$bootstrapMutationStarted = $false
 
 function Get-CanonicalPath([string] $Value) {
     if (-not [System.IO.Path]::IsPathRooted($Value)) {
@@ -148,6 +166,70 @@ function Get-AclSnapshot([string] $Path, [string] $Domain) {
         inheritance_protected = [bool]$acl.AreAccessRulesProtected
         rules = $rules
     }
+}
+
+function Get-CredentialRollbackSnapshot([string] $Name, [string] $Path) {
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [pscustomobject]@{
+            name = $Name
+            path = $Path
+            existed_before = $false
+            sha256_before = $null
+            acl_sddl_before = $null
+            acl_object = $null
+        }
+    }
+    [void](Assert-ValidIpcSecret $Path)
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    return [pscustomobject]@{
+        name = $Name
+        path = $Path
+        existed_before = $true
+        sha256_before = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        acl_sddl_before = $acl.Sddl
+        acl_object = $acl
+    }
+}
+
+function Invoke-CredentialStateRollback {
+    $report.credential_state_rollback_attempted = $true
+    $errors = [System.Collections.Generic.List[string]]::new()
+    foreach ($snapshot in $credentialRollbackSnapshots.Values) {
+        try {
+            if ($snapshot.existed_before) {
+                [void](Assert-ValidIpcSecret $snapshot.path)
+                $currentHash = (Get-FileHash -LiteralPath $snapshot.path -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($currentHash -ne $snapshot.sha256_before) {
+                    throw 'Pre-existing credential content changed; refusing content rollback.'
+                }
+                $currentAcl = Get-Acl -LiteralPath $snapshot.path -ErrorAction Stop
+                if ($currentAcl.Sddl -ne $snapshot.acl_sddl_before) {
+                    Set-Acl -LiteralPath $snapshot.path -AclObject $snapshot.acl_object -ErrorAction Stop
+                }
+                $verifiedAcl = Get-Acl -LiteralPath $snapshot.path -ErrorAction Stop
+                $verifiedHash = (Get-FileHash -LiteralPath $snapshot.path -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($verifiedAcl.Sddl -ne $snapshot.acl_sddl_before -or
+                    $verifiedHash -ne $snapshot.sha256_before) {
+                    throw 'Pre-existing credential rollback verification failed.'
+                }
+                continue
+            }
+
+            if (-not (Test-Path -LiteralPath $snapshot.path)) { continue }
+            if (@($report.paths_created) -notcontains $snapshot.path) {
+                throw 'Credential was not proven to have been created by this gate; refusing deletion.'
+            }
+            [void](Assert-ValidIpcSecret $snapshot.path)
+            [System.IO.File]::Delete($snapshot.path)
+            if (Test-Path -LiteralPath $snapshot.path) {
+                throw 'Created credential remained after rollback.'
+            }
+        } catch {
+            $errors.Add("$($snapshot.name): $($_.Exception.Message)")
+        }
+    }
+    $report.credential_state_rollback_errors = @($errors)
+    $report.credential_state_rollback_succeeded = $errors.Count -eq 0
 }
 
 function Get-AllowRights($Snapshot, [string] $Sid) {
@@ -334,23 +416,39 @@ try {
 
     $template = Join-Path $workspace 'config\trading.bootstrap-observe-only.yaml'
     $configPath = Join-Path $labRoot 'control\trading.yaml'
-    # This validates an existing config/key before creating any new path.
+    # Validate every existing credential before creating any new path.
     if (Test-Path -LiteralPath $configPath) {
         [void](Assert-ExactBootstrapConfig $configPath $template)
     }
-    $existingSecretPath = Join-Path $labRoot 'ipc\automaton.key'
-    if (Test-Path -LiteralPath $existingSecretPath) {
-        [void](Assert-ValidIpcSecret $existingSecretPath)
+    foreach ($credentialEntry in $credentialFiles.GetEnumerator()) {
+        $snapshot = Get-CredentialRollbackSnapshot $credentialEntry.Key $credentialEntry.Value
+        $credentialRollbackSnapshots[$credentialEntry.Key] = $snapshot
     }
+    $credentialSnapshotsReady = $true
+    $report.credential_state_snapshots = @($credentialRollbackSnapshots.Values | ForEach-Object {
+        [ordered]@{
+            name = $_.name
+            path = $_.path
+            existed_before = $_.existed_before
+            acl_sddl_before = $_.acl_sddl_before
+        }
+    })
     $report.acl_prevalidation = 'PASS'
     Write-GateReport
 
+    $bootstrapMutationStarted = $true
     $prepared = Initialize-TradingLabBootstrapState $labRoot $agentState $template
     $report.paths_created = @($prepared.created_paths)
     $report.prepared_state_verified = $true
-    $report.ipc_secret_created = [bool]$prepared.ipc_secret_created
-    $report.ipc_secret_reused = [bool]$prepared.ipc_secret_reused
-    $report.ipc_secret_length = [int]$prepared.ipc_secret_length
+    $report.automaton_key_created = [bool]$prepared.automaton_key_created
+    $report.automaton_key_reused = [bool]$prepared.automaton_key_reused
+    $report.automaton_key_length = [int]$prepared.automaton_key_length
+    $report.observation_key_created = [bool]$prepared.observation_key_created
+    $report.observation_key_reused = [bool]$prepared.observation_key_reused
+    $report.observation_key_length = [int]$prepared.observation_key_length
+    $report.research_key_created = [bool]$prepared.research_key_created
+    $report.research_key_reused = [bool]$prepared.research_key_reused
+    $report.research_key_length = [int]$prepared.research_key_length
     Write-GateReport
 
     $aclScript = Join-Path $workspace 'scripts\Initialize-TradingLabAcl.ps1'
@@ -382,7 +480,9 @@ try {
         config = $configPath
         demo_authorization = (Join-Path $labRoot 'control\demo-authorization')
         ipc = (Join-Path $labRoot 'ipc')
-        ipc_key = (Join-Path $labRoot 'ipc\automaton.key')
+        automaton_key = $credentialFiles.automaton
+        observation_key = $credentialFiles.observation
+        research_key = $credentialFiles.research
         operational = (Join-Path $labRoot 'operational')
         research = (Join-Path $labRoot 'research')
         audit_sqlite = (Join-Path $labRoot 'audit\sqlite')
@@ -427,9 +527,10 @@ try {
         Assert-NoUnexpectedAllow $snapshots[$name] @($systemSid, $administratorsSid, $maintenanceSid, $gatewaySid)
         Assert-ExactMaintenanceAllow $snapshots[$name]
     }
-    foreach ($name in @('ipc', 'ipc_key')) {
+    foreach ($name in @('ipc', 'observation_key', 'research_key')) {
         Assert-NoUnexpectedAllow $snapshots[$name] @($systemSid, $administratorsSid, $gatewaySid, $agentSid)
     }
+    Assert-NoUnexpectedAllow $snapshots.automaton_key @($systemSid, $administratorsSid, $gatewaySid)
     Assert-NoUnexpectedAllow $snapshots.agent_state @($systemSid, $administratorsSid, $maintenanceSid, $agentSid)
     Assert-ExactMaintenanceAllow $snapshots.programdata
     Assert-ExactMaintenanceAllow $snapshots.agent_state
@@ -450,10 +551,19 @@ try {
         ($configGateway -band $writeOrSecurityRights) -ne 0
     ) { throw 'Protected config rights mismatch.' }
 
-    foreach ($principalSid in @($agentSid, $gatewaySid)) {
-        $keyRights = Get-AllowRights $snapshots.ipc_key $principalSid
-        if (($keyRights -band $readRights) -ne $readRights -or ($keyRights -band $writeOrSecurityRights) -ne 0) {
-            throw 'IPC key rights mismatch.'
+    $automatonGatewayRights = Get-AllowRights $snapshots.automaton_key $gatewaySid
+    if (($automatonGatewayRights -band $readRights) -ne $readRights -or
+        ($automatonGatewayRights -band $writeOrSecurityRights) -ne 0 -or
+        (Get-AllowRights $snapshots.automaton_key $agentSid) -ne 0) {
+        throw 'Automaton IPC key rights mismatch.'
+    }
+    foreach ($keyName in @('observation_key', 'research_key')) {
+        foreach ($principalSid in @($agentSid, $gatewaySid)) {
+            $keyRights = Get-AllowRights $snapshots[$keyName] $principalSid
+            if (($keyRights -band $readRights) -ne $readRights -or
+                ($keyRights -band $writeOrSecurityRights) -ne 0) {
+                throw "Shared IPC key rights mismatch: $keyName"
+            }
         }
     }
     foreach ($name in @('operational', 'research', 'audit_sqlite', 'gateway_logs')) {
@@ -496,9 +606,13 @@ try {
         config_agent_access = 'NONE'
         config_gateway_read = $true
         config_gateway_write = $false
-        ipc_agent_read = $true
+        automaton_key_agent_read = $false
+        automaton_key_gateway_read = $true
+        observation_key_agent_read = $true
+        observation_key_gateway_read = $true
+        research_key_agent_read = $true
+        research_key_gateway_read = $true
         ipc_agent_write = $false
-        ipc_gateway_read = $true
         ipc_gateway_write = $false
         kill_switch_exists = $false
         kill_switch_agent_write = $false
@@ -547,12 +661,20 @@ try {
     }
     $report.completed_at_utc = [DateTime]::UtcNow.ToString('o')
 } catch {
+    $primaryError = $_.Exception.Message
+    if ($credentialSnapshotsReady -and $bootstrapMutationStarted) {
+        Invoke-CredentialStateRollback
+    }
     $report.security_descriptors_applied = @(Read-AclProgressFile $progressPath)
     $report.acl_apply = Resolve-AclApplyFailureStatus `
         $report.acl_apply `
         @($report.security_descriptors_applied).Count
     $report.acl_applied = $report.acl_apply -eq 'PASS'
-    $report.error = $_.Exception.Message
+    if ($report.credential_state_rollback_succeeded -eq $false) {
+        $report.error = "$primaryError Credential state rollback failed: $($report.credential_state_rollback_errors -join '; ')"
+    } else {
+        $report.error = $primaryError
+    }
     $report.completed_at_utc = [DateTime]::UtcNow.ToString('o')
 } finally {
     Write-GateReport

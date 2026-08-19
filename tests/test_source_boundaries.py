@@ -1137,6 +1137,15 @@ class SourceBoundaryTests(unittest.TestCase):
         self.assertIn("maintenance_identity", verifier)
         self.assertIn("maintenance_sid not in admin_members", verifier)
         self.assertIn("maintenance_policy.maintenance_targets.get(policy_key)", verifier)
+        for split_ipc_boundary in (
+            '"ipc_automaton_key"',
+            '"ipc_observation_key"',
+            '"ipc_research_key"',
+            '"gateway_ipc_file"',
+            '"shared_ipc_file"',
+        ):
+            self.assertIn(split_ipc_boundary, verifier)
+        self.assertNotIn('"ipc_key"', verifier)
         self.assertIn("Read-TradingLabWindowsAclPolicy", bootstrap)
         self.assertIn("config\\windows-acl-policy.json", initializer)
         for forbidden in ("Set-Acl", "icacls", "/grant", "/reset"):

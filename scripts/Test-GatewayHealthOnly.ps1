@@ -17,6 +17,7 @@ $finalRoot = 'C:\automaton\.venv'
 $pythonExecutable = 'C:\automaton\.venv\Scripts\python.exe'
 $configPath = 'C:\ProgramData\AutomatonMT5Lab\control\trading.yaml'
 $apiKeyPath = 'C:\ProgramData\AutomatonMT5Lab\ipc\automaton.key'
+$researchKeyPath = 'C:\ProgramData\AutomatonMT5Lab\ipc\research.key'
 $operationalRoot = 'C:\ProgramData\AutomatonMT5Lab\operational'
 $runtimeTemp = Join-Path $operationalRoot 'runtime-tmp'
 $reportRoot = Join-Path $operationalRoot 'gateway-startup-results'
@@ -40,6 +41,8 @@ $report = [ordered]@{
     listen_port = $ListenPort
     trading_mode = 'OBSERVE_ONLY'
     mt5_access_enabled = $false
+    automaton_key_validated = $false
+    research_key_validated = $false
     gateway_process_started = $false
     gateway_process_exit_observed = $false
     gateway_process_exit_code = $null
@@ -71,6 +74,8 @@ $report = [ordered]@{
 
 $effectiveSid = $null
 $apiKey = $null
+$researchKey = $null
+$sensitiveValues = @()
 $process = $null
 $stdoutReadTask = $null
 $stderrReadTask = $null
@@ -227,12 +232,14 @@ function Write-ExclusiveJson([string] $Path, [object] $Value) {
     } finally { $stream.Dispose() }
 }
 
-function Get-SanitizedRuntimeError([object] $ErrorRecord, [string] $SensitiveValue) {
+function Get-SanitizedRuntimeError([object] $ErrorRecord, [string[]] $SensitiveValues) {
     $message = $null
     try { $message = [string]$ErrorRecord.Exception.Message } catch {}
     if ([string]::IsNullOrWhiteSpace($message)) { $message = 'Unspecified harness failure.' }
-    if (-not [string]::IsNullOrEmpty($SensitiveValue)) {
-        $message = $message.Replace($SensitiveValue, '[REDACTED]')
+    foreach ($sensitiveValue in @($SensitiveValues)) {
+        if (-not [string]::IsNullOrEmpty($sensitiveValue)) {
+            $message = $message.Replace($sensitiveValue, '[REDACTED]')
+        }
     }
     $message = $message -replace '(?i)\b(password|passwd|api[_-]?key|ipc[_-]?key|credential|credentials|login|server|account)\b\s*[:=]\s*[^\s;,]+', '${1}=[REDACTED]'
     $message = ($message -replace '[\r\n\t]+', ' ').Trim()
@@ -242,17 +249,19 @@ function Get-SanitizedRuntimeError([object] $ErrorRecord, [string] $SensitiveVal
 
 function Get-SanitizedBoundedProcessText(
     [AllowNull()][string] $Text,
-    [AllowNull()][string] $SensitiveValue,
+    [AllowNull()][string[]] $SensitiveValues,
     [int] $MaximumUtf8Bytes = 8192
 ) {
     if ($MaximumUtf8Bytes -lt 64) { throw 'Process stream byte limit is too small.' }
     if ($null -eq $Text) { return '' }
     $sanitized = $Text
-    if (-not [string]::IsNullOrEmpty($SensitiveValue)) {
-        $sanitized = $sanitized.Replace($SensitiveValue, '[REDACTED]')
+    foreach ($sensitiveValue in @($SensitiveValues)) {
+        if (-not [string]::IsNullOrEmpty($sensitiveValue)) {
+            $sanitized = $sanitized.Replace($sensitiveValue, '[REDACTED]')
+        }
     }
     $secretAssignmentPattern = @'
-(?im)["']?(X-AUTOMATON-KEY|api[\s_-]?key|ipc[\s_-]?key|mt5[\s_-]?password|password|passwd|credential|credentials|client[\s_-]?secret|private[\s_-]?key|secret|access[\s_-]?token|refresh[\s_-]?token|token|mt5[\s_-]?login|login|authorized[\s_-]?account|account|server)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;}\r\n]+)
+(?im)["']?(X-AUTOMATON-KEY|X-AUTOMATON-RESEARCH-KEY|api[\s_-]?key|ipc[\s_-]?key|mt5[\s_-]?password|password|passwd|credential|credentials|client[\s_-]?secret|private[\s_-]?key|secret|access[\s_-]?token|refresh[\s_-]?token|token|mt5[\s_-]?login|login|authorized[\s_-]?account|account|server)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;}\r\n]+)
 '@.Trim()
     $sanitized = [regex]::Replace(
         $sanitized,
@@ -284,7 +293,7 @@ function Get-SanitizedBoundedProcessText(
 
 function Receive-GatewayStreamCapture(
     [AllowNull()][object] $ReadTask,
-    [AllowNull()][string] $SensitiveValue,
+    [AllowNull()][string[]] $SensitiveValues,
     [int] $TimeoutMilliseconds = 5000
 ) {
     if ($null -eq $ReadTask) {
@@ -305,14 +314,14 @@ function Receive-GatewayStreamCapture(
         return [pscustomobject]@{
             captured = $true
             sanitized = Get-SanitizedBoundedProcessText `
-                ([string]$ReadTask.Result) $SensitiveValue 8192
+                ([string]$ReadTask.Result) $SensitiveValues 8192
             error = $null
         }
     } catch {
         return [pscustomobject]@{
             captured = $false
             sanitized = $null
-            error = Get-SanitizedRuntimeError $_ $SensitiveValue
+            error = Get-SanitizedRuntimeError $_ $SensitiveValues
         }
     }
 }
@@ -356,7 +365,7 @@ try {
     foreach ($requiredDirectory in @($workspace, $finalRoot, $operationalRoot, $runtimeTemp)) {
         Assert-NoReparsePoint $requiredDirectory $true
     }
-    foreach ($requiredFile in @($pythonExecutable, $configPath, $apiKeyPath)) {
+    foreach ($requiredFile in @($pythonExecutable, $configPath, $apiKeyPath, $researchKeyPath)) {
         Assert-NoReparsePoint $requiredFile $false
     }
     if (-not [System.IO.Directory]::Exists($reportRoot)) {
@@ -381,9 +390,17 @@ try {
 
     $stage = 'IPC_KEY_PREFLIGHT'
     $apiKey = [System.IO.File]::ReadAllText($apiKeyPath, [System.Text.Encoding]::ASCII)
-    if ($apiKey -ne $apiKey.Trim() -or $apiKey -notmatch '^[A-Za-z0-9_-]{43,128}$') {
+    $sensitiveValues = @($apiKey)
+    if ($apiKey -ne $apiKey.Trim() -or $apiKey -notmatch '^[A-Za-z0-9_-]{43}$') {
         throw 'Protected Gateway API key format is invalid.'
     }
+    $report.automaton_key_validated = $true
+    $researchKey = [System.IO.File]::ReadAllText($researchKeyPath, [System.Text.Encoding]::ASCII)
+    $sensitiveValues = @($apiKey, $researchKey)
+    if ($researchKey -ne $researchKey.Trim() -or $researchKey -notmatch '^[A-Za-z0-9_-]{43}$') {
+        throw 'Protected Gateway research key format is invalid.'
+    }
+    $report.research_key_validated = $true
 
     $stage = 'PORT_PREFLIGHT'
     Assert-LoopbackPortAvailable $ListenPort
@@ -442,7 +459,7 @@ try {
                 break
             }
         } catch {
-            $lastHealthError = Get-SanitizedRuntimeError $_ $apiKey
+            $lastHealthError = Get-SanitizedRuntimeError $_ $sensitiveValues
             if ($process.HasExited) {
                 $earlyExit = Resolve-GatewayEarlyExit $true $false $process.ExitCode
                 $gatewayExitBeforeHealth = $earlyExit.early_exit
@@ -485,7 +502,7 @@ try {
     if ([string]::IsNullOrWhiteSpace($failureCode)) {
         $failureCode = "GATEWAY_HEALTH_ONLY_$($stage)_FAILED"
     }
-    $runtimeError = Get-SanitizedRuntimeError $_ $apiKey
+    $runtimeError = Get-SanitizedRuntimeError $_ $sensitiveValues
 } finally {
     # BEGIN_DURABLE_REPORT_FINALLY: only the exact process object created above
     # can be signalled or terminated here.
@@ -505,7 +522,7 @@ try {
                         throw 'Controlled Gateway shutdown did not complete successfully.'
                     }
                 } catch {
-                    $cleanupError = Get-SanitizedRuntimeError $_ $apiKey
+                    $cleanupError = Get-SanitizedRuntimeError $_ $sensitiveValues
                     $processStoppedCleanly = $false
                 }
             } else {
@@ -520,7 +537,7 @@ try {
                     $process.Kill()
                     [void]$process.WaitForExit(5000)
                 } catch {
-                    $forcedError = Get-SanitizedRuntimeError $_ $apiKey
+                    $forcedError = Get-SanitizedRuntimeError $_ $sensitiveValues
                     $cleanupError = if ([string]::IsNullOrWhiteSpace($cleanupError)) {
                         $forcedError
                     } else { "$cleanupError; $forcedError" }
@@ -530,8 +547,8 @@ try {
                 $gatewayProcessExitObserved = $true
                 $gatewayProcessExitCode = $process.ExitCode
             }
-            $stdoutCapture = Receive-GatewayStreamCapture $stdoutReadTask $apiKey 5000
-            $stderrCapture = Receive-GatewayStreamCapture $stderrReadTask $apiKey 5000
+            $stdoutCapture = Receive-GatewayStreamCapture $stdoutReadTask $sensitiveValues 5000
+            $stderrCapture = Receive-GatewayStreamCapture $stderrReadTask $sensitiveValues 5000
             $gatewayStdoutCaptured = [bool]$stdoutCapture.captured
             $gatewayStderrCaptured = [bool]$stderrCapture.captured
             $gatewayStdoutSanitized = $stdoutCapture.sanitized
@@ -547,12 +564,12 @@ try {
                 Get-Process -Id $knownPid -ErrorAction SilentlyContinue
             ) { 1 } else { 0 }
         } catch {
-            $cleanupError = Get-SanitizedRuntimeError $_ $apiKey
+            $cleanupError = Get-SanitizedRuntimeError $_ $sensitiveValues
             $processStoppedCleanly = $false
             $orphanProcesses = 1
         } finally {
             try { $process.Dispose() } catch {
-                $disposeError = Get-SanitizedRuntimeError $_ $apiKey
+                $disposeError = Get-SanitizedRuntimeError $_ $sensitiveValues
                 $cleanupError = if ([string]::IsNullOrWhiteSpace($cleanupError)) {
                     $disposeError
                 } else { "$cleanupError; $disposeError" }
@@ -592,7 +609,7 @@ try {
             if ([string]::IsNullOrWhiteSpace($runtimeError)) {
                 $failureStage = 'RUNTIME_FINGERPRINT_AFTER'
                 $failureCode = 'GATEWAY_HEALTH_ONLY_RUNTIME_FINGERPRINT_AFTER_FAILED'
-                $runtimeError = Get-SanitizedRuntimeError $_ $apiKey
+                $runtimeError = Get-SanitizedRuntimeError $_ $sensitiveValues
             }
         }
     }
@@ -653,7 +670,7 @@ try {
         Write-ExclusiveJson $reportPath $report
         $reportWritten = $true
     } catch {
-        $reportWriteError = Get-SanitizedRuntimeError $_ $apiKey
+        $reportWriteError = Get-SanitizedRuntimeError $_ $sensitiveValues
         $report.status = 'FAIL'
         $passed = $false
     }

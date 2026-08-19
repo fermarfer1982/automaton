@@ -217,7 +217,9 @@ $demoAuthorizationPath = Join-Path $controlPath 'demo-authorization'
 $demoAuthorizationFile = Join-Path $demoAuthorizationPath 'authorization.json'
 $killSwitchPath = Join-Path $controlPath 'STOP_TRADING'
 $ipcPath = Join-Path $labRoot 'ipc'
-$ipcKeyPath = Join-Path $ipcPath 'automaton.key'
+$automatonKeyPath = Join-Path $ipcPath 'automaton.key'
+$observationKeyPath = Join-Path $ipcPath 'observation.key'
+$researchKeyPath = Join-Path $ipcPath 'research.key'
 $researchPath = Join-Path $labRoot 'research'
 $auditSqlitePath = Join-Path $labRoot 'audit\sqlite'
 $auditDbPath = Join-Path $auditSqlitePath 'audit.db'
@@ -935,12 +937,22 @@ try {
     Add-DeniedRightTest 'CONFIG_DELETE' $configPath $DELETE $false $false
     Add-DeniedRightTest 'CONFIG_REPLACE' $controlPath $FILE_ADD_FILE $true $false
 
-    Add-AllowedFileReadTest 'IPC_READ' $ipcKeyPath $true
-    Add-DeniedRightTest 'IPC_WRITE' $ipcKeyPath $FILE_WRITE_DATA $false $false
-    Add-DeniedRightTest 'IPC_TRUNCATE' $ipcKeyPath $FILE_WRITE_DATA $false $false
-    Add-DeniedRightTest 'IPC_DELETE' $ipcKeyPath $DELETE $false $false
+    Add-AllowedFileReadTest 'AUTOMATON_KEY_READ' $automatonKeyPath $true
+    Add-DeniedRightTest 'AUTOMATON_KEY_WRITE' $automatonKeyPath $FILE_WRITE_DATA $false $false
+    Add-DeniedRightTest 'AUTOMATON_KEY_TRUNCATE' $automatonKeyPath $FILE_WRITE_DATA $false $false
+    Add-DeniedRightTest 'AUTOMATON_KEY_DELETE' $automatonKeyPath $DELETE $false $false
+    Add-DeniedRightTest 'AUTOMATON_KEY_CHANGE_ACL' $automatonKeyPath $WRITE_DAC $false $false
+    Add-AllowedFileReadTest 'OBSERVATION_KEY_READ' $observationKeyPath $true
+    Add-DeniedRightTest 'OBSERVATION_KEY_WRITE' $observationKeyPath $FILE_WRITE_DATA $false $false
+    Add-DeniedRightTest 'OBSERVATION_KEY_TRUNCATE' $observationKeyPath $FILE_WRITE_DATA $false $false
+    Add-DeniedRightTest 'OBSERVATION_KEY_DELETE' $observationKeyPath $DELETE $false $false
+    Add-DeniedRightTest 'OBSERVATION_KEY_CHANGE_ACL' $observationKeyPath $WRITE_DAC $false $false
+    Add-AllowedFileReadTest 'RESEARCH_KEY_READ' $researchKeyPath $true
+    Add-DeniedRightTest 'RESEARCH_KEY_WRITE' $researchKeyPath $FILE_WRITE_DATA $false $false
+    Add-DeniedRightTest 'RESEARCH_KEY_TRUNCATE' $researchKeyPath $FILE_WRITE_DATA $false $false
+    Add-DeniedRightTest 'RESEARCH_KEY_DELETE' $researchKeyPath $DELETE $false $false
+    Add-DeniedRightTest 'RESEARCH_KEY_CHANGE_ACL' $researchKeyPath $WRITE_DAC $false $false
     Add-DeniedRightTest 'IPC_REPLACE' $ipcPath $FILE_ADD_FILE $true $false
-    Add-DeniedRightTest 'IPC_CHANGE_ACL' $ipcKeyPath $WRITE_DAC $false $false
 
     Add-MutableDirectoryCanaryTest 'OPERATIONAL_MODIFY' $operationalPath
     Add-MutableDirectoryCanaryTest 'RESEARCH_MODIFY' $researchPath
