@@ -34,6 +34,22 @@ foreach ($forbidden in @('Get-Random', 'New-Guid', 'Write-Host $encoded', 'Write
         throw "Secret generation contains forbidden behavior: $forbidden"
     }
 }
+$pinnedPrevalidationIndex = $helperSource.IndexOf(
+    '[void](Assert-PinnedExistingBootstrapConfig $configPath $normalizedExpectedConfigSha256)'
+)
+$pinnedImmediateRevalidationIndex = $helperSource.LastIndexOf(
+    '$config = Assert-PinnedExistingBootstrapConfig $configPath $normalizedExpectedConfigSha256'
+)
+$secretCreationIndex = $helperSource.IndexOf('$secretResults = @{}')
+if ($pinnedPrevalidationIndex -lt 0 -or
+    $pinnedImmediateRevalidationIndex -le $pinnedPrevalidationIndex -or
+    $secretCreationIndex -le $pinnedImmediateRevalidationIndex) {
+    throw 'Pinned config hash must be validated before bootstrap work and immediately before secret creation.'
+}
+if (-not $helperSource.Contains("`$pinnedExistingConfig = `$PSBoundParameters.ContainsKey('ExpectedExistingConfigSha256')") -or
+    -not $helperSource.Contains('} elseif (Test-Path -LiteralPath $configPath) {')) {
+    throw 'Default exact-template behavior is not structurally isolated from explicit pinned mode.'
+}
 
 function New-TestRoot([string] $CaseName) {
     $base = Join-Path ([System.IO.Path]::GetTempPath()) (
@@ -141,6 +157,114 @@ try {
     }
 } finally {
     Remove-TestRoot $caseC
+}
+
+$casePinnedValid = New-TestRoot 'pinned-valid'
+$pinnedBytes = $null
+$afterBytes = $null
+$pinnedHash = $null
+try {
+    $lab = Join-Path $casePinnedValid 'lab'
+    $control = Join-Path $lab 'control'
+    $configPath = Join-Path $control 'trading.yaml'
+    New-Item -ItemType Directory -Path $control -Force | Out-Null
+    $pinnedBytes = [System.Text.Encoding]::UTF8.GetBytes(
+        ([System.IO.File]::ReadAllText($templatePath, [System.Text.Encoding]::UTF8) +
+        "`r`n# reviewed non-template operational fixture`r`n")
+    )
+    [System.IO.File]::WriteAllBytes($configPath, $pinnedBytes)
+    $pinnedHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $result = Initialize-TradingLabBootstrapState `
+        $lab `
+        (Join-Path $casePinnedValid 'agent\.automaton') `
+        $templatePath `
+        -ExpectedExistingConfigSha256 $pinnedHash.ToUpperInvariant()
+    $afterBytes = [System.IO.File]::ReadAllBytes($configPath)
+    if ($result.config_created -or -not $result.config_reused -or
+        -not $result.config_valid -or
+        $result.config_validation_mode -ne 'PINNED_EXISTING_SHA256' -or
+        $result.config_sha256 -cne $pinnedHash -or
+        -not (Test-ByteArrayEqual $pinnedBytes $afterBytes)) {
+        throw 'Pinned mode did not accept and preserve the exact non-template configuration.'
+    }
+} finally {
+    if ($null -ne $pinnedBytes) { [Array]::Clear($pinnedBytes, 0, $pinnedBytes.Length) }
+    if ($null -ne $afterBytes) { [Array]::Clear($afterBytes, 0, $afterBytes.Length) }
+    $pinnedHash = $null
+    Remove-TestRoot $casePinnedValid
+}
+
+$casePinnedWrongHash = New-TestRoot 'pinned-wrong-hash'
+$actualHash = $null
+$wrongHash = $null
+try {
+    $lab = Join-Path $casePinnedWrongHash 'lab'
+    $control = Join-Path $lab 'control'
+    New-Item -ItemType Directory -Path $control -Force | Out-Null
+    Copy-Item -LiteralPath $templatePath -Destination (Join-Path $control 'trading.yaml')
+    $actualHash = (Get-FileHash -LiteralPath (Join-Path $control 'trading.yaml') -Algorithm SHA256).Hash.ToLowerInvariant()
+    $wrongHash = if ($actualHash -eq (('0' * 64) -join '')) {
+        ('1' * 64) -join ''
+    } else { ('0' * 64) -join '' }
+    $failed = $false
+    try {
+        [void](Initialize-TradingLabBootstrapState `
+            $lab `
+            (Join-Path $casePinnedWrongHash 'agent\.automaton') `
+            $templatePath `
+            -ExpectedExistingConfigSha256 $wrongHash)
+    } catch { $failed = $true }
+    if (-not $failed -or
+        (Test-Path -LiteralPath (Join-Path $lab 'ipc')) -or
+        (Test-Path -LiteralPath (Join-Path $lab 'operational')) -or
+        (Test-Path -LiteralPath (Join-Path $lab 'audit')) -or
+        (Test-Path -LiteralPath (Join-Path $lab 'logs'))) {
+        throw 'Pinned mode wrong hash did not fail before later bootstrap state.'
+    }
+} finally {
+    $actualHash = $null; $wrongHash = $null
+    Remove-TestRoot $casePinnedWrongHash
+}
+
+$casePinnedMissing = New-TestRoot 'pinned-missing'
+try {
+    $lab = Join-Path $casePinnedMissing 'lab'
+    $failed = $false
+    try {
+        [void](Initialize-TradingLabBootstrapState `
+            $lab `
+            (Join-Path $casePinnedMissing 'agent\.automaton') `
+            $templatePath `
+            -ExpectedExistingConfigSha256 (('0' * 64) -join ''))
+    } catch { $failed = $true }
+    if (-not $failed -or (Test-Path -LiteralPath $lab)) {
+        throw 'Pinned mode missing config did not fail before filesystem mutation.'
+    }
+} finally {
+    Remove-TestRoot $casePinnedMissing
+}
+
+$casePinnedMalformed = New-TestRoot 'pinned-malformed'
+try {
+    $lab = Join-Path $casePinnedMalformed 'lab'
+    $control = Join-Path $lab 'control'
+    New-Item -ItemType Directory -Path $control -Force | Out-Null
+    Copy-Item -LiteralPath $templatePath -Destination (Join-Path $control 'trading.yaml')
+    $failed = $false
+    try {
+        [void](Initialize-TradingLabBootstrapState `
+            $lab `
+            (Join-Path $casePinnedMalformed 'agent\.automaton') `
+            $templatePath `
+            -ExpectedExistingConfigSha256 'not-a-sha256')
+    } catch { $failed = $true }
+    if (-not $failed -or
+        (Test-Path -LiteralPath (Join-Path $lab 'ipc')) -or
+        (Test-Path -LiteralPath (Join-Path $lab 'operational'))) {
+        throw 'Pinned mode malformed SHA did not fail before later bootstrap state.'
+    }
+} finally {
+    Remove-TestRoot $casePinnedMalformed
 }
 
 $caseD = New-TestRoot 'd'
@@ -314,6 +438,11 @@ try {
     CASE_A_FRESH_BOOTSTRAP = 'PASS'
     CASE_B_IDEMPOTENT_THREE_KEY_REUSE = 'PASS'
     CASE_C_CHANGED_CONFIG_FAIL_CLOSED = 'PASS'
+    PINNED_EXISTING_NON_TEMPLATE_ACCEPTED = 'PASS'
+    PINNED_EXISTING_BYTES_PRESERVED = 'PASS'
+    PINNED_WRONG_HASH_NO_DRIFT = 'PASS'
+    PINNED_MISSING_CONFIG_NO_DRIFT = 'PASS'
+    PINNED_MALFORMED_SHA_NO_DRIFT = 'PASS'
     CASE_D_AUTOMATON_PRESERVED_MISSING_KEYS_CREATED = 'PASS'
     CASE_E_INVALID_AUTOMATON_FAIL_CLOSED = 'PASS'
     CASE_F_INVALID_OBSERVATION_FAIL_CLOSED = 'PASS'

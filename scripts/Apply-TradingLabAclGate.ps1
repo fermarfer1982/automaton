@@ -1,11 +1,15 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)] [string] $ReportPath
+    [Parameter(Mandatory = $true)] [string] $ReportPath,
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9A-Fa-f]{64}$')]
+    [string] $ExpectedTradingConfigSha256
 )
 
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$expectedConfigSha256 = $ExpectedTradingConfigSha256.ToLowerInvariant()
 
 $workspace = 'C:\automaton'
 $labRoot = 'C:\ProgramData\AutomatonMT5Lab'
@@ -20,6 +24,7 @@ $credentialFiles = [ordered]@{
     observation = (Join-Path $labRoot 'ipc\observation.key')
     research = (Join-Path $labRoot 'ipc\research.key')
 }
+$configPath = Join-Path $labRoot 'control\trading.yaml'
 . (Join-Path $PSScriptRoot 'TradingLabFileSystemRights.ps1')
 $fullControl = 2032127L
 $readRights = 131209L
@@ -41,6 +46,13 @@ $report = [ordered]@{
     demo_execution_enabled = $false
     trading_mode = 'OBSERVE_ONLY'
     account_configured = $false
+    expected_trading_config_sha256 = $expectedConfigSha256
+    trading_config_sha256_before = $null
+    trading_config_sha256_after = $null
+    trading_config_validation_mode = 'PINNED_EXISTING_SHA256'
+    semantic_config_validation_status = 'NOT_RUN'
+    semantic_config_validation_state = $null
+    semantic_config_helper_exit_code = $null
     maintenance_identity = $null
     maintenance_sid = $null
     paths_created = @()
@@ -66,6 +78,7 @@ $report = [ordered]@{
     error = $null
 }
 . (Join-Path $PSScriptRoot 'TradingLabAclBootstrap.ps1')
+. (Join-Path $PSScriptRoot 'ProtectedIdentityGateHelpers.ps1')
 $aclPolicyPath = Join-Path $workspace 'config\windows-acl-policy.json'
 $aclPolicy = $null
 $maintenanceSid = $null
@@ -79,6 +92,73 @@ function Get-CanonicalPath([string] $Value) {
         throw "Path must be absolute: $Value"
     }
     return [System.IO.Path]::GetFullPath($Value).TrimEnd('\')
+}
+
+function Get-SafeTradingConfigSha256([string] $Path) {
+    if (-not [System.IO.Path]::IsPathRooted($Path) -or
+        -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw 'Canonical trading configuration must be an existing absolute file.'
+    }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or
+        (Get-CanonicalPath $item.FullName) -ne (Get-CanonicalPath $Path)) {
+        throw 'Canonical trading configuration must be an exact regular non-reparse file.'
+    }
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Assert-ExpectedTradingConfigSha256([string] $Path, [string] $ExpectedSha256) {
+    $actualSha256 = Get-SafeTradingConfigSha256 $Path
+    if ($actualSha256 -cne $ExpectedSha256) {
+        throw 'Canonical trading configuration SHA256 differs from the operator-reviewed value.'
+    }
+    return $actualSha256
+}
+
+function Invoke-ReviewedTradingConfigInspection([string] $ConfigPath) {
+    $python = Join-Path $workspace '.venv\Scripts\python.exe'
+    if ((Get-CanonicalPath $python) -ne 'C:\automaton\.venv\Scripts\python.exe' -or
+        -not (Test-Path -LiteralPath $python -PathType Leaf)) {
+        throw 'Reviewed repository Python runtime is unavailable.'
+    }
+    $pythonItem = Get-Item -LiteralPath $python -Force -ErrorAction Stop
+    if ($pythonItem.PSIsContainer -or
+        ($pythonItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw 'Reviewed repository Python runtime path is unsafe.'
+    }
+    $helperResult = Invoke-ProtectedIdentityHelperProcess `
+        -Operation 'inspect' `
+        -Stage 'INSPECT' `
+        -Executable $python `
+        -Arguments "-B -m trading_lab.protected_identity_config inspect --config `"$ConfigPath`"" `
+        -WorkingDirectory $workspace `
+        -SensitiveValues @('10012236003')
+    $report.semantic_config_helper_exit_code = [int]$helperResult.exit_code
+    if (-not $helperResult.succeeded) {
+        throw 'Protected configuration inspection failed closed.'
+    }
+    try {
+        return ([string]$helperResult.raw_stdout).Trim() | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw 'Protected configuration inspection returned invalid JSON.'
+    }
+}
+
+function Assert-ReviewedTradingConfigInspection($Inspection, [string] $ExpectedSha256) {
+    if ([string]$Inspection.status -ne 'PASS' -or
+        [string]$Inspection.state -ne 'EXACT_TARGET' -or
+        -not [bool]$Inspection.candidate_schema_validated -or
+        [string]$Inspection.source_sha256 -cne $ExpectedSha256 -or
+        [string]$Inspection.candidate_sha256 -cne $ExpectedSha256 -or
+        [string]$Inspection.target.trading_mode -ne 'OBSERVE_ONLY' -or
+        [bool]$Inspection.target.mt5_access_enabled -ne $false -or
+        [int64]$Inspection.target.authorized_account -ne 10012236003L -or
+        [string]$Inspection.target.authorized_server -cne 'MetaQuotes-Demo' -or
+        [string]$Inspection.target.allowed_symbol -cne 'XAUUSD' -or
+        [string]$Inspection.target.mt5_terminal_path -cne 'C:\Program Files\MetaTrader 5\terminal64.exe') {
+        throw 'Protected configuration inspection does not match the exact reviewed target.'
+    }
 }
 
 function Write-GateReport {
@@ -415,11 +495,18 @@ try {
     }
 
     $template = Join-Path $workspace 'config\trading.bootstrap-observe-only.yaml'
-    $configPath = Join-Path $labRoot 'control\trading.yaml'
-    # Validate every existing credential before creating any new path.
-    if (Test-Path -LiteralPath $configPath) {
-        [void](Assert-ExactBootstrapConfig $configPath $template)
-    }
+    # Pin both bytes and reviewed semantics before credential snapshots or any
+    # filesystem/ACL mutation.  The helper does not import or access MT5.
+    $report.trading_config_sha256_before = Assert-ExpectedTradingConfigSha256 `
+        $configPath $expectedConfigSha256
+    $configInspection = Invoke-ReviewedTradingConfigInspection $configPath
+    Assert-ReviewedTradingConfigInspection $configInspection $expectedConfigSha256
+    $report.semantic_config_validation_status = [string]$configInspection.status
+    $report.semantic_config_validation_state = [string]$configInspection.state
+    $report.account_configured = $true
+
+    # Validate every existing credential only after the pinned operational
+    # configuration has passed both byte and semantic validation.
     foreach ($credentialEntry in $credentialFiles.GetEnumerator()) {
         $snapshot = Get-CredentialRollbackSnapshot $credentialEntry.Key $credentialEntry.Value
         $credentialRollbackSnapshots[$credentialEntry.Key] = $snapshot
@@ -437,9 +524,19 @@ try {
     Write-GateReport
 
     $bootstrapMutationStarted = $true
-    $prepared = Initialize-TradingLabBootstrapState $labRoot $agentState $template
+    $prepared = Initialize-TradingLabBootstrapState `
+        $labRoot `
+        $agentState `
+        $template `
+        -ExpectedExistingConfigSha256 $expectedConfigSha256
     $report.paths_created = @($prepared.created_paths)
     $report.prepared_state_verified = $true
+    if ($prepared.config_validation_mode -ne 'PINNED_EXISTING_SHA256' -or
+        [string]$prepared.config_sha256 -cne $expectedConfigSha256 -or
+        $prepared.config_created -or -not $prepared.config_reused) {
+        throw 'Bootstrap did not preserve the pinned existing configuration contract.'
+    }
+    [void](Assert-ExpectedTradingConfigSha256 $configPath $expectedConfigSha256)
     $report.automaton_key_created = [bool]$prepared.automaton_key_created
     $report.automaton_key_reused = [bool]$prepared.automaton_key_reused
     $report.automaton_key_length = [int]$prepared.automaton_key_length
@@ -471,6 +568,7 @@ try {
     $report.acl_apply = 'PASS'
     $report.acl_applied = $true
     $report.security_descriptors_applied = @(Read-AclProgressFile $progressPath)
+    [void](Assert-ExpectedTradingConfigSha256 $configPath $expectedConfigSha256)
     Write-GateReport
 
     $targets = [ordered]@{
@@ -653,6 +751,12 @@ try {
         $env:Path = $previousPath
     }
     Invoke-Test 'git_diff_check' { & git -C $workspace diff --check } (Join-Path $logRoot 'acl-gate-git-diff-check.log')
+    $report.trading_config_sha256_after = Assert-ExpectedTradingConfigSha256 `
+        $configPath $expectedConfigSha256
+    if ($report.trading_config_sha256_before -cne $expectedConfigSha256 -or
+        $report.trading_config_sha256_after -cne $expectedConfigSha256) {
+        throw 'Canonical trading configuration did not remain byte-identical throughout the ACL gate.'
+    }
     $report.git = [ordered]@{
         branch = (& git -C $workspace branch --show-current).Trim()
         head = (& git -C $workspace log -1 --format='%H %s').Trim()
@@ -662,6 +766,11 @@ try {
     $report.completed_at_utc = [DateTime]::UtcNow.ToString('o')
 } catch {
     $primaryError = $_.Exception.Message
+    if ($null -ne $configPath) {
+        try {
+            $report.trading_config_sha256_after = Get-SafeTradingConfigSha256 $configPath
+        } catch { }
+    }
     if ($credentialSnapshotsReady -and $bootstrapMutationStarted) {
         Invoke-CredentialStateRollback
     }

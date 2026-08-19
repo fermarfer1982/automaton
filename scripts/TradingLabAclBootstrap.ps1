@@ -90,11 +90,51 @@ function Assert-ExactBootstrapConfig([string] $ConfigPath, [string] $TemplatePat
         throw 'Bootstrap trading.yaml contains a forbidden credential field.'
     }
     return [pscustomobject]@{
+        valid = $true
         exact_template = $true
+        validation_mode = 'EXACT_TEMPLATE'
+        sha256 = (Get-FileHash -LiteralPath $ConfigPath -Algorithm SHA256).Hash.ToLowerInvariant()
         trading_mode = 'OBSERVE_ONLY'
         mt5_access_enabled = $false
         account_configured = $false
         credentials_present = $false
+    }
+}
+
+function Assert-CanonicalSha256([string] $Value) {
+    if ($null -eq $Value -or $Value -cnotmatch '^[0-9A-Fa-f]{64}$') {
+        throw 'Expected existing configuration SHA256 must be exactly 64 hexadecimal characters.'
+    }
+    return $Value.ToLowerInvariant()
+}
+
+function Assert-PinnedExistingBootstrapConfig(
+    [string] $ConfigPath,
+    [string] $ExpectedSha256
+) {
+    $normalizedExpected = Assert-CanonicalSha256 $ExpectedSha256
+    if (-not [System.IO.Path]::IsPathRooted($ConfigPath) -or
+        -not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+        throw 'Pinned existing trading.yaml must be an existing absolute file.'
+    }
+    $item = Get-Item -LiteralPath $ConfigPath -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or
+        ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw 'Pinned existing trading.yaml must be a regular non-reparse file.'
+    }
+    $actualSha256 = (Get-FileHash -LiteralPath $ConfigPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualSha256 -cne $normalizedExpected) {
+        throw 'Pinned existing trading.yaml SHA256 does not match the operator-reviewed value.'
+    }
+    return [pscustomobject]@{
+        valid = $true
+        exact_template = $false
+        validation_mode = 'PINNED_EXISTING_SHA256'
+        sha256 = $actualSha256
+        trading_mode = $null
+        mt5_access_enabled = $null
+        account_configured = $null
+        credentials_present = $null
     }
 }
 
@@ -200,8 +240,13 @@ function Initialize-IdempotentIpcSecret([string] $SecretPath) {
 function Initialize-TradingLabBootstrapState(
     [string] $LabRoot,
     [string] $AutomatonStateDir,
-    [string] $TemplatePath
+    [string] $TemplatePath,
+    [AllowNull()][string] $ExpectedExistingConfigSha256 = $null
 ) {
+    $pinnedExistingConfig = $PSBoundParameters.ContainsKey('ExpectedExistingConfigSha256')
+    $normalizedExpectedConfigSha256 = if ($pinnedExistingConfig) {
+        Assert-CanonicalSha256 $ExpectedExistingConfigSha256
+    } else { $null }
     $createdPaths = [System.Collections.Generic.List[string]]::new()
     $configPath = Join-Path $LabRoot 'control\trading.yaml'
     $secretDefinitions = @(
@@ -215,7 +260,9 @@ function Initialize-TradingLabBootstrapState(
     )
     # Validate every pre-existing security-sensitive file before creating any
     # additional path.  A corrupt partial state therefore fails without drift.
-    if (Test-Path -LiteralPath $configPath) {
+    if ($pinnedExistingConfig) {
+        [void](Assert-PinnedExistingBootstrapConfig $configPath $normalizedExpectedConfigSha256)
+    } elseif (Test-Path -LiteralPath $configPath) {
         [void](Assert-ExactBootstrapConfig $configPath $TemplatePath)
     }
     foreach ($secretDefinition in $secretDefinitions) {
@@ -283,12 +330,18 @@ function Initialize-TradingLabBootstrapState(
     }
 
     $configCreated = $false
-    if (-not (Test-Path -LiteralPath $configPath)) {
-        Copy-Item -LiteralPath $TemplatePath -Destination $configPath
-        $createdPaths.Add($configPath)
-        $configCreated = $true
+    if ($pinnedExistingConfig) {
+        # Revalidate immediately before credential creation.  Pinned mode never
+        # copies, renders, normalizes, rewrites, or otherwise mutates trading.yaml.
+        $config = Assert-PinnedExistingBootstrapConfig $configPath $normalizedExpectedConfigSha256
+    } else {
+        if (-not (Test-Path -LiteralPath $configPath)) {
+            Copy-Item -LiteralPath $TemplatePath -Destination $configPath
+            $createdPaths.Add($configPath)
+            $configCreated = $true
+        }
+        $config = Assert-ExactBootstrapConfig $configPath $TemplatePath
     }
-    $config = Assert-ExactBootstrapConfig $configPath $TemplatePath
 
     $secretResults = @{}
     $createdSecretPaths = [System.Collections.Generic.List[string]]::new()
@@ -344,7 +397,9 @@ function Initialize-TradingLabBootstrapState(
         created_paths = @($createdPaths)
         config_created = $configCreated
         config_reused = -not $configCreated
-        config_valid = $config.exact_template
+        config_valid = $config.valid
+        config_validation_mode = $config.validation_mode
+        config_sha256 = $config.sha256
         automaton_key_created = $secretResults.automaton.created
         automaton_key_reused = $secretResults.automaton.reused
         automaton_key_length = $secretResults.automaton.encoded_length

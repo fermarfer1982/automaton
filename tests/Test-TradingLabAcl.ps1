@@ -13,13 +13,19 @@ $source = [System.IO.File]::ReadAllText($scriptPath)
 $applyGatePath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\Apply-TradingLabAclGate.ps1'
 $applyTokens = $null
 $applyErrors = $null
-[void][System.Management.Automation.Language.Parser]::ParseFile(
+$applyAst = [System.Management.Automation.Language.Parser]::ParseFile(
     $applyGatePath, [ref]$applyTokens, [ref]$applyErrors
 )
 if ($applyErrors.Count -ne 0) {
     throw "ACL apply gate has PowerShell AST errors: $($applyErrors -join '; ')"
 }
 $applySource = [System.IO.File]::ReadAllText($applyGatePath)
+$applyParameters = @($applyAst.ParamBlock.Parameters | ForEach-Object {
+    $_.Name.VariablePath.UserPath
+})
+if (($applyParameters -join ',') -ne 'ReportPath,ExpectedTradingConfigSha256') {
+    throw 'ACL apply gate must require only ReportPath and the operator-supplied config SHA256.'
+}
 $authorizationAclPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\Set-MT5ReadOnlyAuthorizationAcl.ps1'
 $repairAclPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\Repair-MT5ReadOnlyAuthorizationAclDrift.ps1'
 $repairHelperPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\MT5ReadOnlyAclRepairHelpers.ps1'
@@ -70,12 +76,69 @@ foreach ($requiredApply in @(
     'S-1-5-21-568964486-193631783-1609210587-1006',
     'S-1-5-21-568964486-193631783-1609210587-1007',
     'trading.bootstrap-observe-only.yaml',
+    "[ValidatePattern('^[0-9A-Fa-f]{64}$')]",
+    '[string] $ExpectedTradingConfigSha256',
     '-Apply | Out-Null',
     "service_identities_executed = `$false",
     "mt5_accessed = `$false"
 )) {
     if (-not $applySource.Contains($requiredApply)) {
         throw "ACL apply gate lacks required boundary: $requiredApply"
+    }
+}
+foreach ($configPinBoundary in @(
+    "trading_config_validation_mode = 'PINNED_EXISTING_SHA256'",
+    'expected_trading_config_sha256 = $expectedConfigSha256',
+    'trading_config_sha256_before',
+    'trading_config_sha256_after',
+    "semantic_config_validation_status = 'NOT_RUN'",
+    'Invoke-ProtectedIdentityHelperProcess',
+    "-Operation 'inspect'",
+    "-Stage 'INSPECT'",
+    'trading_lab.protected_identity_config inspect',
+    "[string]`$Inspection.status -ne 'PASS'",
+    "[string]`$Inspection.state -ne 'EXACT_TARGET'",
+    '[string]$Inspection.source_sha256 -cne $ExpectedSha256',
+    '[string]$Inspection.candidate_sha256 -cne $ExpectedSha256',
+    "[string]`$Inspection.target.trading_mode -ne 'OBSERVE_ONLY'",
+    '[bool]$Inspection.target.mt5_access_enabled -ne $false',
+    '[int64]$Inspection.target.authorized_account -ne 10012236003L',
+    "[string]`$Inspection.target.authorized_server -cne 'MetaQuotes-Demo'",
+    "[string]`$Inspection.target.allowed_symbol -cne 'XAUUSD'",
+    "[string]`$Inspection.target.mt5_terminal_path -cne 'C:\Program Files\MetaTrader 5\terminal64.exe'",
+    '-ExpectedExistingConfigSha256 $expectedConfigSha256'
+)) {
+    if (-not $applySource.Contains($configPinBoundary)) {
+        throw "ACL apply gate lacks pinned operational config boundary: $configPinBoundary"
+    }
+}
+$semanticInspectionIndex = $applySource.IndexOf(
+    '$configInspection = Invoke-ReviewedTradingConfigInspection $configPath'
+)
+$semanticAssertionIndex = $applySource.IndexOf(
+    'Assert-ReviewedTradingConfigInspection $configInspection $expectedConfigSha256'
+)
+$credentialSnapshotIndex = $applySource.IndexOf(
+    '$snapshot = Get-CredentialRollbackSnapshot $credentialEntry.Key $credentialEntry.Value'
+)
+$bootstrapMutationIndex = $applySource.IndexOf('$bootstrapMutationStarted = $true')
+if ($semanticInspectionIndex -lt 0 -or
+    $semanticAssertionIndex -le $semanticInspectionIndex -or
+    $credentialSnapshotIndex -le $semanticAssertionIndex -or
+    $bootstrapMutationIndex -le $credentialSnapshotIndex) {
+    throw 'EXACT_TARGET/hash validation must precede credential snapshots and bootstrap mutation.'
+}
+foreach ($forbiddenConfigMutation in @(
+    'Assert-ExactBootstrapConfig $configPath',
+    'trading_lab.protected_identity_config render',
+    'trading_lab.protected_identity_config validate',
+    '[System.IO.File]::Replace',
+    '[System.IO.File]::WriteAllText($configPath',
+    'Copy-Item -LiteralPath $template -Destination $configPath',
+    'import MetaTrader5', 'MetaTrader5.initialize', '.order_check(', '.order_send('
+)) {
+    if ($applySource.Contains($forbiddenConfigMutation)) {
+        throw "ACL apply gate contains forbidden config/MT5 operation: $forbiddenConfigMutation"
     }
 }
 if ($applySource.Contains('RandomNumberGenerator]::Fill')) {
