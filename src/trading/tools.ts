@@ -1,6 +1,10 @@
 import type { AutomatonTool } from "../types.js";
 import { callGateway, postJson } from "./gateway-client.js";
 import { callObservation } from "./observation-client.js";
+import {
+  callResearch,
+  postResearchJson,
+} from "./research-client.js";
 
 const noParameters = { type: "object", properties: {}, additionalProperties: false } as const;
 
@@ -103,7 +107,7 @@ export function createTradingTools(): AutomatonTool[] {
         },
         required: ["decision_id", "action", "symbol", "timeframe", "bar_time_utc", "reason", "hypothesis_id"],
       },
-      execute: async (args) => postJson("/v1/research/decisions", args),
+      execute: async (args) => postResearchJson("/v1/research/decisions", args),
     },
     {
       name: "propose_trade",
@@ -188,7 +192,7 @@ export function createTradingTools(): AutomatonTool[] {
           thesis: { type: "string", minLength: 1, maxLength: 4000 },
         }, required: ["hypothesis_id", "thesis"],
       },
-      execute: async (args) => postJson("/v1/research/hypotheses", args),
+      execute: async (args) => postResearchJson("/v1/research/hypotheses", args),
     },
     {
       name: "save_trade_review",
@@ -210,14 +214,14 @@ export function createTradingTools(): AutomatonTool[] {
           "strengths", "learning", "hypothesis_effect",
         ],
       },
-      execute: async (args) => postJson("/v1/research/reviews", args),
+      execute: async (args) => postResearchJson("/v1/research/reviews", args),
     },
     {
       name: "get_strategy_statistics",
       description: "Read sample sizes and objective PnL, R, MFE, MAE, drawdown, expectancy, and profit-factor evidence.",
       category: "trading", riskLevel: "safe",
       parameters: noParameters,
-      execute: async () => callGateway("/v1/research/metrics"),
+      execute: async () => callResearch("/v1/research/metrics"),
     },
     {
       name: "get_recent_trading_memory",
@@ -228,7 +232,7 @@ export function createTradingTools(): AutomatonTool[] {
         properties: { limit: { type: "integer", minimum: 1, maximum: 200 } },
         required: ["limit"],
       },
-      execute: async (args) => callGateway(`/v1/research/memory?limit=${encodeURIComponent(String(args.limit))}`),
+      execute: async (args) => callResearch(`/v1/research/memory?limit=${encodeURIComponent(String(args.limit))}`),
     },
   ];
 }

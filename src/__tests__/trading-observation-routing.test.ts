@@ -13,6 +13,10 @@ const calls = vi.hoisted(() => ({
     vi.fn().mockResolvedValue("{}"),
   post:
     vi.fn().mockResolvedValue("{}"),
+  research:
+    vi.fn().mockResolvedValue("{}"),
+  researchPost:
+    vi.fn().mockResolvedValue("{}"),
 }));
 
 vi.mock(
@@ -30,6 +34,16 @@ vi.mock(
       calls.gateway,
     postJson:
       calls.post,
+  }),
+);
+
+vi.mock(
+  "../trading/research-client.js",
+  () => ({
+    callResearch:
+      calls.research,
+    postResearchJson:
+      calls.researchPost,
   }),
 );
 
@@ -137,11 +151,19 @@ describe(
         expect(
           calls.post,
         ).not.toHaveBeenCalled();
+
+        expect(
+          calls.research,
+        ).not.toHaveBeenCalled();
+
+        expect(
+          calls.researchPost,
+        ).not.toHaveBeenCalled();
       },
     );
 
     it(
-      "keeps research operations on the existing gateway during B2.1",
+      "routes all research operations only through the dedicated Research client",
       async () => {
         await execute(
           "record_trading_decision",
@@ -174,11 +196,19 @@ describe(
         ).not.toHaveBeenCalled();
 
         expect(
+          calls.gateway,
+        ).not.toHaveBeenCalled();
+
+        expect(
           calls.post,
+        ).not.toHaveBeenCalled();
+
+        expect(
+          calls.researchPost,
         ).toHaveBeenCalledTimes(3);
 
         expect(
-          calls.post.mock.calls.map(
+          calls.researchPost.mock.calls.map(
             ([route]) => route,
           ),
         ).toEqual([
@@ -188,7 +218,7 @@ describe(
         ]);
 
         expect(
-          calls.gateway.mock.calls.map(
+          calls.research.mock.calls.map(
             ([route]) => route,
           ),
         ).toEqual([

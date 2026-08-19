@@ -24,6 +24,12 @@ from .process_lock import GatewayProcessLock
 from .windows_acl import verify_windows_acl
 
 
+RESEARCH_API_KEY_PATH = Path(
+    r"C:\ProgramData\AutomatonMT5Lab"
+    r"\ipc\research.key"
+)
+
+
 def acquire_mt5_adapter(config: SecurityConfig, *, mt5_access_enabled: bool):
     """Acquire the live provider only after both protected controls allow it."""
     if not mt5_access_enabled or not config.mt5_access_enabled:
@@ -105,6 +111,9 @@ def serve(
     if config.api_key_path is None or config.gateway_lock_path is None:
         raise RuntimeError("Gateway IPC key or process lock path is missing")
     verifier = ApiKeyVerifier(config.api_key_path)
+    research_verifier = ApiKeyVerifier(
+        RESEARCH_API_KEY_PATH
+    )
     with GatewayProcessLock(config.gateway_lock_path):
         logger.info(
             "gateway_start gateway_started=true trading_mode=%s "
@@ -145,7 +154,11 @@ def serve(
                     adapter,
                     runtime_identity_verified=True,
                 )
-            api = create_fastapi_app(application, verifier)
+            api = create_fastapi_app(
+                application,
+                verifier,
+                research_verifier=research_verifier,
+            )
             _run_uvicorn(
                 api,
                 port=port,
