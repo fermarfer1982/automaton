@@ -1,5 +1,6 @@
 import type { AutomatonTool } from "../types.js";
 import { callGateway, postJson } from "./gateway-client.js";
+import { callObservation } from "./observation-client.js";
 
 const noParameters = { type: "object", properties: {}, additionalProperties: false } as const;
 
@@ -7,27 +8,27 @@ export function createTradingTools(): AutomatonTool[] {
   return [
     {
       name: "trading_lab_status",
-      description: "Read sanitized mode, identity, account-guard, market-data, exposure, and audit status.",
+      description: "Read sanitized Observation Service status: OBSERVE_ONLY mode, DEMO connectivity, XAUUSD boundary, and execution_capable=false.",
       category: "trading",
       riskLevel: "safe",
       parameters: noParameters,
-      execute: async () => callGateway("/v1/status"),
+      execute: async () => callObservation("/v1/status"),
     },
     {
       name: "get_account_state",
-      description: "Read sanitized DEMO account state and risk currency without receiving login or server identifiers.",
+      description: "Read sanitized DEMO balance/equity, connectivity, trade flags, and currency without account or server identifiers.",
       category: "trading",
       riskLevel: "safe",
       parameters: noParameters,
-      execute: async () => callGateway("/v1/account"),
+      execute: async () => callObservation("/v1/account"),
     },
     {
       name: "get_market_snapshot",
-      description: "Read a compact XAUUSD snapshot with closed M1/M5/M15/H1 context, ATR, sessions, positions, and daily state.",
+      description: "Read sanitized XAUUSD symbol/tick state plus 20 closed candles for M1/M5/M15/H1 from the non-executable Observation Service.",
       category: "trading",
       riskLevel: "safe",
       parameters: noParameters,
-      execute: async () => callGateway("/v1/market/XAUUSD"),
+      execute: async () => callObservation("/v1/market/XAUUSD"),
     },
     {
       name: "get_candles",
@@ -42,17 +43,17 @@ export function createTradingTools(): AutomatonTool[] {
         },
         required: ["timeframe", "count"],
       },
-      execute: async (args) => callGateway(
+      execute: async (args) => callObservation(
         `/v1/candles/XAUUSD?timeframe=${encodeURIComponent(String(args.timeframe))}&count=${encodeURIComponent(String(args.count))}`,
       ),
     },
     {
       name: "get_positions",
-      description: "Read current positions through the guarded gateway.",
+      description: "Read account-wide open positions through the non-executable Observation Service.",
       category: "trading",
       riskLevel: "safe",
       parameters: noParameters,
-      execute: async () => callGateway("/v1/positions"),
+      execute: async () => callObservation("/v1/positions"),
     },
     {
       name: "get_trade_history",
@@ -73,16 +74,16 @@ export function createTradingTools(): AutomatonTool[] {
           from: String(args.from_utc), to: String(args.to_utc),
           symbol: "XAUUSD", limit: String(args.limit),
         });
-        return callGateway(`/v1/history?${query.toString()}`);
+        return callObservation(`/v1/history?${query.toString()}`);
       },
     },
     {
       name: "get_daily_performance",
-      description: "Read current UTC-day performance and exposure from the guarded account.",
+      description: "Read account-wide current UTC-day realized PnL and currency from the non-executable Observation Service.",
       category: "trading",
       riskLevel: "safe",
       parameters: noParameters,
-      execute: async () => callGateway("/v1/daily-stats"),
+      execute: async () => callObservation("/v1/daily-stats"),
     },
     {
       name: "record_trading_decision",
