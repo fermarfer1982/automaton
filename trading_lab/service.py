@@ -123,9 +123,16 @@ def serve(
             except ImportError as exc:
                 raise RuntimeError("FastAPI dependency is unavailable") from exc
             if health_only:
+                from .observation_http import (
+                    ObservationLatestClosedM1Provider,
+                )
+
                 application = build_health_only_application(
                     replace(config, mt5_access_enabled=False),
                     runtime_identity_verified=True,
+                    latest_closed_m1_provider=(
+                        ObservationLatestClosedM1Provider()
+                    ),
                 )
                 application.record_gateway_started()
                 health_start_audit_completed = True
