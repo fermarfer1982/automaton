@@ -423,12 +423,12 @@ if ($pinnedExistingConfig -and (
     throw 'Bootstrap did not preserve the pinned existing configuration contract.'
 }
 
-$authorizationChildren = @(Get-ChildItem -LiteralPath $demoAuthorization -Force)
-foreach ($authorizationChild in $authorizationChildren) {
-    if ($authorizationChild.PSIsContainer -or
-        $authorizationChild.Name -cnotmatch '^mt5-read-only-authorization-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$' -or
-        ($authorizationChild.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
-        throw "Unexpected authorization artifact: $($authorizationChild.FullName)"
+$authorizationPreflightChildren = @(Get-ChildItem -LiteralPath $demoAuthorization -Force)
+foreach ($authorizationPreflightChild in $authorizationPreflightChildren) {
+    if ($authorizationPreflightChild.PSIsContainer -or
+        $authorizationPreflightChild.Name -cnotmatch '^mt5-read-only-authorization-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$' -or
+        ($authorizationPreflightChild.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw "Unexpected authorization artifact: $($authorizationPreflightChild.FullName)"
     }
 }
 
@@ -536,6 +536,220 @@ function Set-ExactControlAcl {
     }
 }
 
+function Get-DemoAuthorizationAclSnapshot(
+    [System.Security.AccessControl.FileSystemSecurity] $Security,
+    [string] $Path
+) {
+    $ownerSid = $Security.GetOwner(
+        [System.Security.Principal.SecurityIdentifier]
+    ).Value
+    $rules = @($Security.GetAccessRules(
+        $true,
+        $true,
+        [System.Security.Principal.SecurityIdentifier]
+    ) | ForEach-Object {
+        [pscustomobject]@{
+            sid = $_.IdentityReference.Value
+            rights = [int64]$_.FileSystemRights
+            access_type = [int]$_.AccessControlType
+            inherited = [bool]$_.IsInherited
+            inheritance_flags = [int]$_.InheritanceFlags
+            propagation_flags = [int]$_.PropagationFlags
+        }
+    })
+    # Group SID and descriptor-control serialization are intentionally excluded:
+    # they do not grant access and are not part of this exact authorization policy.
+    return [pscustomobject]@{
+        path = $Path
+        owner_sid = $ownerSid
+        protected = [bool]$Security.AreAccessRulesProtected
+        rules = $rules
+    }
+}
+
+function New-DemoAuthorizationAclRule(
+    [System.Security.Principal.SecurityIdentifier] $Sid,
+    [System.Security.AccessControl.FileSystemRights] $Rights,
+    [bool] $Inherited,
+    [System.Security.AccessControl.InheritanceFlags] $InheritanceFlags,
+    [System.Security.AccessControl.PropagationFlags] $PropagationFlags
+) {
+    return [pscustomobject]@{
+        sid = $Sid.Value
+        rights = [int64]$Rights
+        access_type = [int][System.Security.AccessControl.AccessControlType]::Allow
+        inherited = $Inherited
+        inheritance_flags = [int]$InheritanceFlags
+        propagation_flags = [int]$PropagationFlags
+    }
+}
+
+function Test-DemoAuthorizationAclRuleExact($Actual, $Expected) {
+    return [string]$Actual.sid -ceq [string]$Expected.sid -and
+        [int64]$Actual.rights -eq [int64]$Expected.rights -and
+        [int]$Actual.access_type -eq [int]$Expected.access_type -and
+        [bool]$Actual.inherited -eq [bool]$Expected.inherited -and
+        [int]$Actual.inheritance_flags -eq [int]$Expected.inheritance_flags -and
+        [int]$Actual.propagation_flags -eq [int]$Expected.propagation_flags
+}
+
+function Assert-DemoAuthorizationAclRuleSet(
+    $Snapshot,
+    [object[]] $ExpectedRules,
+    [bool] $RulesMustBeInherited
+) {
+    $actualRules = @($Snapshot.rules)
+    if ($actualRules.Count -ne $ExpectedRules.Count) {
+        throw "Authorization ACL ACE count is not exact: $($Snapshot.path)"
+    }
+    $unmatched = [System.Collections.ArrayList]::new()
+    foreach ($actualRule in $actualRules) {
+        if ([int]$actualRule.access_type -ne
+            [int][System.Security.AccessControl.AccessControlType]::Allow) {
+            throw "Authorization ACL contains a non-Allow ACE: $($Snapshot.path)"
+        }
+        if ([bool]$actualRule.inherited -ne $RulesMustBeInherited) {
+            throw "Authorization ACL ACE inheritance is not exact: $($Snapshot.path)"
+        }
+        [void]$unmatched.Add($actualRule)
+    }
+    foreach ($expectedRule in $ExpectedRules) {
+        $matchingIndex = -1
+        for ($index = 0; $index -lt $unmatched.Count; $index++) {
+            if (Test-DemoAuthorizationAclRuleExact $unmatched[$index] $expectedRule) {
+                $matchingIndex = $index
+                break
+            }
+        }
+        if ($matchingIndex -lt 0) {
+            throw "Authorization ACL exact ACE policy mismatch: $($Snapshot.path)"
+        }
+        $unmatched.RemoveAt($matchingIndex)
+    }
+    if ($unmatched.Count -ne 0) {
+        throw "Authorization ACL contains an unexpected ACE: $($Snapshot.path)"
+    }
+}
+
+function Assert-DemoAuthorizationParentAclSnapshot(
+    $Snapshot,
+    [System.Security.Principal.SecurityIdentifier] $GatewaySid,
+    [System.Security.Principal.SecurityIdentifier] $SystemSid,
+    [System.Security.Principal.SecurityIdentifier] $AdministratorsSid
+) {
+    if ([string]$Snapshot.owner_sid -cne $AdministratorsSid.Value) {
+        throw "Authorization directory owner is not BUILTIN\Administrators: $($Snapshot.path)"
+    }
+    if (-not [bool]$Snapshot.protected) {
+        throw "Authorization directory DACL is not protected: $($Snapshot.path)"
+    }
+    $directoryInheritance = [System.Security.AccessControl.InheritanceFlags](
+        [int][System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+        [int][System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    )
+    $expectedRules = @(
+        New-DemoAuthorizationAclRule $SystemSid `
+            ([System.Security.AccessControl.FileSystemRights]::FullControl) `
+            $false $directoryInheritance `
+            ([System.Security.AccessControl.PropagationFlags]::None)
+        New-DemoAuthorizationAclRule $AdministratorsSid `
+            ([System.Security.AccessControl.FileSystemRights]::FullControl) `
+            $false $directoryInheritance `
+            ([System.Security.AccessControl.PropagationFlags]::None)
+        New-DemoAuthorizationAclRule $GatewaySid `
+            ([System.Security.AccessControl.FileSystemRights]::ReadAndExecute) `
+            $false ([System.Security.AccessControl.InheritanceFlags]::None) `
+            ([System.Security.AccessControl.PropagationFlags]::None)
+        New-DemoAuthorizationAclRule $GatewaySid `
+            ([System.Security.AccessControl.FileSystemRights]::Read) `
+            $false ([System.Security.AccessControl.InheritanceFlags]::ObjectInherit) `
+            ([System.Security.AccessControl.PropagationFlags]::InheritOnly)
+    )
+    Assert-DemoAuthorizationAclRuleSet $Snapshot $expectedRules $false
+}
+
+function Assert-DemoAuthorizationChildAclSnapshot(
+    $Snapshot,
+    [System.Security.Principal.SecurityIdentifier] $GatewaySid,
+    [System.Security.Principal.SecurityIdentifier] $SystemSid,
+    [System.Security.Principal.SecurityIdentifier] $AdministratorsSid
+) {
+    if (-not ([string]$Snapshot.owner_sid -ceq $AdministratorsSid.Value)) {
+        throw "Authorization artifact owner is not BUILTIN\Administrators: $($Snapshot.path)"
+    }
+    if ([bool]$Snapshot.protected) {
+        throw "Authorization artifact must inherit its parent ACL: $($Snapshot.path)"
+    }
+    $expectedRules = @(
+        New-DemoAuthorizationAclRule $SystemSid `
+            ([System.Security.AccessControl.FileSystemRights]::FullControl) `
+            $true ([System.Security.AccessControl.InheritanceFlags]::None) `
+            ([System.Security.AccessControl.PropagationFlags]::None)
+        New-DemoAuthorizationAclRule $AdministratorsSid `
+            ([System.Security.AccessControl.FileSystemRights]::FullControl) `
+            $true ([System.Security.AccessControl.InheritanceFlags]::None) `
+            ([System.Security.AccessControl.PropagationFlags]::None)
+        New-DemoAuthorizationAclRule $GatewaySid `
+            ([System.Security.AccessControl.FileSystemRights]::Read) `
+            $true ([System.Security.AccessControl.InheritanceFlags]::None) `
+            ([System.Security.AccessControl.PropagationFlags]::None)
+    )
+    Assert-DemoAuthorizationAclRuleSet $Snapshot $expectedRules $true
+}
+
+function ConvertTo-DemoAuthorizationChildInventory([object[]] $Children) {
+    $names = [System.Collections.Generic.List[string]]::new()
+    $seenNames = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::Ordinal
+    )
+    foreach ($child in @($Children)) {
+        foreach ($requiredProperty in @('Name', 'FullName', 'PSIsContainer', 'Attributes')) {
+            if ($null -eq $child.PSObject.Properties[$requiredProperty]) {
+                throw 'Authorization child inventory entry is incomplete or ambiguous.'
+            }
+        }
+        if ([bool]$child.PSIsContainer -or
+            [string]$child.Name -cnotmatch '^mt5-read-only-authorization-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$' -or
+            ([System.IO.FileAttributes]$child.Attributes -band
+                [System.IO.FileAttributes]::ReparsePoint)) {
+            throw "Unexpected authorization artifact: $($child.FullName)"
+        }
+        if (-not $seenNames.Add([string]$child.Name)) {
+            throw "Duplicate authorization artifact inventory entry: $($child.Name)"
+        }
+        $names.Add([string]$child.Name)
+    }
+    [string[]]$sortedNames = @($names)
+    [array]::Sort($sortedNames, [System.StringComparer]::Ordinal)
+    return [pscustomobject]@{
+        children = @($Children)
+        canonical_names = $sortedNames
+    }
+}
+
+function Get-DemoAuthorizationChildInventory {
+    $children = @(Get-ChildItem -LiteralPath $demoAuthorization -Force -ErrorAction Stop)
+    return (ConvertTo-DemoAuthorizationChildInventory $children)
+}
+
+function Assert-DemoAuthorizationChildInventoryStable(
+    [string[]] $ValidatedNames,
+    [string[]] $FinalNames
+) {
+    [string[]]$validated = @($ValidatedNames)
+    [string[]]$final = @($FinalNames)
+    [array]::Sort($validated, [System.StringComparer]::Ordinal)
+    [array]::Sort($final, [System.StringComparer]::Ordinal)
+    if ($validated.Count -ne $final.Count) {
+        throw 'Authorization artifact inventory changed after validation.'
+    }
+    for ($index = 0; $index -lt $validated.Count; $index++) {
+        if ($validated[$index] -cne $final[$index]) {
+            throw 'Authorization artifact inventory changed after validation.'
+        }
+    }
+}
+
 function Set-ExactDemoAuthorizationAcl {
     $security = [System.Security.AccessControl.DirectorySecurity]::new()
     $security.SetOwner($administratorsSid)
@@ -563,27 +777,43 @@ function Set-ExactDemoAuthorizationAcl {
         [System.Security.AccessControl.PropagationFlags]::InheritOnly,
         [System.Security.AccessControl.AccessControlType]::Allow
     ))
-    if ($authorizationChildren.Count -gt 0) {
+    $validatedInventory = Get-DemoAuthorizationChildInventory
+    if ($validatedInventory.children.Count -gt 0) {
         $current = Get-Acl -LiteralPath $demoAuthorization -ErrorAction Stop
-        if ($current.Sddl -ne $security.GetSecurityDescriptorSddlForm(
-            [System.Security.AccessControl.AccessControlSections]::All
-        )) {
-            throw 'Existing authorization artifacts require an already-canonical parent ACL.'
+        $parentSnapshot = Get-DemoAuthorizationAclSnapshot $current $demoAuthorization
+        Assert-DemoAuthorizationParentAclSnapshot `
+            $parentSnapshot $gatewaySid $systemSid $administratorsSid
+        foreach ($authorizationChild in @($validatedInventory.children)) {
+            $childItem = Get-Item -LiteralPath $authorizationChild.FullName `
+                -Force -ErrorAction Stop
+            if ($childItem.PSIsContainer -or
+                $childItem.Name -cnotmatch '^mt5-read-only-authorization-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$' -or
+                ($childItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                throw "Unexpected authorization artifact: $($childItem.FullName)"
+            }
+            $childSecurity = Get-Acl -LiteralPath $childItem.FullName -ErrorAction Stop
+            $childSnapshot = Get-DemoAuthorizationAclSnapshot `
+                $childSecurity $childItem.FullName
+            Assert-DemoAuthorizationChildAclSnapshot `
+                $childSnapshot $gatewaySid $systemSid $administratorsSid
         }
-        return
-    }
-    Set-Acl -LiteralPath $demoAuthorization -AclObject $security
-    if ($ProgressPath) {
-        $progressRecord = [pscustomobject]@{
-            path = $demoAuthorization
-            applied_at_utc = [DateTime]::UtcNow.ToString('o')
+    } else {
+        Set-Acl -LiteralPath $demoAuthorization -AclObject $security
+        if ($ProgressPath) {
+            $progressRecord = [pscustomobject]@{
+                path = $demoAuthorization
+                applied_at_utc = [DateTime]::UtcNow.ToString('o')
+            }
+            [System.IO.File]::AppendAllText(
+                $ProgressPath,
+                (($progressRecord | ConvertTo-Json -Compress) + [Environment]::NewLine),
+                [System.Text.UTF8Encoding]::new($false)
+            )
         }
-        [System.IO.File]::AppendAllText(
-            $ProgressPath,
-            (($progressRecord | ConvertTo-Json -Compress) + [Environment]::NewLine),
-            [System.Text.UTF8Encoding]::new($false)
-        )
     }
+    $finalInventory = Get-DemoAuthorizationChildInventory
+    Assert-DemoAuthorizationChildInventoryStable `
+        $validatedInventory.canonical_names $finalInventory.canonical_names
 }
 
 $read = [System.Security.AccessControl.FileSystemRights]::Read

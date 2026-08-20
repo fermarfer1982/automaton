@@ -63,6 +63,419 @@ if (-not $setupSource.Contains("Join-Path `$PSScriptRoot 'Initialize-TradingLabA
     $setupSource.Contains('ExpectedExistingConfigSha256')) {
     throw 'setup.ps1 must retain the backward-compatible default initializer call without pinned mode.'
 }
+
+$initializerFunctionAsts = @($initializerAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+}, $true))
+$demoAuthorizationFunction = @($initializerFunctionAsts | Where-Object {
+    $_.Name -eq 'Set-ExactDemoAuthorizationAcl'
+})
+if ($demoAuthorizationFunction.Count -ne 1) {
+    throw 'Set-ExactDemoAuthorizationAcl function boundary was not found.'
+}
+$demoAuthorizationSource = $demoAuthorizationFunction[0].Extent.Text
+foreach ($forbiddenSerializedAclDecision in @(
+    '$current.Sddl',
+    'GetSecurityDescriptorSddlForm'
+)) {
+    if ($demoAuthorizationSource.Contains($forbiddenSerializedAclDecision)) {
+        throw "Existing authorization artifacts still use serialized SDDL canonicality: $forbiddenSerializedAclDecision"
+    }
+}
+$snapshotFunction = @($initializerFunctionAsts | Where-Object {
+    $_.Name -eq 'Get-DemoAuthorizationAclSnapshot'
+})
+if ($snapshotFunction.Count -ne 1) {
+    throw 'Authorization ACL semantic snapshot helper was not found.'
+}
+$snapshotFunctionSource = $snapshotFunction[0].Extent.Text
+foreach ($requiredSnapshotBoundary in @(
+    '$Security.GetOwner(',
+    '$Security.GetAccessRules(',
+    '[System.Security.Principal.SecurityIdentifier]',
+    '$_.IdentityReference.Value',
+    'rights = [int64]$_.FileSystemRights',
+    'access_type = [int]$_.AccessControlType',
+    'inherited = [bool]$_.IsInherited',
+    'inheritance_flags = [int]$_.InheritanceFlags',
+    'propagation_flags = [int]$_.PropagationFlags'
+)) {
+    if (-not $snapshotFunctionSource.Contains($requiredSnapshotBoundary)) {
+        throw "Authorization ACL snapshot is not SID/numeric exact: $requiredSnapshotBoundary"
+    }
+}
+foreach ($forbiddenSnapshotMetadata in @('.Sddl', 'GetGroup(', 'GetSecurityDescriptorSddlForm')) {
+    if ($snapshotFunctionSource.Contains($forbiddenSnapshotMetadata)) {
+        throw "Authorization ACL policy improperly depends on descriptor metadata: $forbiddenSnapshotMetadata"
+    }
+}
+foreach ($requiredSemanticAclBoundary in @(
+    '$validatedInventory = Get-DemoAuthorizationChildInventory',
+    'if ($validatedInventory.children.Count -gt 0)',
+    'Get-DemoAuthorizationAclSnapshot $current $demoAuthorization',
+    'Assert-DemoAuthorizationParentAclSnapshot',
+    'foreach ($authorizationChild in @($validatedInventory.children))',
+    'Get-Item -LiteralPath $authorizationChild.FullName',
+    '$childItem.PSIsContainer',
+    'FileAttributes]::ReparsePoint',
+    '^mt5-read-only-authorization-',
+    'Get-Acl -LiteralPath $childItem.FullName',
+    'Assert-DemoAuthorizationChildAclSnapshot',
+    'Set-Acl -LiteralPath $demoAuthorization -AclObject $security',
+    '$finalInventory = Get-DemoAuthorizationChildInventory',
+    'Assert-DemoAuthorizationChildInventoryStable'
+)) {
+    if (-not $demoAuthorizationSource.Contains($requiredSemanticAclBoundary)) {
+        throw "Authorization ACL semantic branch lacks boundary: $requiredSemanticAclBoundary"
+    }
+}
+$freshInventoryIndex = $demoAuthorizationSource.IndexOf(
+    '$validatedInventory = Get-DemoAuthorizationChildInventory'
+)
+$existingArtifactsBranch = $demoAuthorizationSource.IndexOf(
+    'if ($validatedInventory.children.Count -gt 0)',
+    [Math]::Max(0, $freshInventoryIndex)
+)
+$parentSemanticCheck = $demoAuthorizationSource.IndexOf(
+    'Assert-DemoAuthorizationParentAclSnapshot',
+    [Math]::Max(0, $existingArtifactsBranch)
+)
+$childSemanticCheck = $demoAuthorizationSource.IndexOf(
+    'Assert-DemoAuthorizationChildAclSnapshot',
+    [Math]::Max(0, $parentSemanticCheck)
+)
+$existingArtifactsElse = $demoAuthorizationSource.IndexOf(
+    "`n    } else {",
+    [Math]::Max(0, $childSemanticCheck)
+)
+$emptyDirectorySetAcl = $demoAuthorizationSource.IndexOf(
+    'Set-Acl -LiteralPath $demoAuthorization -AclObject $security',
+    [Math]::Max(0, $existingArtifactsElse)
+)
+$finalInventoryIndex = $demoAuthorizationSource.IndexOf(
+    '$finalInventory = Get-DemoAuthorizationChildInventory',
+    [Math]::Max(0, $emptyDirectorySetAcl)
+)
+$finalInventoryAssertion = $demoAuthorizationSource.IndexOf(
+    'Assert-DemoAuthorizationChildInventoryStable',
+    [Math]::Max(0, $finalInventoryIndex)
+)
+if ($freshInventoryIndex -lt 0 -or
+    $existingArtifactsBranch -le $freshInventoryIndex -or
+    $parentSemanticCheck -le $existingArtifactsBranch -or
+    $childSemanticCheck -le $parentSemanticCheck -or
+    $existingArtifactsElse -le $childSemanticCheck -or
+    $emptyDirectorySetAcl -le $existingArtifactsElse -or
+    $finalInventoryIndex -le $emptyDirectorySetAcl -or
+    $finalInventoryAssertion -le $finalInventoryIndex) {
+    throw 'Authorization ACL branch does not use fresh validation and final inventories around all ACL work.'
+}
+$existingArtifactsSource = $demoAuthorizationSource.Substring(
+    $existingArtifactsBranch,
+    $existingArtifactsElse - $existingArtifactsBranch
+)
+if ($existingArtifactsSource.Contains('Set-Acl')) {
+    throw 'Existing canonical authorization artifacts can reach Set-Acl instead of returning unchanged.'
+}
+
+foreach ($semanticFunctionName in @(
+    'New-DemoAuthorizationAclRule',
+    'Test-DemoAuthorizationAclRuleExact',
+    'Assert-DemoAuthorizationAclRuleSet',
+    'Assert-DemoAuthorizationParentAclSnapshot',
+    'Assert-DemoAuthorizationChildAclSnapshot',
+    'ConvertTo-DemoAuthorizationChildInventory',
+    'Assert-DemoAuthorizationChildInventoryStable'
+)) {
+    $semanticFunction = @($initializerFunctionAsts | Where-Object {
+        $_.Name -eq $semanticFunctionName
+    })
+    if ($semanticFunction.Count -ne 1) {
+        throw "Authorization semantic helper is missing: $semanticFunctionName"
+    }
+    . ([scriptblock]::Create($semanticFunction[0].Extent.Text))
+}
+
+function Copy-TestDemoAuthorizationRule($Rule) {
+    return [pscustomobject]@{
+        sid = [string]$Rule.sid
+        rights = [int64]$Rule.rights
+        access_type = [int]$Rule.access_type
+        inherited = [bool]$Rule.inherited
+        inheritance_flags = [int]$Rule.inheritance_flags
+        propagation_flags = [int]$Rule.propagation_flags
+    }
+}
+
+function New-TestDemoAuthorizationSnapshot(
+    [object[]] $Rules,
+    [bool] $Protected,
+    [string] $OwnerSid = 'S-1-5-32-544',
+    [string] $GroupSid = 'S-1-5-21-10-20-30-513',
+    [string] $DescriptorControl = 'D:PAI'
+) {
+    return [pscustomobject]@{
+        path = 'synthetic-authorization-target'
+        owner_sid = $OwnerSid
+        group_sid = $GroupSid
+        descriptor_control = $DescriptorControl
+        protected = $Protected
+        rules = @($Rules | ForEach-Object { Copy-TestDemoAuthorizationRule $_ })
+    }
+}
+
+function Assert-DemoAuthorizationTestThrows([scriptblock] $Action, [string] $Message) {
+    $threw = $false
+    try { & $Action } catch { $threw = $true }
+    if (-not $threw) { throw $Message }
+}
+
+function New-TestDemoAuthorizationChild([string] $Name) {
+    return [pscustomobject]@{
+        Name = $Name
+        FullName = 'C:\synthetic\demo-authorization\' + $Name
+        PSIsContainer = $false
+        Attributes = [System.IO.FileAttributes]::Normal
+    }
+}
+
+function Assert-DemoAuthorizationInventoryDrift(
+    [string[]] $ValidatedNames,
+    [string[]] $FinalNames,
+    [string] $Case
+) {
+    $message = $null
+    try {
+        Assert-DemoAuthorizationChildInventoryStable $ValidatedNames $FinalNames
+    } catch {
+        $message = $_.Exception.Message
+    }
+    if ($message -cne 'Authorization artifact inventory changed after validation.') {
+        throw "$Case did not fail specifically because of authorization inventory drift."
+    }
+}
+
+$semanticSystemSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+$semanticAdministratorsSid = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+$semanticGatewaySid = [System.Security.Principal.SecurityIdentifier]::new(
+    'S-1-5-21-10-20-30-1007'
+)
+$semanticAgentSid = [System.Security.Principal.SecurityIdentifier]::new(
+    'S-1-5-21-10-20-30-1006'
+)
+$semanticDirectoryInheritance = [System.Security.AccessControl.InheritanceFlags](
+    [int][System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+    [int][System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+)
+$canonicalParentRules = @(
+    New-DemoAuthorizationAclRule $semanticSystemSid `
+        ([System.Security.AccessControl.FileSystemRights]::FullControl) `
+        $false $semanticDirectoryInheritance `
+        ([System.Security.AccessControl.PropagationFlags]::None)
+    New-DemoAuthorizationAclRule $semanticAdministratorsSid `
+        ([System.Security.AccessControl.FileSystemRights]::FullControl) `
+        $false $semanticDirectoryInheritance `
+        ([System.Security.AccessControl.PropagationFlags]::None)
+    New-DemoAuthorizationAclRule $semanticGatewaySid `
+        ([System.Security.AccessControl.FileSystemRights]::ReadAndExecute) `
+        $false ([System.Security.AccessControl.InheritanceFlags]::None) `
+        ([System.Security.AccessControl.PropagationFlags]::None)
+    New-DemoAuthorizationAclRule $semanticGatewaySid `
+        ([System.Security.AccessControl.FileSystemRights]::Read) `
+        $false ([System.Security.AccessControl.InheritanceFlags]::ObjectInherit) `
+        ([System.Security.AccessControl.PropagationFlags]::InheritOnly)
+)
+$canonicalChildRules = @(
+    New-DemoAuthorizationAclRule $semanticSystemSid `
+        ([System.Security.AccessControl.FileSystemRights]::FullControl) `
+        $true ([System.Security.AccessControl.InheritanceFlags]::None) `
+        ([System.Security.AccessControl.PropagationFlags]::None)
+    New-DemoAuthorizationAclRule $semanticAdministratorsSid `
+        ([System.Security.AccessControl.FileSystemRights]::FullControl) `
+        $true ([System.Security.AccessControl.InheritanceFlags]::None) `
+        ([System.Security.AccessControl.PropagationFlags]::None)
+    New-DemoAuthorizationAclRule $semanticGatewaySid `
+        ([System.Security.AccessControl.FileSystemRights]::Read) `
+        $true ([System.Security.AccessControl.InheritanceFlags]::None) `
+        ([System.Security.AccessControl.PropagationFlags]::None)
+)
+
+$inventoryNameA = 'mt5-read-only-authorization-11111111-1111-4111-8111-111111111111.json'
+$inventoryNameB = 'mt5-read-only-authorization-22222222-2222-4222-8222-222222222222.json'
+$inventoryNameC = 'mt5-read-only-authorization-33333333-3333-4333-8333-333333333333.json'
+$validatedInventory = ConvertTo-DemoAuthorizationChildInventory @(
+    (New-TestDemoAuthorizationChild $inventoryNameB),
+    (New-TestDemoAuthorizationChild $inventoryNameA)
+)
+$stableInventory = ConvertTo-DemoAuthorizationChildInventory @(
+    (New-TestDemoAuthorizationChild $inventoryNameA),
+    (New-TestDemoAuthorizationChild $inventoryNameB)
+)
+Assert-DemoAuthorizationChildInventoryStable `
+    $validatedInventory.canonical_names $stableInventory.canonical_names
+$addedInventory = ConvertTo-DemoAuthorizationChildInventory @(
+    (New-TestDemoAuthorizationChild $inventoryNameA),
+    (New-TestDemoAuthorizationChild $inventoryNameB),
+    (New-TestDemoAuthorizationChild $inventoryNameC)
+)
+Assert-DemoAuthorizationInventoryDrift `
+    $validatedInventory.canonical_names $addedInventory.canonical_names 'Added child'
+$removedInventory = ConvertTo-DemoAuthorizationChildInventory @(
+    (New-TestDemoAuthorizationChild $inventoryNameA)
+)
+Assert-DemoAuthorizationInventoryDrift `
+    $validatedInventory.canonical_names $removedInventory.canonical_names 'Removed child'
+Assert-DemoAuthorizationTestThrows {
+    ConvertTo-DemoAuthorizationChildInventory @(
+        (New-TestDemoAuthorizationChild $inventoryNameA),
+        (New-TestDemoAuthorizationChild $inventoryNameA)
+    ) | Out-Null
+} 'Duplicate authorization inventory entries were accepted.'
+Assert-DemoAuthorizationTestThrows {
+    ConvertTo-DemoAuthorizationChildInventory @(
+        (New-TestDemoAuthorizationChild 'unexpected.json')
+    ) | Out-Null
+} 'Malformed authorization inventory entries were accepted.'
+
+$reorderedParentRules = @($canonicalParentRules | ForEach-Object {
+    Copy-TestDemoAuthorizationRule $_
+})
+[array]::Reverse($reorderedParentRules)
+$canonicalParent = New-TestDemoAuthorizationSnapshot `
+    $reorderedParentRules $true $semanticAdministratorsSid.Value `
+    'S-1-5-21-10-20-30-999' 'D:PAI'
+Assert-DemoAuthorizationParentAclSnapshot `
+    $canonicalParent $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+$canonicalParent.group_sid = 'S-1-5-21-10-20-30-998'
+$canonicalParent.descriptor_control = 'D:P'
+Assert-DemoAuthorizationParentAclSnapshot `
+    $canonicalParent $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+
+$extraParent = New-TestDemoAuthorizationSnapshot $canonicalParentRules $true
+$extraParent.rules += New-DemoAuthorizationAclRule $semanticAgentSid `
+    ([System.Security.AccessControl.FileSystemRights]::Read) $false `
+    ([System.Security.AccessControl.InheritanceFlags]::None) `
+    ([System.Security.AccessControl.PropagationFlags]::None)
+Assert-DemoAuthorizationTestThrows {
+    Assert-DemoAuthorizationParentAclSnapshot `
+        $extraParent $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+} 'An additional parent ACE was accepted.'
+
+$denyParent = New-TestDemoAuthorizationSnapshot $canonicalParentRules $true
+$denyParent.rules[0].access_type = [int][System.Security.AccessControl.AccessControlType]::Deny
+Assert-DemoAuthorizationTestThrows {
+    Assert-DemoAuthorizationParentAclSnapshot `
+        $denyParent $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+} 'A Deny parent ACE was accepted.'
+
+$agentParent = New-TestDemoAuthorizationSnapshot $canonicalParentRules $true
+$agentParent.rules[2].sid = $semanticAgentSid.Value
+Assert-DemoAuthorizationTestThrows {
+    Assert-DemoAuthorizationParentAclSnapshot `
+        $agentParent $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+} 'An Agent parent ACE was accepted.'
+
+$wrongParentRights = New-TestDemoAuthorizationSnapshot $canonicalParentRules $true
+$wrongParentRights.rules[2].rights = [int64][System.Security.AccessControl.FileSystemRights]::Read
+Assert-DemoAuthorizationTestThrows {
+    Assert-DemoAuthorizationParentAclSnapshot `
+        $wrongParentRights $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+} 'Wrong Gateway parent rights were accepted.'
+
+$wrongParentInheritance = New-TestDemoAuthorizationSnapshot $canonicalParentRules $true
+$wrongParentInheritance.rules[0].inheritance_flags = `
+    [int][System.Security.AccessControl.InheritanceFlags]::None
+Assert-DemoAuthorizationTestThrows {
+    Assert-DemoAuthorizationParentAclSnapshot `
+        $wrongParentInheritance $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+} 'Wrong parent inheritance flags were accepted.'
+
+$wrongParentPropagation = New-TestDemoAuthorizationSnapshot $canonicalParentRules $true
+$wrongParentPropagation.rules[3].propagation_flags = `
+    [int][System.Security.AccessControl.PropagationFlags]::None
+Assert-DemoAuthorizationTestThrows {
+    Assert-DemoAuthorizationParentAclSnapshot `
+        $wrongParentPropagation $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+} 'Wrong parent propagation flags were accepted.'
+
+$unprotectedParent = New-TestDemoAuthorizationSnapshot $canonicalParentRules $false
+Assert-DemoAuthorizationTestThrows {
+    Assert-DemoAuthorizationParentAclSnapshot `
+        $unprotectedParent $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+} 'An unprotected parent DACL was accepted.'
+
+$wrongOwnerParent = New-TestDemoAuthorizationSnapshot `
+    $canonicalParentRules $true $semanticSystemSid.Value
+Assert-DemoAuthorizationTestThrows {
+    Assert-DemoAuthorizationParentAclSnapshot `
+        $wrongOwnerParent $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+} 'A parent with the wrong owner was accepted.'
+
+$canonicalChild = New-TestDemoAuthorizationSnapshot $canonicalChildRules $false
+Assert-DemoAuthorizationChildAclSnapshot `
+    $canonicalChild $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+
+$wrongOwnerChild = New-TestDemoAuthorizationSnapshot `
+    $canonicalChildRules $false $semanticSystemSid.Value
+Assert-DemoAuthorizationTestThrows {
+    Assert-DemoAuthorizationChildAclSnapshot `
+        $wrongOwnerChild $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+} 'An authorization child with the wrong owner was accepted.'
+
+$protectedChild = New-TestDemoAuthorizationSnapshot $canonicalChildRules $true
+Assert-DemoAuthorizationTestThrows {
+    Assert-DemoAuthorizationChildAclSnapshot `
+        $protectedChild $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+} 'A protected authorization child was accepted.'
+
+$explicitChild = New-TestDemoAuthorizationSnapshot $canonicalChildRules $false
+$explicitChild.rules[0].inherited = $false
+Assert-DemoAuthorizationTestThrows {
+    Assert-DemoAuthorizationChildAclSnapshot `
+        $explicitChild $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+} 'An explicit authorization child ACE was accepted.'
+
+$denyChild = New-TestDemoAuthorizationSnapshot $canonicalChildRules $false
+$denyChild.rules[0].access_type = [int][System.Security.AccessControl.AccessControlType]::Deny
+Assert-DemoAuthorizationTestThrows {
+    Assert-DemoAuthorizationChildAclSnapshot `
+        $denyChild $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+} 'A Deny authorization child ACE was accepted.'
+
+$extraChild = New-TestDemoAuthorizationSnapshot $canonicalChildRules $false
+$extraChild.rules += New-DemoAuthorizationAclRule $semanticAgentSid `
+    ([System.Security.AccessControl.FileSystemRights]::Read) $true `
+    ([System.Security.AccessControl.InheritanceFlags]::None) `
+    ([System.Security.AccessControl.PropagationFlags]::None)
+Assert-DemoAuthorizationTestThrows {
+    Assert-DemoAuthorizationChildAclSnapshot `
+        $extraChild $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+} 'An additional authorization child ACE was accepted.'
+
+$agentChild = New-TestDemoAuthorizationSnapshot $canonicalChildRules $false
+$agentChild.rules[2].sid = $semanticAgentSid.Value
+Assert-DemoAuthorizationTestThrows {
+    Assert-DemoAuthorizationChildAclSnapshot `
+        $agentChild $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+} 'An Agent authorization child ACE was accepted.'
+
+$wrongChildInheritance = New-TestDemoAuthorizationSnapshot $canonicalChildRules $false
+$wrongChildInheritance.rules[2].inheritance_flags = `
+    [int][System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+Assert-DemoAuthorizationTestThrows {
+    Assert-DemoAuthorizationChildAclSnapshot `
+        $wrongChildInheritance $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+} 'Wrong inherited child flags were accepted.'
+
+$wrongChildPropagation = New-TestDemoAuthorizationSnapshot $canonicalChildRules $false
+$wrongChildPropagation.rules[2].propagation_flags = `
+    [int][System.Security.AccessControl.PropagationFlags]::InheritOnly
+Assert-DemoAuthorizationTestThrows {
+    Assert-DemoAuthorizationChildAclSnapshot `
+        $wrongChildPropagation $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+} 'Wrong inherited child propagation was accepted.'
+
 $applyGatePath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\Apply-TradingLabAclGate.ps1'
 $applyTokens = $null
 $applyErrors = $null
