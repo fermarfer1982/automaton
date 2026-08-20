@@ -583,6 +583,76 @@ class ResearchStore:
         )
         return result
 
+    def market_experience_bounds(
+        self,
+    ) -> tuple[datetime | None, datetime | None]:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT
+                  MIN(bar_time_utc) AS first_bar_time_utc,
+                  MAX(bar_time_utc) AS last_bar_time_utc
+                FROM market_experiences
+                """
+            ).fetchone()
+
+        first_raw = row["first_bar_time_utc"]
+        last_raw = row["last_bar_time_utc"]
+
+        first = (
+            datetime.fromisoformat(
+                str(first_raw)
+            ).astimezone(UTC)
+            if first_raw is not None
+            else None
+        )
+        last = (
+            datetime.fromisoformat(
+                str(last_raw)
+            ).astimezone(UTC)
+            if last_raw is not None
+            else None
+        )
+        return first, last
+
+    def market_experience_bar_times(
+        self,
+        start_utc: datetime,
+        end_utc: datetime,
+    ) -> set[str]:
+        start = self._canonical_utc(
+            start_utc,
+            field_name="start_utc",
+        )
+        end = self._canonical_utc(
+            end_utc,
+            field_name="end_utc",
+        )
+        if end < start:
+            raise ValueError(
+                "Experience coverage end cannot precede start"
+            )
+
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT bar_time_utc
+                FROM market_experiences
+                WHERE bar_time_utc >= ?
+                  AND bar_time_utc <= ?
+                ORDER BY bar_time_utc
+                """,
+                (
+                    start.isoformat(),
+                    end.isoformat(),
+                ),
+            ).fetchall()
+
+        return {
+            str(row["bar_time_utc"])
+            for row in rows
+        }
+
     def record_experience_outcome(
         self,
         record: ExperienceOutcomeRecord,

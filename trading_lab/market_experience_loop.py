@@ -97,6 +97,7 @@ class MarketExperienceLoop:
                 experiences_created=(
                     current.experiences_created
                     + int(result.experience_created)
+                    + result.backfill_experiences_created
                 ),
                 outcomes_created=(
                     current.outcomes_created

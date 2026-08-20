@@ -35,6 +35,7 @@ class MarketExperienceLoopTests(unittest.TestCase):
                 bar_time_utc="2026-08-20T14:30:00+00:00",
                 experience_created=True,
                 outcomes_created=0,
+                backfill_experiences_created=2,
             ),
             CollectorResult(
                 experience_id="e1",
@@ -53,7 +54,7 @@ class MarketExperienceLoopTests(unittest.TestCase):
 
         state = loop.snapshot()
         self.assertEqual(2, state.cycles)
-        self.assertEqual(1, state.experiences_created)
+        self.assertEqual(3, state.experiences_created)
         self.assertEqual(1, state.outcomes_created)
         self.assertEqual(0, state.consecutive_errors)
         self.assertIsNone(state.last_error)

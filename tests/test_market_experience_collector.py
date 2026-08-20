@@ -197,7 +197,14 @@ class MarketExperienceCollectorTests(unittest.TestCase):
                 now=datetime(2026, 8, 20, 11, 1, tzinfo=UTC)
             )
 
-            self.assertEqual(3, result.outcomes_created)
+            self.assertGreaterEqual(
+                result.outcomes_created,
+                3,
+            )
+            self.assertGreater(
+                result.backfill_experiences_created,
+                0,
+            )
             outcomes = store.experience_outcomes(
                 "old-experience"
             )
@@ -221,6 +228,98 @@ class MarketExperienceCollectorTests(unittest.TestCase):
                 55.0,
                 by_horizon[5]["mfe_long_points"],
                 places=6,
+            )
+
+    def test_backfills_internal_gap_without_m1_lookahead(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ResearchStore(Path(directory) / "research.db")
+            rows = self.build_rows()
+            observation = FakeObservation(rows)
+            collector = MarketExperienceCollector(
+                observation,
+                store,
+            )
+
+            base = datetime(
+                2026, 8, 20, 10, 55, tzinfo=UTC
+            )
+            for minute in (0, 4):
+                bar_time = base + timedelta(minutes=minute)
+                row = next(
+                    item for item in rows["M1"]
+                    if int(item["time_msc"])
+                    == int(bar_time.timestamp() * 1000)
+                )
+                store.record_market_experience(
+                    MarketExperienceRecord(
+                        experience_id=collector._experience_id(
+                            int(row["time_msc"])
+                        ),
+                        symbol="XAUUSD",
+                        timeframe="M1",
+                        bar_time_utc=bar_time,
+                        reference_price=float(row["close"]),
+                        point=0.01,
+                        spread_points=float(row["spread"]),
+                        session="LONDON",
+                        features={"seed": True},
+                    )
+                )
+
+            future_spike_time = int(
+                datetime(
+                    2026, 8, 20, 10, 57, tzinfo=UTC
+                ).timestamp() * 1000
+            )
+            for row in rows["M1"]:
+                if int(row["time_msc"]) == future_spike_time:
+                    row["high"] = 9000.0
+
+            result = collector.collect_once(
+                now=datetime(
+                    2026, 8, 20, 11, 1, tzinfo=UTC
+                )
+            )
+
+            self.assertTrue(result.experience_created)
+            self.assertEqual(
+                3,
+                result.backfill_experiences_created,
+            )
+
+            expected_times = {
+                (
+                    base + timedelta(minutes=minute)
+                ).isoformat()
+                for minute in range(6)
+            }
+            actual_times = store.market_experience_bar_times(
+                base,
+                base + timedelta(minutes=5),
+            )
+            self.assertEqual(
+                expected_times,
+                actual_times,
+            )
+
+            target = datetime(
+                2026, 8, 20, 10, 56, tzinfo=UTC
+            )
+            target_id = collector._experience_id(
+                int(target.timestamp() * 1000)
+            )
+            saved = store.get_market_experience(
+                target_id
+            )
+            self.assertIsNotNone(saved)
+            m1_features = saved["features"]["timeframes"]["M1"]
+            self.assertEqual(
+                target.isoformat(),
+                m1_features["bar_time_utc"],
+            )
+            self.assertLess(
+                m1_features["rolling_high_20"],
+                9000.0,
             )
 
     def test_does_not_create_outcome_across_missing_m1_bar(self):

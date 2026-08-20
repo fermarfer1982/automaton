@@ -246,6 +246,60 @@ class ResearchStoreTests(unittest.TestCase):
                         "DELETE FROM experience_outcomes"
                     )
 
+    def test_market_experience_coverage_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ResearchStore(
+                Path(directory) / "research.db"
+            )
+            self.assertEqual(
+                (None, None),
+                store.market_experience_bounds(),
+            )
+
+            first = datetime(
+                2026, 8, 20, 11, 5, tzinfo=UTC
+            )
+            last = first + timedelta(minutes=2)
+
+            for index, bar_time in enumerate(
+                (first, last),
+                start=1,
+            ):
+                store.record_market_experience(
+                    MarketExperienceRecord(
+                        experience_id=f"coverage-{index}",
+                        symbol="XAUUSD",
+                        timeframe="M1",
+                        bar_time_utc=bar_time,
+                        reference_price=4487.0 + index,
+                        point=0.01,
+                        spread_points=10.0,
+                        session="LONDON",
+                        features={},
+                    )
+                )
+
+            self.assertEqual(
+                (first, last),
+                store.market_experience_bounds(),
+            )
+            self.assertEqual(
+                {
+                    first.isoformat(),
+                    last.isoformat(),
+                },
+                store.market_experience_bar_times(
+                    first,
+                    last,
+                ),
+            )
+
+            with self.assertRaises(ValueError):
+                store.market_experience_bar_times(
+                    last,
+                    first,
+                )
+
     def test_market_experience_requires_m1_aligned_utc_bar(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = ResearchStore(

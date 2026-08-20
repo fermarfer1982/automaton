@@ -31,6 +31,7 @@ class CollectorResult:
     bar_time_utc: str
     experience_created: bool
     outcomes_created: int
+    backfill_experiences_created: int = 0
 
 
 def _finite(value: Any, *, field: str) -> float:
@@ -176,6 +177,7 @@ class MarketExperienceCollector:
     """Closed-bar evidence collector with no MT5 execution capability."""
 
     HORIZONS = (5, 15, 60)
+    MAX_BACKFILL_PER_CYCLE = 120
 
     def __init__(
         self,
@@ -285,6 +287,107 @@ class MarketExperienceCollector:
 
         return created
 
+    def _record_experience_for_bar(
+        self,
+        *,
+        row: dict[str, Any],
+        m1: list[dict[str, Any]],
+        m5: list[dict[str, Any]],
+        m15: list[dict[str, Any]],
+        h1: list[dict[str, Any]],
+        point: float,
+        bid: float,
+        ask: float,
+        allow_live_spread_fallback: bool,
+    ) -> bool:
+        bar_msc = int(row["time_msc"])
+        bar_time = datetime.fromtimestamp(
+            bar_msc / 1000,
+            UTC,
+        )
+        experience_id = self._experience_id(bar_msc)
+
+        closed_spread = row.get("spread")
+        if (
+            isinstance(closed_spread, (int, float))
+            and not isinstance(closed_spread, bool)
+            and math.isfinite(float(closed_spread))
+            and float(closed_spread) >= 0
+        ):
+            spread_points = float(closed_spread)
+            spread_source = "CLOSED_M1"
+        elif allow_live_spread_fallback:
+            spread_points = (ask - bid) / point
+            spread_source = "LIVE_TICK_FALLBACK"
+        else:
+            return False
+
+        context = session_context(
+            bar_time + timedelta(minutes=1)
+        )
+
+        def available_by_reference(
+            rows: list[dict[str, Any]],
+        ) -> list[dict[str, Any]]:
+            selected = [
+                item
+                for item in rows
+                if int(item["time_msc"]) <= bar_msc
+            ]
+            if not selected:
+                raise RuntimeError(
+                    "Closed history is unavailable "
+                    "at the M1 reference time"
+                )
+            return selected
+
+        features = {
+            "feature_version": 1,
+            "closed_bar_only": True,
+            "no_lookahead": True,
+            "spread_source": spread_source,
+            "weekday_utc": bar_time.weekday(),
+            "hour_utc": bar_time.hour,
+            "session": context,
+            "timeframes": {
+                "M1": _timeframe_features(
+                    available_by_reference(m1),
+                    point=point,
+                ),
+                "M5": _timeframe_features(
+                    available_by_reference(m5),
+                    point=point,
+                ),
+                "M15": _timeframe_features(
+                    available_by_reference(m15),
+                    point=point,
+                ),
+                "H1": _timeframe_features(
+                    available_by_reference(h1),
+                    point=point,
+                ),
+            },
+        }
+
+        try:
+            self._store.record_market_experience(
+                MarketExperienceRecord(
+                    experience_id=experience_id,
+                    symbol=self._symbol,
+                    timeframe="M1",
+                    bar_time_utc=bar_time,
+                    reference_price=float(row["close"]),
+                    point=point,
+                    spread_points=spread_points,
+                    session=str(context["primary"]),
+                    features=features,
+                )
+            )
+        except FileExistsError:
+            return False
+
+        return True
+
     def collect_once(
         self,
         *,
@@ -313,10 +416,53 @@ class MarketExperienceCollector:
             raise RuntimeError("Latest closed M1 bar is not in the past")
 
         experience_id = self._experience_id(bar_msc)
-        if (
+        latest_exists = (
             self._store.get_market_experience(experience_id)
             is not None
-        ):
+        )
+
+        earliest_stored, _ = (
+            self._store.market_experience_bounds()
+        )
+        backfill_rows: list[dict[str, Any]] = []
+
+        if earliest_stored is not None:
+            first_m1_time = datetime.fromtimestamp(
+                int(m1[0]["time_msc"]) / 1000,
+                UTC,
+            )
+            backfill_start = max(
+                earliest_stored + timedelta(minutes=1),
+                first_m1_time,
+            )
+            backfill_end = (
+                bar_time - timedelta(minutes=1)
+            )
+
+            if backfill_start <= backfill_end:
+                existing_times = (
+                    self._store.market_experience_bar_times(
+                        backfill_start,
+                        backfill_end,
+                    )
+                )
+                missing_rows = []
+                for row in m1[:-1]:
+                    row_time = datetime.fromtimestamp(
+                        int(row["time_msc"]) / 1000,
+                        UTC,
+                    )
+                    if (
+                        backfill_start <= row_time <= backfill_end
+                        and row_time.isoformat()
+                        not in existing_times
+                    ):
+                        missing_rows.append(row)
+                backfill_rows = missing_rows[
+                    : self.MAX_BACKFILL_PER_CYCLE
+                ]
+
+        if latest_exists and not backfill_rows:
             outcomes_created = self._complete_outcomes(m1)
             return CollectorResult(
                 experience_id=experience_id,
@@ -329,84 +475,41 @@ class MarketExperienceCollector:
         m15 = self._closed_candles("M15", 200)
         h1 = self._closed_candles("H1", 200)
 
-        closed_spread = latest.get("spread")
-        if (
-            isinstance(closed_spread, (int, float))
-            and not isinstance(closed_spread, bool)
-            and math.isfinite(float(closed_spread))
-            and float(closed_spread) >= 0
-        ):
-            spread_points = float(closed_spread)
-            spread_source = "CLOSED_M1"
-        else:
-            spread_points = (ask - bid) / point
-            spread_source = "LIVE_TICK_FALLBACK"
-
-        context = session_context(
-            bar_time + timedelta(minutes=1)
-        )
-        def available_by_reference(
-            rows: list[dict[str, Any]],
-        ) -> list[dict[str, Any]]:
-            selected = [
-                row for row in rows
-                if int(row["time_msc"]) <= bar_msc
-            ]
-            if not selected:
-                raise RuntimeError(
-                    "Higher-timeframe closed history is unavailable "
-                    "at the M1 reference time"
-                )
-            return selected
-
-        features = {
-            "feature_version": 1,
-            "closed_bar_only": True,
-            "no_lookahead": True,
-            "spread_source": spread_source,
-            "weekday_utc": bar_time.weekday(),
-            "hour_utc": bar_time.hour,
-            "session": context,
-            "timeframes": {
-                "M1": _timeframe_features(m1, point=point),
-                "M5": _timeframe_features(
-                    available_by_reference(m5),
-                    point=point,
-                ),
-                "M15": _timeframe_features(
-                    available_by_reference(m15),
-                    point=point,
-                ),
-                "H1": _timeframe_features(
-                    available_by_reference(h1),
-                    point=point,
-                ),
-            },
-        }
-
-        created = True
-        try:
-            self._store.record_market_experience(
-                MarketExperienceRecord(
-                    experience_id=experience_id,
-                    symbol=self._symbol,
-                    timeframe="M1",
-                    bar_time_utc=bar_time,
-                    reference_price=float(latest["close"]),
-                    point=point,
-                    spread_points=spread_points,
-                    session=str(context["primary"]),
-                    features=features,
-                )
+        latest_created = False
+        if not latest_exists:
+            latest_created = self._record_experience_for_bar(
+                row=latest,
+                m1=m1,
+                m5=m5,
+                m15=m15,
+                h1=h1,
+                point=point,
+                bid=bid,
+                ask=ask,
+                allow_live_spread_fallback=True,
             )
-        except FileExistsError:
-            created = False
+
+        backfill_created = 0
+        for row in backfill_rows:
+            if self._record_experience_for_bar(
+                row=row,
+                m1=m1,
+                m5=m5,
+                m15=m15,
+                h1=h1,
+                point=point,
+                bid=bid,
+                ask=ask,
+                allow_live_spread_fallback=False,
+            ):
+                backfill_created += 1
 
         outcomes_created = self._complete_outcomes(m1)
 
         return CollectorResult(
             experience_id=experience_id,
             bar_time_utc=bar_time.isoformat(),
-            experience_created=created,
+            experience_created=latest_created,
             outcomes_created=outcomes_created,
+            backfill_experiences_created=backfill_created,
         )
