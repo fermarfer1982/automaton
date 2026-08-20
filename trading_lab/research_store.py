@@ -703,6 +703,36 @@ class ResearchStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def pending_market_experiences(
+        self,
+        *,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 5000
+        ):
+            raise ValueError(
+                "Experience pending limit must be between 1 and 5000"
+            )
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT me.*
+                FROM market_experiences me
+                WHERE (
+                  SELECT COUNT(*)
+                  FROM experience_outcomes eo
+                  WHERE eo.experience_id = me.experience_id
+                ) < 3
+                ORDER BY me.bar_time_utc, me.experience_id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def record_proposal(
         self,
         proposal: TradeProposal,
