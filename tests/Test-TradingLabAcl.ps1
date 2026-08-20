@@ -180,7 +180,9 @@ if ($existingArtifactsSource.Contains('Set-Acl')) {
 }
 
 foreach ($semanticFunctionName in @(
+    'Get-DemoAuthorizationAclSnapshot',
     'New-DemoAuthorizationAclRule',
+    'ConvertTo-WindowsEffectiveFileSystemRights',
     'Test-DemoAuthorizationAclRuleExact',
     'Assert-DemoAuthorizationAclRuleSet',
     'Assert-DemoAuthorizationParentAclSnapshot',
@@ -416,6 +418,38 @@ $canonicalChild = New-TestDemoAuthorizationSnapshot $canonicalChildRules $false
 Assert-DemoAuthorizationChildAclSnapshot `
     $canonicalChild $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
 
+$synchronizeBit = [int64][System.Security.AccessControl.FileSystemRights]::Synchronize
+$windowsEffectiveParentRules = @($canonicalParentRules | ForEach-Object {
+    Copy-TestDemoAuthorizationRule $_
+})
+$windowsEffectiveParentRules[2].rights = `
+    ([int64]$windowsEffectiveParentRules[2].rights -bor $synchronizeBit)
+$windowsEffectiveParentRules[3].rights = `
+    ([int64]$windowsEffectiveParentRules[3].rights -bor $synchronizeBit)
+$windowsEffectiveParent = New-TestDemoAuthorizationSnapshot `
+    $windowsEffectiveParentRules $true
+Assert-DemoAuthorizationParentAclSnapshot `
+    $windowsEffectiveParent $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+
+$windowsEffectiveChildRules = @($canonicalChildRules | ForEach-Object {
+    Copy-TestDemoAuthorizationRule $_
+})
+$windowsEffectiveChildRules[2].rights = `
+    ([int64]$windowsEffectiveChildRules[2].rights -bor $synchronizeBit)
+$windowsEffectiveChild = New-TestDemoAuthorizationSnapshot `
+    $windowsEffectiveChildRules $false
+Assert-DemoAuthorizationChildAclSnapshot `
+    $windowsEffectiveChild $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+
+$overPermittedParent = New-TestDemoAuthorizationSnapshot `
+    $windowsEffectiveParentRules $true
+$overPermittedParent.rules[2].rights = `
+    ([int64][System.Security.AccessControl.FileSystemRights]::Modify -bor $synchronizeBit)
+Assert-DemoAuthorizationTestThrows {
+    Assert-DemoAuthorizationParentAclSnapshot `
+        $overPermittedParent $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+} 'Synchronize normalization accepted additional Modify rights.'
+
 $wrongOwnerChild = New-TestDemoAuthorizationSnapshot `
     $canonicalChildRules $false $semanticSystemSid.Value
 Assert-DemoAuthorizationTestThrows {
@@ -475,6 +509,155 @@ Assert-DemoAuthorizationTestThrows {
     Assert-DemoAuthorizationChildAclSnapshot `
         $wrongChildPropagation $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
 } 'Wrong inherited child propagation was accepted.'
+
+$realAclFixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+    'automaton-trading-lab-acl-' + [guid]::NewGuid().ToString('N')
+)
+$realAclFixtureCanonical = [System.IO.Path]::GetFullPath($realAclFixtureRoot).TrimEnd('\')
+foreach ($forbiddenRealAclRoot in @(
+    'C:\ProgramData\AutomatonMT5Lab',
+    'C:\Users\AutomatonAgent\.automaton',
+    'C:\automaton'
+)) {
+    $forbiddenCanonical = [System.IO.Path]::GetFullPath($forbiddenRealAclRoot).TrimEnd('\')
+    if ($realAclFixtureCanonical.Equals(
+            $forbiddenCanonical,
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -or
+        $realAclFixtureCanonical.StartsWith(
+            $forbiddenCanonical + '\',
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw 'Real Get-Acl regression fixture resolved inside a protected production path.'
+    }
+}
+
+function New-RealAuthorizationParentAcl(
+    [System.Security.AccessControl.FileSystemRights] $GatewayDirectRights
+) {
+    $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetOwner($semanticAdministratorsSid)
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @($semanticSystemSid, $semanticAdministratorsSid)) {
+        [void]$acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+            $sid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            $semanticDirectoryInheritance,
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        ))
+    }
+    [void]$acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+        $semanticGatewaySid,
+        $GatewayDirectRights,
+        [System.Security.AccessControl.InheritanceFlags]::None,
+        [System.Security.AccessControl.PropagationFlags]::None,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    ))
+    [void]$acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+        $semanticGatewaySid,
+        [System.Security.AccessControl.FileSystemRights]::Read,
+        [System.Security.AccessControl.InheritanceFlags]::ObjectInherit,
+        [System.Security.AccessControl.PropagationFlags]::InheritOnly,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    ))
+    return $acl
+}
+
+New-Item -ItemType Directory -Path $realAclFixtureRoot -ErrorAction Stop | Out-Null
+try {
+    $realParentPath = Join-Path $realAclFixtureRoot 'demo-authorization'
+    New-Item -ItemType Directory -Path $realParentPath -ErrorAction Stop | Out-Null
+
+    Set-Acl -LiteralPath $realParentPath -AclObject (
+        New-RealAuthorizationParentAcl `
+            ([System.Security.AccessControl.FileSystemRights]::ReadAndExecute)
+    )
+    $realParentSnapshot = Get-DemoAuthorizationAclSnapshot `
+        (Get-Acl -LiteralPath $realParentPath -ErrorAction Stop) $realParentPath
+
+    $effectiveRead = (
+        [int64][System.Security.AccessControl.FileSystemRights]::Read -bor
+        $synchronizeBit
+    )
+    $effectiveReadExecute = (
+        [int64][System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor
+        $synchronizeBit
+    )
+    $realGatewayDirect = @($realParentSnapshot.rules | Where-Object {
+        $_.sid -ceq $semanticGatewaySid.Value -and
+        -not $_.inherited -and
+        $_.inheritance_flags -eq [int][System.Security.AccessControl.InheritanceFlags]::None -and
+        $_.propagation_flags -eq [int][System.Security.AccessControl.PropagationFlags]::None
+    })
+    if ($realGatewayDirect.Count -ne 1 -or
+        [int64]$realGatewayDirect[0].rights -ne $effectiveReadExecute) {
+        throw 'Real Get-Acl ReadAndExecute ACE did not materialize Synchronize as expected.'
+    }
+    $realGatewayChildTemplate = @($realParentSnapshot.rules | Where-Object {
+        $_.sid -ceq $semanticGatewaySid.Value -and
+        -not $_.inherited -and
+        $_.inheritance_flags -eq [int][System.Security.AccessControl.InheritanceFlags]::ObjectInherit -and
+        $_.propagation_flags -eq [int][System.Security.AccessControl.PropagationFlags]::InheritOnly
+    })
+    if ($realGatewayChildTemplate.Count -ne 1 -or
+        [int64]$realGatewayChildTemplate[0].rights -ne $effectiveRead) {
+        throw 'Real Get-Acl Read ACE did not materialize Synchronize as expected.'
+    }
+    Assert-DemoAuthorizationParentAclSnapshot `
+        $realParentSnapshot $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+
+    $realChildPath = Join-Path $realParentPath `
+        'mt5-read-only-authorization-44444444-4444-4444-8444-444444444444.json'
+    [System.IO.File]::WriteAllText(
+        $realChildPath,
+        '{}',
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $realChildAcl = Get-Acl -LiteralPath $realChildPath -ErrorAction Stop
+    $realChildAcl.SetOwner($semanticAdministratorsSid)
+    Set-Acl -LiteralPath $realChildPath -AclObject $realChildAcl
+    $realChildSnapshot = Get-DemoAuthorizationAclSnapshot `
+        (Get-Acl -LiteralPath $realChildPath -ErrorAction Stop) $realChildPath
+    $realGatewayChild = @($realChildSnapshot.rules | Where-Object {
+        $_.sid -ceq $semanticGatewaySid.Value -and $_.inherited
+    })
+    if ($realGatewayChild.Count -ne 1 -or
+        [int64]$realGatewayChild[0].rights -ne $effectiveRead) {
+        throw 'Real inherited child Read ACE did not materialize Synchronize as expected.'
+    }
+    Assert-DemoAuthorizationChildAclSnapshot `
+        $realChildSnapshot $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+
+    Set-Acl -LiteralPath $realParentPath -AclObject (
+        New-RealAuthorizationParentAcl `
+            ([System.Security.AccessControl.FileSystemRights]::Modify)
+    )
+    $realOverPermittedSnapshot = Get-DemoAuthorizationAclSnapshot `
+        (Get-Acl -LiteralPath $realParentPath -ErrorAction Stop) $realParentPath
+    Assert-DemoAuthorizationTestThrows {
+        Assert-DemoAuthorizationParentAclSnapshot `
+            $realOverPermittedSnapshot `
+            $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+    } 'Real Get-Acl over-permitted Gateway Modify ACE was accepted.'
+
+    Set-Acl -LiteralPath $realParentPath -AclObject (
+        New-RealAuthorizationParentAcl `
+            ([System.Security.AccessControl.FileSystemRights]::Read)
+    )
+    $realUnderPermittedSnapshot = Get-DemoAuthorizationAclSnapshot `
+        (Get-Acl -LiteralPath $realParentPath -ErrorAction Stop) $realParentPath
+    Assert-DemoAuthorizationTestThrows {
+        Assert-DemoAuthorizationParentAclSnapshot `
+            $realUnderPermittedSnapshot `
+            $semanticGatewaySid $semanticSystemSid $semanticAdministratorsSid
+    } 'Real Get-Acl missing ExecuteFile right was accepted.'
+} finally {
+    if (Test-Path -LiteralPath $realAclFixtureRoot) {
+        Remove-Item -LiteralPath $realAclFixtureRoot -Recurse -Force `
+            -ErrorAction SilentlyContinue
+    }
+}
 
 $applyGatePath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\Apply-TradingLabAclGate.ps1'
 $applyTokens = $null

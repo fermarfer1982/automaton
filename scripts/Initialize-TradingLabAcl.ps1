@@ -584,9 +584,30 @@ function New-DemoAuthorizationAclRule(
     }
 }
 
+function ConvertTo-WindowsEffectiveFileSystemRights(
+    [int64] $Rights,
+    [int] $AccessType
+) {
+    $synchronize = [int64][System.Security.AccessControl.FileSystemRights]::Synchronize
+    $allow = [int][System.Security.AccessControl.AccessControlType]::Allow
+
+    # FileSystemAccessRule/Windows materializes Synchronize on Allow ACEs.
+    # Normalize only that platform-implied bit; every other right remains
+    # part of the exact comparison. Non-Allow ACEs remain unchanged and are
+    # rejected fail-closed by Assert-DemoAuthorizationAclRuleSet.
+    if ($AccessType -eq $allow) {
+        return ([int64]$Rights -bor $synchronize)
+    }
+    return [int64]$Rights
+}
+
 function Test-DemoAuthorizationAclRuleExact($Actual, $Expected) {
+    $actualRights = ConvertTo-WindowsEffectiveFileSystemRights `
+        ([int64]$Actual.rights) ([int]$Actual.access_type)
+    $expectedRights = ConvertTo-WindowsEffectiveFileSystemRights `
+        ([int64]$Expected.rights) ([int]$Expected.access_type)
     return [string]$Actual.sid -ceq [string]$Expected.sid -and
-        [int64]$Actual.rights -eq [int64]$Expected.rights -and
+        $actualRights -eq $expectedRights -and
         [int]$Actual.access_type -eq [int]$Expected.access_type -and
         [bool]$Actual.inherited -eq [bool]$Expected.inherited -and
         [int]$Actual.inheritance_flags -eq [int]$Expected.inheritance_flags -and
