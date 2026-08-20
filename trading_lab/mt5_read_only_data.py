@@ -60,6 +60,65 @@ class MT5ReadOnlyDataCapabilityViolation(MT5ReadOnlyDataError):
     pass
 
 
+_SERVER_OFFSET_GRANULARITY_SECONDS = 60 * 60
+_MAX_SERVER_OFFSET_HOURS = 14
+_MAX_SERVER_OFFSET_RESIDUAL_SECONDS = 120.0
+_MAX_NORMALIZED_TICK_AGE_SECONDS = 120.0
+_MAX_NORMALIZED_TICK_FUTURE_SECONDS = 5.0
+_CALIBRATION_SYMBOL = "XAUUSD"
+
+
+def _infer_server_time_offset_msc(
+    raw_time_msc: int,
+    now_utc: datetime,
+) -> int:
+    if raw_time_msc <= 0:
+        raise MT5ReadOnlyDataError(
+            "MT5 server timestamp must be positive"
+        )
+
+    if now_utc.tzinfo is None:
+        raise MT5ReadOnlyDataError(
+            "UTC calibration clock must be timezone-aware"
+        )
+
+    now = now_utc.astimezone(UTC)
+    raw_seconds = raw_time_msc / 1000.0
+    delta_seconds = raw_seconds - now.timestamp()
+
+    offset_hours = int(round(
+        delta_seconds / _SERVER_OFFSET_GRANULARITY_SECONDS
+    ))
+
+    if abs(offset_hours) > _MAX_SERVER_OFFSET_HOURS:
+        raise MT5ReadOnlyDataError(
+            "MT5 server time offset is outside the allowed range"
+        )
+
+    offset_seconds = (
+        offset_hours * _SERVER_OFFSET_GRANULARITY_SECONDS
+    )
+    residual_seconds = delta_seconds - offset_seconds
+
+    if abs(residual_seconds) > _MAX_SERVER_OFFSET_RESIDUAL_SECONDS:
+        raise MT5ReadOnlyDataError(
+            "MT5 server time is not close to an integral-hour offset"
+        )
+
+    normalized_seconds = raw_seconds - offset_seconds
+    age_seconds = now.timestamp() - normalized_seconds
+
+    if (
+        age_seconds > _MAX_NORMALIZED_TICK_AGE_SECONDS
+        or age_seconds < -_MAX_NORMALIZED_TICK_FUTURE_SECONDS
+    ):
+        raise MT5ReadOnlyDataError(
+            "Normalized MT5 tick time is not fresh UTC"
+        )
+
+    return offset_seconds * 1000
+
+
 def _terminal_is_visible_in_session(
     terminal_path: Path,
 ) -> bool:
@@ -272,6 +331,7 @@ class MT5ReadOnlyDataAdapter:
         "_ledger",
         "_lock",
         "_terminal_running_probe",
+        "_now_provider",
     )
 
     def __init__(
@@ -280,6 +340,7 @@ class MT5ReadOnlyDataAdapter:
         bindings: MT5ReadOnlyDataBindings,
         *,
         terminal_running_probe: Callable[[Path], bool] | None = None,
+        now_provider: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._terminal_path = terminal_path
         self._bindings = bindings
@@ -289,6 +350,7 @@ class MT5ReadOnlyDataAdapter:
             terminal_running_probe
             or _terminal_is_visible_in_session
         )
+        self._now_provider = now_provider
         self.assert_read_only_boundary()
 
     @property
@@ -343,6 +405,52 @@ class MT5ReadOnlyDataAdapter:
             )
         except Exception:
             return MT5ReadOnlyDataError(f"{operation} failed")
+
+    def _server_offset_msc(
+        self,
+        symbol: str,
+        *,
+        tick: object | None = None,
+    ) -> int:
+        current_tick = tick
+
+        if current_tick is None:
+            current_tick = self._invoke(
+                "symbol_info_tick",
+                self._bindings.symbol_info_tick,
+                symbol,
+            )
+
+        if current_tick is None:
+            raise self._error("symbol_info_tick")
+
+        raw_time_msc = int(
+            getattr(current_tick, "time_msc", 0)
+        )
+
+        return _infer_server_time_offset_msc(
+            raw_time_msc,
+            self._now_provider(),
+        )
+
+    @staticmethod
+    def _normalize_server_time_msc(
+        raw_time_msc: int,
+        server_offset_msc: int,
+    ) -> int:
+        if raw_time_msc <= 0:
+            raise MT5ReadOnlyDataError(
+                "MT5 timestamp must be positive"
+            )
+
+        normalized = raw_time_msc - server_offset_msc
+
+        if normalized <= 0:
+            raise MT5ReadOnlyDataError(
+                "Normalized MT5 timestamp must be positive"
+            )
+
+        return normalized
 
     def initialize(self) -> bool:
         if not self._terminal_running_probe(
@@ -425,6 +533,11 @@ class MT5ReadOnlyDataAdapter:
         if info is None or tick is None:
             raise self._error("symbol_info")
 
+        server_offset_msc = self._server_offset_msc(
+            symbol,
+            tick=tick,
+        )
+
         tick_values = [
             abs(float(getattr(info, field, 0.0) or 0.0))
             for field in (
@@ -456,7 +569,10 @@ class MT5ReadOnlyDataAdapter:
             volume_step=float(info.volume_step),
             trade_stops_level=int(info.trade_stops_level),
             visible=bool(info.visible),
-            tick_time_msc=int(tick.time_msc),
+            tick_time_msc=self._normalize_server_time_msc(
+                int(tick.time_msc),
+                server_offset_msc,
+            ),
             trade_freeze_level=int(
                 getattr(info, "trade_freeze_level", 0)
             ),
@@ -492,6 +608,10 @@ class MT5ReadOnlyDataAdapter:
             raise MT5ReadOnlyDataError(
                 "Unsupported candle timeframe"
             )
+
+        server_offset_msc = self._server_offset_msc(
+            symbol
+        )
 
         rates = self._invoke(
             "copy_rates_from_pos",
@@ -539,7 +659,10 @@ class MT5ReadOnlyDataAdapter:
                 CandleSnapshot(
                     symbol=symbol,
                     timeframe=timeframe,
-                    time_msc=int(field("time")) * 1000,
+                    time_msc=self._normalize_server_time_msc(
+                        int(field("time")) * 1000,
+                        server_offset_msc,
+                    ),
                     open=values[0],
                     high=values[1],
                     low=values[2],
@@ -632,6 +755,10 @@ class MT5ReadOnlyDataAdapter:
                 "History limit must be between 1 and 1000"
             )
 
+        server_offset_msc = self._server_offset_msc(
+            symbol or _CALIBRATION_SYMBOL
+        )
+
         deals = self._invoke(
             "history_deals_get",
             self._bindings.history_deals_get,
@@ -709,8 +836,9 @@ class MT5ReadOnlyDataAdapter:
                     fee=float(
                         getattr(deal, "fee", 0.0)
                     ),
-                    time_msc=int(
-                        getattr(deal, "time_msc", 0)
+                    time_msc=self._normalize_server_time_msc(
+                        int(getattr(deal, "time_msc", 0)),
+                        server_offset_msc,
                     ),
                     magic_number=int(
                         getattr(deal, "magic", 0)

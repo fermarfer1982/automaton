@@ -217,6 +217,17 @@ class FakeMT5:
         raise AssertionError("order_send must never be called")
 
 
+_TEST_SERVER_RAW_MSC = 1_800_000_000_000
+_TEST_SERVER_OFFSET_MSC = 3 * 60 * 60 * 1000
+_TEST_NOW_UTC = datetime.fromtimestamp(
+    (
+        _TEST_SERVER_RAW_MSC
+        - _TEST_SERVER_OFFSET_MSC
+    ) / 1000,
+    UTC,
+)
+
+
 def make_adapter():
     fake = FakeMT5()
     bindings = _bindings_from_module(fake)
@@ -224,6 +235,7 @@ def make_adapter():
         Path(r"C:\Program Files\MetaTrader 5\terminal64.exe"),
         bindings,
         terminal_running_probe=lambda _path: True,
+        now_provider=lambda: _TEST_NOW_UTC,
     )
     return fake, bindings, adapter
 
@@ -246,6 +258,7 @@ def test_capability_surface_is_exact_and_execution_methods_are_absent():
         "_ledger",
         "_lock",
         "_terminal_running_probe",
+        "_now_provider",
     }
 
     adapter.assert_read_only_boundary()
@@ -326,10 +339,18 @@ def test_observation_methods_only_use_read_capabilities():
     assert market.bid == pytest.approx(4392.96)
     assert market.ask == pytest.approx(4393.23)
     assert market.trade_mode == "FULL"
+    assert market.tick_time_msc == (
+        _TEST_SERVER_RAW_MSC
+        - _TEST_SERVER_OFFSET_MSC
+    )
 
     assert len(candles) == 2
     assert candles[0].timeframe == "M5"
     assert candles[0].symbol == "XAUUSD"
+    assert candles[0].time_msc == (
+        _TEST_SERVER_RAW_MSC
+        - _TEST_SERVER_OFFSET_MSC
+    )
 
     assert len(positions) == 1
     assert positions[0].ticket == 12345
@@ -340,7 +361,16 @@ def test_observation_methods_only_use_read_capabilities():
 
     assert len(history) == 2
     assert history[0].symbol == "XAUUSD"
+    assert history[0].time_msc == (
+        _TEST_SERVER_RAW_MSC
+        - _TEST_SERVER_OFFSET_MSC
+    )
     assert history[1].entry == "OUT"
+    assert history[1].time_msc == (
+        _TEST_SERVER_RAW_MSC
+        + 100_000
+        - _TEST_SERVER_OFFSET_MSC
+    )
 
     # Entry-deal profit is ignored for realized PnL.
     # -1.0 entry commission
@@ -368,12 +398,35 @@ def test_observation_methods_only_use_read_capabilities():
     assert evidence["allowed"]["terminal_info"] == 1
     assert evidence["allowed"]["account_info"] == 1
     assert evidence["allowed"]["symbol_info"] == 1
-    assert evidence["allowed"]["symbol_info_tick"] == 1
+    assert evidence["allowed"]["symbol_info_tick"] == 3
     assert evidence["allowed"]["copy_rates_from_pos"] == 1
     assert evidence["allowed"]["positions_get"] == 1
     assert evidence["allowed"]["orders_get"] == 1
     assert evidence["allowed"]["history_deals_get"] == 2
     assert evidence["unexpected"] == {}
+
+
+def test_server_time_calibration_fails_closed_on_non_hour_drift():
+    class DriftedFakeMT5(FakeMT5):
+        def symbol_info_tick(self, symbol: str):
+            tick = super().symbol_info_tick(symbol)
+            tick.time_msc += 20 * 60 * 1000
+            return tick
+
+    fake = DriftedFakeMT5()
+    bindings = _bindings_from_module(fake)
+    adapter = MT5ReadOnlyDataAdapter(
+        Path(r"C:\Program Files\MetaTrader 5\terminal64.exe"),
+        bindings,
+        terminal_running_probe=lambda _path: True,
+        now_provider=lambda: _TEST_NOW_UTC,
+    )
+
+    with pytest.raises(
+        MT5ReadOnlyDataError,
+        match="integral-hour offset",
+    ):
+        adapter.symbol_snapshot("XAUUSD")
 
 
 def test_unexpected_capability_fails_closed_and_remains_poisoned():
