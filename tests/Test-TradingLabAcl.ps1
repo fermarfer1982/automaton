@@ -669,6 +669,74 @@ if ($applyErrors.Count -ne 0) {
     throw "ACL apply gate has PowerShell AST errors: $($applyErrors -join '; ')"
 }
 $applySource = [System.IO.File]::ReadAllText($applyGatePath)
+$applyFunctionAsts = @($applyAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+}, $true))
+$applyExactAclRuleFunction = @($applyFunctionAsts | Where-Object {
+    $_.Name -eq 'Test-ExactAclRule'
+})
+if ($applyExactAclRuleFunction.Count -ne 1) {
+    throw 'ACL apply gate exact-rule comparator was not found.'
+}
+. ([scriptblock]::Create($applyExactAclRuleFunction[0].Extent.Text))
+
+$applyTestSid = 'S-1-5-21-10-20-30-1007'
+function New-ApplyExactRuleTestCase(
+    [int64] $Rights,
+    [string] $Type = 'Allow'
+) {
+    return [pscustomobject]@{
+        sid = $applyTestSid
+        type = $Type
+        rights = $Rights
+        inherited = $false
+        inheritance_flags = 'None'
+        propagation_flags = 'None'
+    }
+}
+$applySynchronize = [int64][System.Security.AccessControl.FileSystemRights]::Synchronize
+$applyEffectiveRead = (
+    [int64][System.Security.AccessControl.FileSystemRights]::Read -bor
+    $applySynchronize
+)
+$applyEffectiveReadExecute = (
+    [int64][System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor
+    $applySynchronize
+)
+if (-not (Test-ExactAclRule `
+        (New-ApplyExactRuleTestCase $applyEffectiveRead) `
+        $applyTestSid `
+        ([int64][System.Security.AccessControl.FileSystemRights]::Read) `
+        $false 'None' 'None')) {
+    throw 'ACL apply gate rejected Windows-effective Read,Synchronize.'
+}
+if (-not (Test-ExactAclRule `
+        (New-ApplyExactRuleTestCase $applyEffectiveReadExecute) `
+        $applyTestSid `
+        ([int64][System.Security.AccessControl.FileSystemRights]::ReadAndExecute) `
+        $false 'None' 'None')) {
+    throw 'ACL apply gate rejected Windows-effective ReadAndExecute,Synchronize.'
+}
+$applyOverPermitted = (
+    [int64][System.Security.AccessControl.FileSystemRights]::Modify -bor
+    $applySynchronize
+)
+if (Test-ExactAclRule `
+        (New-ApplyExactRuleTestCase $applyOverPermitted) `
+        $applyTestSid `
+        ([int64][System.Security.AccessControl.FileSystemRights]::ReadAndExecute) `
+        $false 'None' 'None') {
+    throw 'ACL apply gate Synchronize normalization accepted Modify.'
+}
+if (Test-ExactAclRule `
+        (New-ApplyExactRuleTestCase $applyEffectiveRead) `
+        $applyTestSid `
+        ([int64][System.Security.AccessControl.FileSystemRights]::ReadAndExecute) `
+        $false 'None' 'None') {
+    throw 'ACL apply gate Synchronize normalization accepted missing ExecuteFile.'
+}
+
 $applyParameters = @($applyAst.ParamBlock.Parameters | ForEach-Object {
     $_.Name.VariablePath.UserPath
 })

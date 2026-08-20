@@ -367,8 +367,15 @@ function Test-ExactAclRule(
     [string] $InheritanceFlags,
     [string] $PropagationFlags
 ) {
+    $synchronize = [int64][System.Security.AccessControl.FileSystemRights]::Synchronize
+    $actualRights = [int64]$Rule.rights
+    $expectedRights = [int64]$Rights
+    if ($Rule.type -eq 'Allow') {
+        $actualRights = $actualRights -bor $synchronize
+        $expectedRights = $expectedRights -bor $synchronize
+    }
     return $Rule.sid -eq $Sid -and $Rule.type -eq 'Allow' -and
-        [int64]$Rule.rights -eq $Rights -and [bool]$Rule.inherited -eq $Inherited -and
+        $actualRights -eq $expectedRights -and [bool]$Rule.inherited -eq $Inherited -and
         $Rule.inheritance_flags -eq $InheritanceFlags -and
         $Rule.propagation_flags -eq $PropagationFlags
 }
