@@ -305,15 +305,29 @@ class MarketExperienceCollector:
             raise RuntimeError("Observed market economics are invalid")
 
         m1 = self._closed_candles("M1", 500)
-        m5 = self._closed_candles("M5", 200)
-        m15 = self._closed_candles("M15", 200)
-        h1 = self._closed_candles("H1", 200)
 
         latest = m1[-1]
         bar_msc = int(latest["time_msc"])
         bar_time = datetime.fromtimestamp(bar_msc / 1000, UTC)
         if bar_time >= timestamp:
             raise RuntimeError("Latest closed M1 bar is not in the past")
+
+        experience_id = self._experience_id(bar_msc)
+        if (
+            self._store.get_market_experience(experience_id)
+            is not None
+        ):
+            outcomes_created = self._complete_outcomes(m1)
+            return CollectorResult(
+                experience_id=experience_id,
+                bar_time_utc=bar_time.isoformat(),
+                experience_created=False,
+                outcomes_created=outcomes_created,
+            )
+
+        m5 = self._closed_candles("M5", 200)
+        m15 = self._closed_candles("M15", 200)
+        h1 = self._closed_candles("H1", 200)
 
         closed_spread = latest.get("spread")
         if (
@@ -370,7 +384,6 @@ class MarketExperienceCollector:
             },
         }
 
-        experience_id = self._experience_id(bar_msc)
         created = True
         try:
             self._store.record_market_experience(

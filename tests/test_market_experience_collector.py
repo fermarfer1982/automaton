@@ -51,6 +51,7 @@ def series(
 class FakeObservation:
     def __init__(self, rows_by_timeframe):
         self.rows = rows_by_timeframe
+        self.candle_requests = []
 
     def symbol_state(self, symbol):
         return {
@@ -61,6 +62,7 @@ class FakeObservation:
         }
 
     def candles(self, symbol, timeframe, count):
+        self.candle_requests.append(timeframe)
         rows = self.rows[timeframe][-count:]
         return {
             "symbol": symbol,
@@ -121,8 +123,13 @@ class MarketExperienceCollectorTests(unittest.TestCase):
             now = datetime(2026, 8, 20, 11, 1, tzinfo=UTC)
 
             first = collector.collect_once(now=now)
+            observation.candle_requests.clear()
             second = collector.collect_once(now=now)
 
+            self.assertEqual(
+                ["M1"],
+                observation.candle_requests,
+            )
             self.assertTrue(first.experience_created)
             self.assertFalse(second.experience_created)
             self.assertEqual(

@@ -10,6 +10,12 @@ from pathlib import Path
 from .api_auth import ApiKeyVerifier
 from .config import load_mt5_security_config
 from .domain import TradingMode
+from .market_experience_collector import (
+    MarketExperienceCollector,
+)
+from .market_experience_loop import (
+    MarketExperienceLoop,
+)
 from .mt5_read_only_client import (
     MT5ReadOnlyClient,
 )
@@ -20,6 +26,7 @@ from .observation_application import (
     ObservationApplication,
 )
 from .process_lock import GatewayProcessLock
+from .research_store import ResearchStore
 from .windows_acl import verify_windows_acl
 
 
@@ -129,9 +136,14 @@ def serve(
     workspace: Path = DEFAULT_WORKSPACE,
     python_executable: Path = DEFAULT_PYTHON,
     controlled_stdin_shutdown: bool = False,
+    collect_market_experiences: bool = False,
+    collector_interval_seconds: float = 10.0,
     environment: dict[str, str] | None = None,
     uvicorn_runner=_run_uvicorn,
     client_factory=MT5ReadOnlyClient,
+    research_store_factory=ResearchStore,
+    collector_factory=MarketExperienceCollector,
+    collector_loop_factory=MarketExperienceLoop,
 ) -> None:
     if not 1024 <= port <= 65535:
         raise ValueError(
@@ -220,6 +232,8 @@ def serve(
         )
 
         primary_error = None
+        collector_loop = None
+        collector_thread = None
 
         try:
             application = (
@@ -236,6 +250,36 @@ def serve(
                     ),
                 )
             )
+
+            if collect_market_experiences:
+                research_store = research_store_factory(
+                    config.research_db_path
+                )
+
+                if not research_store.health():
+                    raise RuntimeError(
+                        "Research store is unavailable"
+                    )
+
+                collector = collector_factory(
+                    application,
+                    research_store,
+                    symbol=config.allowed_symbol,
+                )
+
+                collector_loop = collector_loop_factory(
+                    collector,
+                    interval_seconds=(
+                        collector_interval_seconds
+                    ),
+                )
+
+                collector_thread = threading.Thread(
+                    target=collector_loop.run,
+                    name="market-experience-collector",
+                    daemon=True,
+                )
+                collector_thread.start()
 
             api = create_observation_api(
                 application,
@@ -255,11 +299,29 @@ def serve(
             raise
 
         finally:
+            if collector_loop is not None:
+                collector_loop.stop()
+
+            if collector_thread is not None:
+                collector_thread.join(
+                    timeout=65.0
+                )
+
             try:
                 client.close()
             except BaseException:
                 if primary_error is None:
                     raise
+
+            if (
+                collector_thread is not None
+                and collector_thread.is_alive()
+                and primary_error is None
+            ):
+                raise RuntimeError(
+                    "Market experience collector "
+                    "did not stop cleanly"
+                )
 
 
 def main() -> None:
@@ -298,6 +360,17 @@ def main() -> None:
         action="store_true",
     )
 
+    parser.add_argument(
+        "--collect-market-experiences",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--collector-interval-seconds",
+        type=float,
+        default=10.0,
+    )
+
     args = parser.parse_args()
 
     serve(
@@ -309,6 +382,12 @@ def main() -> None:
         ),
         controlled_stdin_shutdown=(
             args.controlled_stdin_shutdown
+        ),
+        collect_market_experiences=(
+            args.collect_market_experiences
+        ),
+        collector_interval_seconds=(
+            args.collector_interval_seconds
         ),
     )
 

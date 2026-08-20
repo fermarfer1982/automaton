@@ -75,6 +75,16 @@ class ObservationServiceSourceTests(
             source,
         )
 
+        self.assertIn(
+            "MarketExperienceLoop",
+            source,
+        )
+
+        self.assertIn(
+            "ResearchStore",
+            source,
+        )
+
     def test_service_binds_protected_identity(self):
         source = SERVICE.read_text(
             encoding="utf-8"
