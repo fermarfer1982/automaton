@@ -561,6 +561,7 @@ try {
         -WorkspaceRoot $workspace `
         -LabRoot $labRoot `
         -ProgressPath $progressPath `
+        -ExpectedExistingConfigSha256 $expectedConfigSha256 `
         -Apply | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "Initialize-TradingLabAcl.ps1 failed with exit code $LASTEXITCODE."

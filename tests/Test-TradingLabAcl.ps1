@@ -2,7 +2,7 @@ $ErrorActionPreference = 'Stop'
 $scriptPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\Initialize-TradingLabAcl.ps1'
 $tokens = $null
 $errors = $null
-[void][System.Management.Automation.Language.Parser]::ParseFile(
+$initializerAst = [System.Management.Automation.Language.Parser]::ParseFile(
     $scriptPath, [ref]$tokens, [ref]$errors
 )
 if ($errors.Count -ne 0) {
@@ -10,6 +10,59 @@ if ($errors.Count -ne 0) {
 }
 
 $source = [System.IO.File]::ReadAllText($scriptPath)
+$initializerParameters = @($initializerAst.ParamBlock.Parameters | ForEach-Object {
+    $_.Name.VariablePath.UserPath
+})
+$expectedHashParameter = @($initializerAst.ParamBlock.Parameters | Where-Object {
+    $_.Name.VariablePath.UserPath -eq 'ExpectedExistingConfigSha256'
+})
+if ($expectedHashParameter.Count -ne 1 -or
+    $initializerParameters[-2] -ne 'ExpectedExistingConfigSha256') {
+    throw 'ACL initializer must expose the optional pinned existing config SHA256 parameter.'
+}
+$expectedHashParameterSource = $expectedHashParameter[0].Extent.Text
+if (-not $expectedHashParameterSource.Contains("[ValidatePattern('^[0-9A-Fa-f]{64}$')]") -or
+    $expectedHashParameterSource.Contains('Mandatory')) {
+    throw 'ACL initializer pinned SHA256 parameter must be optional and exactly 64 hexadecimal characters.'
+}
+foreach ($initializerPinBoundary in @(
+    "`$PSBoundParameters.ContainsKey('ExpectedExistingConfigSha256')",
+    'Initialize-TradingLabBootstrapState $root $state $bootstrapTemplate',
+    '-ExpectedExistingConfigSha256 $ExpectedExistingConfigSha256',
+    '-not [bool]$preparedState.config_valid',
+    "[string]`$preparedState.config_validation_mode -cne 'PINNED_EXISTING_SHA256'",
+    '[string]$preparedState.config_sha256 -cne $normalizedExpectedConfigSha256',
+    '[bool]$preparedState.config_created',
+    '-not [bool]$preparedState.config_reused',
+    'Assert-PinnedExistingBootstrapConfig',
+    "[string]`$configBeforeAclMutation.validation_mode -cne 'PINNED_EXISTING_SHA256'"
+)) {
+    if (-not $source.Contains($initializerPinBoundary)) {
+        throw "ACL initializer lacks pinned config boundary: $initializerPinBoundary"
+    }
+}
+$pinnedRevalidationIndex = $source.LastIndexOf('Assert-PinnedExistingBootstrapConfig')
+$firstAclMutationIndex = $source.IndexOf(
+    'Set-ExactAcl $root @($gatewaySid, $automatonSid) @($readExecute, $readExecute)'
+)
+if ($pinnedRevalidationIndex -lt 0 -or $firstAclMutationIndex -le $pinnedRevalidationIndex) {
+    throw 'Pinned canonical config revalidation must immediately precede the first ACL mutation.'
+}
+$preAclBoundary = $source.Substring(
+    $pinnedRevalidationIndex,
+    $firstAclMutationIndex - $pinnedRevalidationIndex
+)
+if ($preAclBoundary.Contains('Set-Acl') -or $preAclBoundary.Contains('Set-ExactAcl') -or
+    $preAclBoundary.Contains('Set-ExactTreeAcl') -or
+    $preAclBoundary.Contains('Set-ExactControlAcl')) {
+    throw 'An ACL mutation can occur between pinned config revalidation and the first exact ACL application.'
+}
+$setupPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\setup.ps1'
+$setupSource = [System.IO.File]::ReadAllText($setupPath)
+if (-not $setupSource.Contains("Join-Path `$PSScriptRoot 'Initialize-TradingLabAcl.ps1'") -or
+    $setupSource.Contains('ExpectedExistingConfigSha256')) {
+    throw 'setup.ps1 must retain the backward-compatible default initializer call without pinned mode.'
+}
 $applyGatePath = Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts\Apply-TradingLabAclGate.ps1'
 $applyTokens = $null
 $applyErrors = $null
@@ -110,6 +163,32 @@ foreach ($configPinBoundary in @(
 )) {
     if (-not $applySource.Contains($configPinBoundary)) {
         throw "ACL apply gate lacks pinned operational config boundary: $configPinBoundary"
+    }
+}
+$initializerInvocationIndex = $applySource.IndexOf('& $aclScript')
+$initializerInvocationEnd = $applySource.IndexOf(
+    'if ($LASTEXITCODE -ne 0)',
+    [Math]::Max(0, $initializerInvocationIndex)
+)
+if ($initializerInvocationIndex -lt 0 -or $initializerInvocationEnd -le $initializerInvocationIndex) {
+    throw 'ACL apply gate initializer invocation boundary was not found.'
+}
+$initializerInvocation = $applySource.Substring(
+    $initializerInvocationIndex,
+    $initializerInvocationEnd - $initializerInvocationIndex
+)
+if (-not $initializerInvocation.Contains(
+    '-ExpectedExistingConfigSha256 $expectedConfigSha256'
+)) {
+    throw 'ACL apply gate does not forward the operator-reviewed SHA256 into the initializer.'
+}
+$combinedAclSurface = $source + $applySource
+foreach ($forbiddenAclCapability in @(
+    'MetaTrader5.initialize', 'import MetaTrader5', '.order_check(', '.order_send(',
+    'symbol_select(', 'login('
+)) {
+    if ($combinedAclSurface.Contains($forbiddenAclCapability)) {
+        throw "ACL pinned-config surface contains forbidden MT5/trading capability: $forbiddenAclCapability"
     }
 }
 $semanticInspectionIndex = $applySource.IndexOf(

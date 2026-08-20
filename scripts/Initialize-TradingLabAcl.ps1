@@ -7,11 +7,17 @@ param(
     [string] $WorkspaceRoot = 'C:\automaton',
     [string] $AclPolicyPath,
     [string] $ProgressPath,
+    [ValidatePattern('^[0-9A-Fa-f]{64}$')]
+    [string] $ExpectedExistingConfigSha256,
     [switch] $Apply
 )
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'TradingLabAclBootstrap.ps1')
+$pinnedExistingConfig = $PSBoundParameters.ContainsKey('ExpectedExistingConfigSha256')
+$normalizedExpectedConfigSha256 = if ($pinnedExistingConfig) {
+    $ExpectedExistingConfigSha256.ToLowerInvariant()
+} else { $null }
 
 function Get-CanonicalPath([string] $Value) {
     if (-not [System.IO.Path]::IsPathRooted($Value)) {
@@ -398,7 +404,24 @@ foreach ($protectedSourceDirectory in $protectedSourceDirectories) {
 }
 
 $bootstrapTemplate = Join-Path $workspace 'config\trading.bootstrap-observe-only.yaml'
-$preparedState = Initialize-TradingLabBootstrapState $root $state $bootstrapTemplate
+$preparedState = if ($pinnedExistingConfig) {
+    Initialize-TradingLabBootstrapState `
+        $root `
+        $state `
+        $bootstrapTemplate `
+        -ExpectedExistingConfigSha256 $ExpectedExistingConfigSha256
+} else {
+    Initialize-TradingLabBootstrapState $root $state $bootstrapTemplate
+}
+if ($pinnedExistingConfig -and (
+    -not [bool]$preparedState.config_valid -or
+    [string]$preparedState.config_validation_mode -cne 'PINNED_EXISTING_SHA256' -or
+    [string]$preparedState.config_sha256 -cne $normalizedExpectedConfigSha256 -or
+    [bool]$preparedState.config_created -or
+    -not [bool]$preparedState.config_reused
+)) {
+    throw 'Bootstrap did not preserve the pinned existing configuration contract.'
+}
 
 $authorizationChildren = @(Get-ChildItem -LiteralPath $demoAuthorization -Force)
 foreach ($authorizationChild in $authorizationChildren) {
@@ -572,6 +595,16 @@ $appendOnly = [System.Security.AccessControl.FileSystemRights](
     [int][System.Security.AccessControl.FileSystemRights]::Synchronize
 )
 
+if ($pinnedExistingConfig) {
+    $configBeforeAclMutation = Assert-PinnedExistingBootstrapConfig `
+        $configFile `
+        $normalizedExpectedConfigSha256
+    if (-not [bool]$configBeforeAclMutation.valid -or
+        [string]$configBeforeAclMutation.validation_mode -cne 'PINNED_EXISTING_SHA256' -or
+        [string]$configBeforeAclMutation.sha256 -cne $normalizedExpectedConfigSha256) {
+        throw 'Pinned existing trading.yaml failed final pre-ACL validation.'
+    }
+}
 Set-ExactAcl $root @($gatewaySid, $automatonSid) @($readExecute, $readExecute) $true $false 'lab_root'
 Set-ExactAcl $workspace @($gatewaySid, $automatonSid) @($readExecute, $readExecute) $true $true
 foreach ($protectedSourceDirectory in $protectedSourceDirectories) {
