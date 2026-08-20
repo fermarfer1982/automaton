@@ -9,7 +9,7 @@ import statistics
 import threading
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -83,6 +83,29 @@ class StrategyMetrics:
     expectancy_r_ci95_high: float | None
     evidence_sufficient: bool
     minimum_evidence_sample: int = MIN_EVIDENCE_SAMPLE
+
+
+@dataclass(frozen=True)
+class MarketExperienceRecord:
+    experience_id: str
+    symbol: str
+    timeframe: str
+    bar_time_utc: datetime
+    reference_price: float
+    point: float
+    spread_points: float
+    session: str
+    features: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ExperienceOutcomeRecord:
+    experience_id: str
+    horizon_minutes: int
+    future_bar_time_utc: datetime
+    future_close: float
+    window_high: float
+    window_low: float
 
 
 _SCHEMA = """
@@ -391,6 +414,66 @@ class ResearchStore:
         connection.execute(
             "INSERT OR IGNORE INTO research_schema(version) VALUES (8)"
         )
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS market_experiences (
+              experience_id TEXT PRIMARY KEY,
+              symbol TEXT NOT NULL CHECK(symbol = 'XAUUSD'),
+              timeframe TEXT NOT NULL CHECK(timeframe = 'M1'),
+              bar_time_utc TEXT NOT NULL,
+              reference_price REAL NOT NULL CHECK(reference_price > 0),
+              point REAL NOT NULL CHECK(point > 0),
+              spread_points REAL NOT NULL CHECK(spread_points >= 0),
+              session TEXT NOT NULL,
+              features_json TEXT NOT NULL,
+              created_at_utc TEXT NOT NULL,
+              UNIQUE(symbol, timeframe, bar_time_utc)
+            );
+            CREATE INDEX IF NOT EXISTS idx_market_experiences_bar
+              ON market_experiences(bar_time_utc, experience_id);
+            CREATE TRIGGER IF NOT EXISTS market_experiences_no_update
+            BEFORE UPDATE ON market_experiences
+            BEGIN
+              SELECT RAISE(ABORT, 'market experiences are append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS market_experiences_no_delete
+            BEFORE DELETE ON market_experiences
+            BEGIN
+              SELECT RAISE(ABORT, 'market experiences are append-only');
+            END;
+
+            CREATE TABLE IF NOT EXISTS experience_outcomes (
+              experience_id TEXT NOT NULL,
+              horizon_minutes INTEGER NOT NULL
+                CHECK(horizon_minutes IN (5, 15, 60)),
+              future_bar_time_utc TEXT NOT NULL,
+              future_close REAL NOT NULL CHECK(future_close > 0),
+              window_high REAL NOT NULL CHECK(window_high > 0),
+              window_low REAL NOT NULL CHECK(window_low > 0),
+              return_points REAL NOT NULL,
+              mfe_long_points REAL NOT NULL CHECK(mfe_long_points >= 0),
+              mae_long_points REAL NOT NULL CHECK(mae_long_points <= 0),
+              created_at_utc TEXT NOT NULL,
+              PRIMARY KEY(experience_id, horizon_minutes),
+              FOREIGN KEY(experience_id)
+                REFERENCES market_experiences(experience_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_experience_outcomes_horizon
+              ON experience_outcomes(horizon_minutes, future_bar_time_utc);
+            CREATE TRIGGER IF NOT EXISTS experience_outcomes_no_update
+            BEFORE UPDATE ON experience_outcomes
+            BEGIN
+              SELECT RAISE(ABORT, 'experience outcomes are append-only');
+            END;
+            CREATE TRIGGER IF NOT EXISTS experience_outcomes_no_delete
+            BEFORE DELETE ON experience_outcomes
+            BEGIN
+              SELECT RAISE(ABORT, 'experience outcomes are append-only');
+            END;
+
+            INSERT OR IGNORE INTO research_schema(version) VALUES (9);
+            """
+        )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5.0)
@@ -403,6 +486,222 @@ class ResearchStore:
         invalid = [name for name, value in values.items() if not math.isfinite(value)]
         if invalid:
             raise ValueError(f"Non-finite research values: {', '.join(invalid)}")
+
+    @staticmethod
+    def _canonical_utc(value: datetime, *, field_name: str) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError(f"{field_name} must be timezone-aware")
+        return value.astimezone(UTC)
+
+    def record_market_experience(
+        self,
+        record: MarketExperienceRecord,
+    ) -> None:
+        if not record.experience_id.strip():
+            raise ValueError("Experience ID must be non-empty")
+        if record.symbol != "XAUUSD" or record.timeframe != "M1":
+            raise ValueError("Market experiences support only XAUUSD M1")
+        if not record.session.strip() or len(record.session) > 64:
+            raise ValueError("Experience session must contain 1..64 characters")
+        self._validate_finite({
+            "reference_price": record.reference_price,
+            "point": record.point,
+            "spread_points": record.spread_points,
+        })
+        if (
+            record.reference_price <= 0
+            or record.point <= 0
+            or record.spread_points < 0
+        ):
+            raise ValueError("Experience market economics are invalid")
+        if not isinstance(record.features, dict):
+            raise ValueError("Experience features must be an object")
+
+        bar_time = self._canonical_utc(
+            record.bar_time_utc,
+            field_name="bar_time_utc",
+        )
+        if bar_time.second != 0 or bar_time.microsecond != 0:
+            raise ValueError(
+                "Experience bar_time_utc must align to a closed M1 bar"
+            )
+        features_json = json.dumps(
+            record.features,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        if len(features_json.encode("utf-8")) > 64 * 1024:
+            raise ValueError("Experience features exceed 64 KiB")
+
+        with self._lock, closing(self._connect()) as connection:
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO market_experiences(
+                      experience_id, symbol, timeframe, bar_time_utc,
+                      reference_price, point, spread_points, session,
+                      features_json, created_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.experience_id,
+                        record.symbol,
+                        record.timeframe,
+                        bar_time.isoformat(),
+                        record.reference_price,
+                        record.point,
+                        record.spread_points,
+                        record.session.strip(),
+                        features_json,
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise FileExistsError(
+                    "A market experience already exists for this closed M1 bar"
+                ) from exc
+            connection.commit()
+
+    def get_market_experience(
+        self,
+        experience_id: str,
+    ) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM market_experiences
+                WHERE experience_id = ?
+                """,
+                (experience_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["features"] = json.loads(
+            str(result.pop("features_json"))
+        )
+        return result
+
+    def record_experience_outcome(
+        self,
+        record: ExperienceOutcomeRecord,
+    ) -> None:
+        if record.horizon_minutes not in {5, 15, 60}:
+            raise ValueError(
+                "Experience horizon must be 5, 15, or 60 minutes"
+            )
+        self._validate_finite({
+            "future_close": record.future_close,
+            "window_high": record.window_high,
+            "window_low": record.window_low,
+        })
+        if min(
+            record.future_close,
+            record.window_high,
+            record.window_low,
+        ) <= 0:
+            raise ValueError("Experience outcome prices must be positive")
+        if not (
+            record.window_low
+            <= record.future_close
+            <= record.window_high
+        ):
+            raise ValueError(
+                "Future close must lie inside the outcome window"
+            )
+
+        future_time = self._canonical_utc(
+            record.future_bar_time_utc,
+            field_name="future_bar_time_utc",
+        )
+
+        with self._lock, closing(self._connect()) as connection:
+            experience = connection.execute(
+                """
+                SELECT bar_time_utc, reference_price, point
+                FROM market_experiences
+                WHERE experience_id = ?
+                """,
+                (record.experience_id,),
+            ).fetchone()
+            if experience is None:
+                raise LookupError("Market experience was not found")
+
+            bar_time = datetime.fromisoformat(
+                str(experience["bar_time_utc"])
+            ).astimezone(UTC)
+            expected_time = bar_time + timedelta(
+                minutes=record.horizon_minutes
+            )
+            if future_time != expected_time:
+                raise ValueError(
+                    "Outcome timestamp does not match its horizon"
+                )
+
+            reference_price = float(experience["reference_price"])
+            point = float(experience["point"])
+            return_points = (
+                record.future_close - reference_price
+            ) / point
+            mfe_long_points = max(
+                0.0,
+                (record.window_high - reference_price) / point,
+            )
+            mae_long_points = min(
+                0.0,
+                (record.window_low - reference_price) / point,
+            )
+            self._validate_finite({
+                "return_points": return_points,
+                "mfe_long_points": mfe_long_points,
+                "mae_long_points": mae_long_points,
+            })
+
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO experience_outcomes(
+                      experience_id, horizon_minutes,
+                      future_bar_time_utc, future_close,
+                      window_high, window_low,
+                      return_points, mfe_long_points,
+                      mae_long_points, created_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record.experience_id,
+                        record.horizon_minutes,
+                        future_time.isoformat(),
+                        record.future_close,
+                        record.window_high,
+                        record.window_low,
+                        return_points,
+                        mfe_long_points,
+                        mae_long_points,
+                        datetime.now(UTC).isoformat(),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise FileExistsError(
+                    "This experience horizon is already recorded"
+                ) from exc
+            connection.commit()
+
+    def experience_outcomes(
+        self,
+        experience_id: str,
+    ) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM experience_outcomes
+                WHERE experience_id = ?
+                ORDER BY horizon_minutes
+                """,
+                (experience_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def record_proposal(
         self,
@@ -1178,6 +1477,6 @@ class ResearchStore:
         try:
             with closing(self._connect()) as connection:
                 version = connection.execute("SELECT MAX(version) FROM research_schema").fetchone()[0]
-            return version == 8
+            return version == 9
         except sqlite3.Error:
             return False

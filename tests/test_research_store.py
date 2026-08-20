@@ -9,7 +9,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from trading_lab.domain import Side, TradingMode
-from trading_lab.research_store import ResearchStore, TradeResultRecord
+from trading_lab.research_store import (
+    ExperienceOutcomeRecord,
+    MarketExperienceRecord,
+    ResearchStore,
+    TradeResultRecord,
+)
 from tests.test_risk_engine import proposal
 
 
@@ -141,6 +146,168 @@ class ResearchStoreTests(unittest.TestCase):
             self.assertEqual(10_000.0, drawdown["start_equity"])
             self.assertEqual(10_050.0, drawdown["peak_equity"])
             self.assertEqual(60.0, drawdown["drawdown"])
+
+    def test_market_experiences_and_outcomes_are_append_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "research.db"
+            store = ResearchStore(path)
+            bar_time = datetime(2026, 8, 20, 11, 5, tzinfo=UTC)
+            experience = MarketExperienceRecord(
+                experience_id="experience-1",
+                symbol="XAUUSD",
+                timeframe="M1",
+                bar_time_utc=bar_time,
+                reference_price=4487.47,
+                point=0.01,
+                spread_points=28.0,
+                session="LONDON",
+                features={
+                    "h1_bias": "BULLISH",
+                    "m15_state": "PULLBACK",
+                    "m5_state": "REBOUND",
+                    "atr_m1": 2.03,
+                },
+            )
+            store.record_market_experience(experience)
+
+            stored = store.get_market_experience(
+                experience.experience_id
+            )
+            self.assertIsNotNone(stored)
+            self.assertEqual("XAUUSD", stored["symbol"])
+            self.assertTrue(store.health())
+            self.assertEqual(
+                "BULLISH",
+                stored["features"]["h1_bias"],
+            )
+
+            store.record_experience_outcome(
+                ExperienceOutcomeRecord(
+                    experience_id=experience.experience_id,
+                    horizon_minutes=5,
+                    future_bar_time_utc=(
+                        bar_time + timedelta(minutes=5)
+                    ),
+                    future_close=4489.47,
+                    window_high=4490.47,
+                    window_low=4486.47,
+                )
+            )
+            rows = store.experience_outcomes(
+                experience.experience_id
+            )
+            self.assertEqual(1, len(rows))
+            self.assertAlmostEqual(
+                200.0,
+                rows[0]["return_points"],
+            )
+            self.assertAlmostEqual(
+                300.0,
+                rows[0]["mfe_long_points"],
+            )
+            self.assertAlmostEqual(
+                -100.0,
+                rows[0]["mae_long_points"],
+            )
+
+            with self.assertRaises(FileExistsError):
+                store.record_market_experience(experience)
+            with self.assertRaises(FileExistsError):
+                store.record_experience_outcome(
+                    ExperienceOutcomeRecord(
+                        experience_id=experience.experience_id,
+                        horizon_minutes=5,
+                        future_bar_time_utc=(
+                            bar_time + timedelta(minutes=5)
+                        ),
+                        future_close=4489.47,
+                        window_high=4490.47,
+                        window_low=4486.47,
+                    )
+                )
+
+            with closing(sqlite3.connect(path)) as connection:
+                versions = {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT version FROM research_schema"
+                    )
+                }
+                self.assertIn(9, versions)
+                with self.assertRaises(sqlite3.DatabaseError):
+                    connection.execute(
+                        """
+                        UPDATE market_experiences
+                        SET reference_price = 1
+                        """
+                    )
+                with self.assertRaises(sqlite3.DatabaseError):
+                    connection.execute(
+                        "DELETE FROM experience_outcomes"
+                    )
+
+    def test_market_experience_requires_m1_aligned_utc_bar(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ResearchStore(
+                Path(directory) / "research.db"
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "align to a closed M1 bar",
+            ):
+                store.record_market_experience(
+                    MarketExperienceRecord(
+                        experience_id="experience-unaligned",
+                        symbol="XAUUSD",
+                        timeframe="M1",
+                        bar_time_utc=datetime(
+                            2026, 8, 20, 11, 5, 1, tzinfo=UTC
+                        ),
+                        reference_price=4487.47,
+                        point=0.01,
+                        spread_points=10.0,
+                        session="LONDON",
+                        features={},
+                    )
+                )
+
+    def test_experience_outcome_requires_exact_horizon_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ResearchStore(
+                Path(directory) / "research.db"
+            )
+            bar_time = datetime(
+                2026, 8, 20, 11, 5, tzinfo=UTC
+            )
+            store.record_market_experience(
+                MarketExperienceRecord(
+                    experience_id="experience-2",
+                    symbol="XAUUSD",
+                    timeframe="M1",
+                    bar_time_utc=bar_time,
+                    reference_price=4487.47,
+                    point=0.01,
+                    spread_points=10.0,
+                    session="LONDON",
+                    features={},
+                )
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "does not match its horizon",
+            ):
+                store.record_experience_outcome(
+                    ExperienceOutcomeRecord(
+                        experience_id="experience-2",
+                        horizon_minutes=15,
+                        future_bar_time_utc=(
+                            bar_time + timedelta(minutes=14)
+                        ),
+                        future_close=4488.0,
+                        window_high=4489.0,
+                        window_low=4486.0,
+                    )
+                )
 
     def test_hypotheses_and_closed_trade_evidence_are_immutable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
