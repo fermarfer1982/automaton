@@ -121,6 +121,21 @@ class MarketExperienceLoop:
 
         return result
 
+    def health(self) -> dict[str, object]:
+        snapshot = self.snapshot()
+
+        return {
+            "running": not self._stop_event.is_set(),
+            "cycles": snapshot.cycles,
+            "experiences_created": snapshot.experiences_created,
+            "outcomes_created": snapshot.outcomes_created,
+            "consecutive_errors": snapshot.consecutive_errors,
+            "last_bar_time_utc": snapshot.last_bar_time_utc,
+            "last_success_at_utc": snapshot.last_success_at_utc,
+            "last_error_at_utc": snapshot.last_error_at_utc,
+            "last_error": snapshot.last_error,
+        }
+
     def run(self) -> None:
         while not self._stop_event.is_set():
             self.run_cycle()
