@@ -148,6 +148,14 @@ class MarketExperienceCollectorTests(unittest.TestCase):
                 saved["spread_points"],
             )
             features = saved["features"]
+            self.assertEqual(
+                2,
+                features["feature_version"],
+            )
+            self.assertEqual(
+                "2026-08-20T11:01:00+00:00",
+                features["reference_time_utc"],
+            )
             self.assertTrue(features["closed_bar_only"])
             self.assertTrue(features["no_lookahead"])
             self.assertEqual(
@@ -275,6 +283,47 @@ class MarketExperienceCollectorTests(unittest.TestCase):
                 if int(row["time_msc"]) == future_spike_time:
                     row["high"] = 9000.0
 
+            invalid_m5_time = datetime(
+                2026, 8, 20, 10, 55, tzinfo=UTC
+            )
+            for row in rows["M5"]:
+                if int(row["time_msc"]) == int(
+                    invalid_m5_time.timestamp() * 1000
+                ):
+                    row["high"] = 9000.0
+
+            for bar_time, price in (
+                (
+                    datetime(
+                        2026, 8, 20, 10, 30, tzinfo=UTC
+                    ),
+                    4500.0,
+                ),
+                (
+                    datetime(
+                        2026, 8, 20, 10, 45, tzinfo=UTC
+                    ),
+                    9000.0,
+                ),
+            ):
+                item = candle(
+                    bar_time,
+                    price,
+                )
+                item["timeframe"] = "M15"
+                if price >= 9000.0:
+                    item["high"] = 9001.0
+                rows["M15"].append(item)
+
+            invalid_h1_time = datetime(
+                2026, 8, 20, 10, 0, tzinfo=UTC
+            )
+            for row in rows["H1"]:
+                if int(row["time_msc"]) == int(
+                    invalid_h1_time.timestamp() * 1000
+                ):
+                    row["high"] = 9000.0
+
             result = collector.collect_once(
                 now=datetime(
                     2026, 8, 20, 11, 1, tzinfo=UTC
@@ -312,13 +361,70 @@ class MarketExperienceCollectorTests(unittest.TestCase):
                 target_id
             )
             self.assertIsNotNone(saved)
-            m1_features = saved["features"]["timeframes"]["M1"]
+            features = saved["features"]
+            self.assertEqual(
+                2,
+                features["feature_version"],
+            )
+            self.assertEqual(
+                (
+                    target + timedelta(minutes=1)
+                ).isoformat(),
+                features["reference_time_utc"],
+            )
+
+            m1_features = features["timeframes"]["M1"]
             self.assertEqual(
                 target.isoformat(),
                 m1_features["bar_time_utc"],
             )
             self.assertLess(
                 m1_features["rolling_high_20"],
+                9000.0,
+            )
+
+            self.assertEqual(
+                datetime(
+                    2026, 8, 20, 10, 50, tzinfo=UTC
+                ).isoformat(),
+                features["timeframes"]["M5"][
+                    "bar_time_utc"
+                ],
+            )
+            self.assertLess(
+                features["timeframes"]["M5"][
+                    "rolling_high_20"
+                ],
+                9000.0,
+            )
+
+            self.assertEqual(
+                datetime(
+                    2026, 8, 20, 10, 30, tzinfo=UTC
+                ).isoformat(),
+                features["timeframes"]["M15"][
+                    "bar_time_utc"
+                ],
+            )
+            self.assertLess(
+                features["timeframes"]["M15"][
+                    "rolling_high_20"
+                ],
+                9000.0,
+            )
+
+            self.assertEqual(
+                datetime(
+                    2026, 8, 20, 9, 0, tzinfo=UTC
+                ).isoformat(),
+                features["timeframes"]["H1"][
+                    "bar_time_utc"
+                ],
+            )
+            self.assertLess(
+                features["timeframes"]["H1"][
+                    "rolling_high_20"
+                ],
                 9000.0,
             )
 

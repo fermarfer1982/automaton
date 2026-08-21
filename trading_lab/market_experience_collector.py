@@ -178,6 +178,13 @@ class MarketExperienceCollector:
 
     HORIZONS = (5, 15, 60)
     MAX_BACKFILL_PER_CYCLE = 120
+    FEATURE_VERSION = 2
+    TIMEFRAME_MINUTES = {
+        "M1": 1,
+        "M5": 5,
+        "M15": 15,
+        "H1": 60,
+    }
 
     def __init__(
         self,
@@ -306,6 +313,7 @@ class MarketExperienceCollector:
             UTC,
         )
         experience_id = self._experience_id(bar_msc)
+        reference_end_msc = bar_msc + 60_000
 
         closed_spread = row.get("spread")
         if (
@@ -328,11 +336,21 @@ class MarketExperienceCollector:
 
         def available_by_reference(
             rows: list[dict[str, Any]],
+            timeframe: str,
         ) -> list[dict[str, Any]]:
+            duration_minutes = self.TIMEFRAME_MINUTES[
+                timeframe
+            ]
+            duration_msc = duration_minutes * 60_000
+
             selected = [
                 item
                 for item in rows
-                if int(item["time_msc"]) <= bar_msc
+                if (
+                    int(item["time_msc"])
+                    + duration_msc
+                    <= reference_end_msc
+                )
             ]
             if not selected:
                 raise RuntimeError(
@@ -342,7 +360,10 @@ class MarketExperienceCollector:
             return selected
 
         features = {
-            "feature_version": 1,
+            "feature_version": self.FEATURE_VERSION,
+            "reference_time_utc": (
+                bar_time + timedelta(minutes=1)
+            ).isoformat(),
             "closed_bar_only": True,
             "no_lookahead": True,
             "spread_source": spread_source,
@@ -351,19 +372,19 @@ class MarketExperienceCollector:
             "session": context,
             "timeframes": {
                 "M1": _timeframe_features(
-                    available_by_reference(m1),
+                    available_by_reference(m1, "M1"),
                     point=point,
                 ),
                 "M5": _timeframe_features(
-                    available_by_reference(m5),
+                    available_by_reference(m5, "M5"),
                     point=point,
                 ),
                 "M15": _timeframe_features(
-                    available_by_reference(m15),
+                    available_by_reference(m15, "M15"),
                     point=point,
                 ),
                 "H1": _timeframe_features(
-                    available_by_reference(h1),
+                    available_by_reference(h1, "H1"),
                     point=point,
                 ),
             },
