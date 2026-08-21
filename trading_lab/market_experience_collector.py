@@ -22,6 +22,8 @@ class MarketObservationSource(Protocol):
         symbol: str,
         timeframe: str,
         count: int,
+        *,
+        start_pos: int = 1,
     ) -> dict[str, Any]: ...
 
 
@@ -179,6 +181,9 @@ class MarketExperienceCollector:
     HORIZONS = (5, 15, 60)
     MAX_BACKFILL_PER_CYCLE = 120
     FEATURE_VERSION = 2
+    CANDLE_PAGE_SIZE = 500
+    HISTORICAL_TARGET_M1_BARS = 10_000
+    HISTORICAL_WARMUP_BARS = 60
     TIMEFRAME_MINUTES = {
         "M1": 1,
         "M5": 5,
@@ -198,6 +203,11 @@ class MarketExperienceCollector:
         self._observation = observation
         self._store = store
         self._symbol = symbol
+        self._historical_cache: dict[
+            str,
+            list[dict[str, Any]],
+        ] | None = None
+        self._historical_backfill_complete = False
 
     @classmethod
     def _experience_id(cls, time_msc: int) -> str:
@@ -210,12 +220,23 @@ class MarketExperienceCollector:
         self,
         timeframe: str,
         count: int,
+        *,
+        start_pos: int = 1,
     ) -> list[dict[str, Any]]:
-        payload = self._observation.candles(
-            self._symbol,
-            timeframe,
-            count,
-        )
+        if start_pos == 1:
+            payload = self._observation.candles(
+                self._symbol,
+                timeframe,
+                count,
+            )
+        else:
+            payload = self._observation.candles(
+                self._symbol,
+                timeframe,
+                count,
+                start_pos=start_pos,
+            )
+
         if (
             not isinstance(payload, dict)
             or payload.get("symbol") != self._symbol
@@ -225,6 +246,92 @@ class MarketExperienceCollector:
         ):
             raise RuntimeError("Observation candle boundary is invalid")
         return _sorted_candles(payload["candles"])
+
+    def _closed_candles_paged(
+        self,
+        timeframe: str,
+        total_count: int,
+    ) -> list[dict[str, Any]]:
+        if total_count < 1:
+            raise ValueError(
+                "Paged candle count must be positive"
+            )
+
+        collected: list[dict[str, Any]] = []
+        start_pos = 1
+        remaining = total_count
+
+        while remaining > 0:
+            request_count = min(
+                self.CANDLE_PAGE_SIZE,
+                remaining,
+            )
+            page = self._closed_candles(
+                timeframe,
+                request_count,
+                start_pos=start_pos,
+            )
+            collected.extend(page)
+
+            if len(page) < request_count:
+                break
+
+            start_pos += request_count
+            remaining -= request_count
+
+        by_time = {
+            int(row["time_msc"]): row
+            for row in collected
+        }
+
+        return _sorted_candles(
+            list(by_time.values())
+        )
+
+    def _historical_counts(
+        self,
+    ) -> dict[str, int]:
+        target = self.HISTORICAL_TARGET_M1_BARS
+        warmup = self.HISTORICAL_WARMUP_BARS
+
+        return {
+            "M1": target + warmup,
+            "M5": math.ceil(target / 5) + warmup,
+            "M15": math.ceil(target / 15) + warmup,
+            "H1": math.ceil(target / 60) + warmup,
+        }
+
+    def _ensure_historical_cache(
+        self,
+    ) -> dict[str, list[dict[str, Any]]]:
+        if self._historical_cache is None:
+            counts = self._historical_counts()
+            self._historical_cache = {
+                timeframe: self._closed_candles_paged(
+                    timeframe,
+                    count,
+                )
+                for timeframe, count in counts.items()
+            }
+
+        return self._historical_cache
+
+    @staticmethod
+    def _merge_histories(
+        older: list[dict[str, Any]],
+        recent: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        by_time = {
+            int(row["time_msc"]): row
+            for row in older
+        }
+        by_time.update({
+            int(row["time_msc"]): row
+            for row in recent
+        })
+        return _sorted_candles(
+            list(by_time.values())
+        )
 
     def _complete_outcomes(
         self,
@@ -432,9 +539,9 @@ class MarketExperienceCollector:
         if point <= 0 or bid <= 0 or ask < bid:
             raise RuntimeError("Observed market economics are invalid")
 
-        m1 = self._closed_candles("M1", 500)
+        recent_m1 = self._closed_candles("M1", 500)
 
-        latest = m1[-1]
+        latest = recent_m1[-1]
         bar_msc = int(latest["time_msc"])
         bar_time = datetime.fromtimestamp(bar_msc / 1000, UTC)
         if bar_time >= timestamp:
@@ -448,7 +555,7 @@ class MarketExperienceCollector:
 
         backfill_rows: list[dict[str, Any]] = []
         first_m1_time = datetime.fromtimestamp(
-            int(m1[0]["time_msc"]) / 1000,
+            int(recent_m1[0]["time_msc"]) / 1000,
             UTC,
         )
         backfill_start = first_m1_time
@@ -469,7 +576,7 @@ class MarketExperienceCollector:
             )
 
             missing_rows = []
-            for row in m1[:-1]:
+            for row in recent_m1[:-1]:
                 row_time = datetime.fromtimestamp(
                     int(row["time_msc"]) / 1000,
                     UTC,
@@ -490,14 +597,11 @@ class MarketExperienceCollector:
                 ]
 
             if internal_missing:
-                # Repair current-version gaps before expanding
-                # historical coverage. This keeps near-live
-                # evidence contiguous and deterministic.
                 backfill_rows = internal_missing[
                     : self.MAX_BACKFILL_PER_CYCLE
                 ]
             else:
-                historical_missing = [
+                recent_historical_missing = [
                     row
                     for row_time, row in missing_rows
                     if (
@@ -505,15 +609,71 @@ class MarketExperienceCollector:
                         or row_time < earliest_v2
                     )
                 ]
-                # Reconstruct the most recent eligible history
-                # first so useful v2 coverage becomes available
-                # quickly while remaining bounded per cycle.
                 backfill_rows = list(
-                    reversed(historical_missing)
+                    reversed(recent_historical_missing)
                 )[: self.MAX_BACKFILL_PER_CYCLE]
 
+        working_m1 = recent_m1
+        historical_cache = self._historical_cache
+
+        if (
+            not backfill_rows
+            and not self._historical_backfill_complete
+            and len(recent_m1) == self.CANDLE_PAGE_SIZE
+        ):
+            historical_cache = self._ensure_historical_cache()
+            working_m1 = self._merge_histories(
+                historical_cache["M1"],
+                recent_m1,
+            )
+            self._historical_cache["M1"] = working_m1
+
+            eligible = working_m1[
+                -(
+                    self.HISTORICAL_TARGET_M1_BARS
+                    + 1
+                ):-1
+            ]
+
+            if eligible:
+                historical_start = datetime.fromtimestamp(
+                    int(eligible[0]["time_msc"]) / 1000,
+                    UTC,
+                )
+                historical_end = datetime.fromtimestamp(
+                    int(eligible[-1]["time_msc"]) / 1000,
+                    UTC,
+                )
+                existing_historical = (
+                    self._store.market_experience_bar_times(
+                        historical_start,
+                        historical_end,
+                        feature_version=self.FEATURE_VERSION,
+                    )
+                )
+                missing_historical = [
+                    row
+                    for row in eligible
+                    if datetime.fromtimestamp(
+                        int(row["time_msc"]) / 1000,
+                        UTC,
+                    ).isoformat()
+                    not in existing_historical
+                ]
+
+                if missing_historical:
+                    backfill_rows = list(
+                        reversed(missing_historical)
+                    )[: self.MAX_BACKFILL_PER_CYCLE]
+                else:
+                    self._historical_backfill_complete = True
+            else:
+                self._historical_backfill_complete = True
+
         if latest_exists and not backfill_rows:
-            outcomes_created = self._complete_outcomes(m1)
+            outcomes_created = self._complete_outcomes(
+                working_m1
+            )
             return CollectorResult(
                 experience_id=experience_id,
                 bar_time_utc=bar_time.isoformat(),
@@ -521,9 +681,39 @@ class MarketExperienceCollector:
                 outcomes_created=outcomes_created,
             )
 
-        m5 = self._closed_candles("M5", 200)
-        m15 = self._closed_candles("M15", 200)
-        h1 = self._closed_candles("H1", 200)
+        recent_m5 = self._closed_candles("M5", 200)
+        recent_m15 = self._closed_candles("M15", 200)
+        recent_h1 = self._closed_candles("H1", 200)
+
+        if historical_cache is not None:
+            m1 = self._merge_histories(
+                historical_cache["M1"],
+                recent_m1,
+            )
+            m5 = self._merge_histories(
+                historical_cache["M5"],
+                recent_m5,
+            )
+            m15 = self._merge_histories(
+                historical_cache["M15"],
+                recent_m15,
+            )
+            h1 = self._merge_histories(
+                historical_cache["H1"],
+                recent_h1,
+            )
+
+            self._historical_cache.update({
+                "M1": m1,
+                "M5": m5,
+                "M15": m15,
+                "H1": h1,
+            })
+        else:
+            m1 = recent_m1
+            m5 = recent_m5
+            m15 = recent_m15
+            h1 = recent_h1
 
         latest_created = False
         if not latest_exists:

@@ -402,14 +402,20 @@ class MT5ReadOnlyClient:
         count: int,
         *,
         symbol: str = "XAUUSD",
+        start_pos: int = 1,
     ) -> list[dict[str, Any]]:
+        params = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "count": count,
+        }
+
+        if start_pos != 1:
+            params["start_pos"] = start_pos
+
         result = self.request(
             "CANDLES",
-            {
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "count": count,
-            },
+            params,
         )
 
         if not isinstance(result, list):

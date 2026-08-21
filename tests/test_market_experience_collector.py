@@ -52,6 +52,7 @@ class FakeObservation:
     def __init__(self, rows_by_timeframe):
         self.rows = rows_by_timeframe
         self.candle_requests = []
+        self.candle_page_requests = []
 
     def symbol_state(self, symbol):
         return {
@@ -61,9 +62,28 @@ class FakeObservation:
             "point": 0.01,
         }
 
-    def candles(self, symbol, timeframe, count):
+    def candles(
+        self,
+        symbol,
+        timeframe,
+        count,
+        *,
+        start_pos=1,
+    ):
         self.candle_requests.append(timeframe)
-        rows = self.rows[timeframe][-count:]
+        self.candle_page_requests.append(
+            (timeframe, count, start_pos)
+        )
+
+        source = self.rows[timeframe]
+        end = len(source) - (start_pos - 1)
+
+        if end <= 0:
+            rows = []
+        else:
+            begin = max(0, end - count)
+            rows = source[begin:end]
+
         return {
             "symbol": symbol,
             "timeframe": timeframe,
@@ -110,6 +130,46 @@ class MarketExperienceCollectorTests(unittest.TestCase):
                 timeframe="H1",
             ),
         }
+
+    def test_paged_closed_candles_keep_each_request_bounded(self):
+        rows = self.build_rows()
+        start = datetime(2026, 8, 19, 0, 0, tzinfo=UTC)
+        rows["M1"] = series(
+            start=start,
+            count=1200,
+            step_minutes=1,
+            start_price=4400.0,
+            increment=0.01,
+            timeframe="M1",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            observation = FakeObservation(rows)
+            collector = MarketExperienceCollector(
+                observation,
+                ResearchStore(Path(directory) / "research.db"),
+            )
+
+            result = collector._closed_candles_paged(
+                "M1",
+                1200,
+            )
+
+        self.assertEqual(1200, len(result))
+        self.assertEqual(
+            [
+                ("M1", 500, 1),
+                ("M1", 500, 501),
+                ("M1", 200, 1001),
+            ],
+            observation.candle_page_requests,
+        )
+        self.assertTrue(
+            all(
+                count <= 500
+                for _, count, _ in observation.candle_page_requests
+            )
+        )
 
     def test_collects_latest_closed_m1_idempotently(self):
         with tempfile.TemporaryDirectory() as directory:

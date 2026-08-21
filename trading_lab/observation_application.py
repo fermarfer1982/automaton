@@ -30,6 +30,7 @@ class ObservationClient(Protocol):
         count: int,
         *,
         symbol: str = "XAUUSD",
+        start_pos: int = 1,
     ) -> list[dict[str, Any]]: ...
 
     def positions(self) -> dict[str, Any]: ...
@@ -236,6 +237,8 @@ class ObservationApplication:
         symbol: str,
         timeframe: str,
         count: int,
+        *,
+        start_pos: int = 1,
     ) -> dict[str, Any]:
         self._validated_account()
 
@@ -258,11 +261,28 @@ class ObservationApplication:
                 "Observation candle count is invalid"
             )
 
-        rows = self._client.candles(
-            timeframe,
-            count,
-            symbol=symbol,
-        )
+        if (
+            not isinstance(start_pos, int)
+            or isinstance(start_pos, bool)
+            or not 1 <= start_pos <= 100_000
+        ):
+            raise ValueError(
+                "Observation candle start_pos is invalid"
+            )
+
+        if start_pos == 1:
+            rows = self._client.candles(
+                timeframe,
+                count,
+                symbol=symbol,
+            )
+        else:
+            rows = self._client.candles(
+                timeframe,
+                count,
+                symbol=symbol,
+                start_pos=start_pos,
+            )
 
         if not isinstance(rows, list):
             raise RuntimeError(

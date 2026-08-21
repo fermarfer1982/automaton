@@ -591,10 +591,22 @@ class MT5ReadOnlyDataAdapter:
         symbol: str,
         timeframe: str,
         count: int,
+        *,
+        start_pos: int = 1,
     ) -> list[CandleSnapshot]:
         if count < 1 or count > 500:
             raise MT5ReadOnlyDataError(
                 "Candle count must be between 1 and 500"
+            )
+
+        if (
+            isinstance(start_pos, bool)
+            or not isinstance(start_pos, int)
+            or start_pos < 1
+            or start_pos > 100_000
+        ):
+            raise MT5ReadOnlyDataError(
+                "Candle start_pos must be between 1 and 100000"
             )
 
         timeframes = {
@@ -618,7 +630,7 @@ class MT5ReadOnlyDataAdapter:
             self._bindings.copy_rates_from_pos,
             symbol,
             timeframes[timeframe],
-            1,
+            start_pos,
             count,
         )
 

@@ -33,6 +33,8 @@ class MT5ReadOnlyWorkerAdapter(Protocol):
         symbol: str,
         timeframe: str,
         count: int,
+        *,
+        start_pos: int = 1,
     ) -> list[CandleSnapshot]:
         ...
 
@@ -243,11 +245,23 @@ def dispatch_request(
             )
 
         if operation == "CANDLES":
-            snapshots = adapter.candles(
-                params["symbol"],
-                params["timeframe"],
-                params["count"],
+            start_pos = int(
+                params.get("start_pos", 1)
             )
+
+            if start_pos == 1:
+                snapshots = adapter.candles(
+                    params["symbol"],
+                    params["timeframe"],
+                    params["count"],
+                )
+            else:
+                snapshots = adapter.candles(
+                    params["symbol"],
+                    params["timeframe"],
+                    params["count"],
+                    start_pos=start_pos,
+                )
 
             return (
                 _success(

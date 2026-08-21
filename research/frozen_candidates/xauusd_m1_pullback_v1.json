@@ -1,0 +1,47 @@
+{
+  "candidate_set_id": "xauusd_m1_pullback_v1",
+  "status": "FROZEN",
+  "symbol": "XAUUSD",
+  "feature_version": 2,
+  "direction": "LONG",
+  "discovery_window_start_utc": "2026-08-20T23:10:00+00:00",
+  "discovery_cutoff_utc": "2026-08-21T07:38:00+00:00",
+  "evaluation_horizon_minutes": 15,
+  "diagnostic_horizons_minutes": [5, 15, 60],
+  "non_overlap_minutes": 15,
+  "minimum_oos_non_overlap_signals": 30,
+  "minimum_oos_utc_days": 3,
+  "rules": {
+    "F1_M1_3BAR_PULLBACK_LONG": {
+      "all": [
+        {
+          "feature": "timeframes.M1.return_3_points",
+          "op": "<=",
+          "threshold": -125.0
+        }
+      ]
+    },
+    "F2_M1_PULLBACK_WITH_H1_CONFIRM_LONG": {
+      "all": [
+        {
+          "feature": "timeframes.M1.return_3_points",
+          "op": "<=",
+          "threshold": -125.0
+        },
+        {
+          "feature": "timeframes.H1.return_1_points",
+          "op": ">=",
+          "threshold": 525.0
+        }
+      ]
+    }
+  },
+  "methodology": {
+    "thresholds_must_not_be_changed_from_oos_results": true,
+    "feature_version_1_excluded": true,
+    "long_cost_proxy": "Bid-bar close return minus entry spread",
+    "episode_policy": "First qualifying signal, then 15-minute non-overlap",
+    "historical_validation_scope": "Bars strictly before discovery_window_start_utc",
+    "prospective_oos_scope": "Bars strictly after discovery_cutoff_utc"
+  }
+}

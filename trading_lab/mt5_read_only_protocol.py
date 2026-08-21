@@ -213,11 +213,26 @@ def _validate_params(
         }
 
     if operation == "CANDLES":
-        _require_exact_keys(
-            params,
-            {"symbol", "timeframe", "count"},
-            context=operation,
-        )
+        actual_keys = frozenset(params)
+        legacy_keys = frozenset({
+            "symbol",
+            "timeframe",
+            "count",
+        })
+        paged_keys = frozenset({
+            "symbol",
+            "timeframe",
+            "count",
+            "start_pos",
+        })
+
+        if actual_keys not in {
+            legacy_keys,
+            paged_keys,
+        }:
+            raise MT5ReadOnlyProtocolError(
+                "CANDLES keys are not exact"
+            )
 
         symbol = _require_symbol(
             params["symbol"]
@@ -247,11 +262,28 @@ def _validate_params(
                 "Candle count is invalid"
             )
 
-        return {
+        result = {
             "symbol": symbol,
             "timeframe": timeframe,
             "count": count,
         }
+
+        if "start_pos" in params:
+            start_pos = params["start_pos"]
+
+            if (
+                isinstance(start_pos, bool)
+                or not isinstance(start_pos, int)
+                or start_pos < 1
+                or start_pos > 100_000
+            ):
+                raise MT5ReadOnlyProtocolError(
+                    "Candle start_pos is invalid"
+                )
+
+            result["start_pos"] = start_pos
+
+        return result
 
     if operation == "HISTORY":
         _require_exact_keys(

@@ -165,6 +165,51 @@ def test_candle_request_accepts_reviewed_bounds(
     assert request.params["count"] == count
 
 
+
+@pytest.mark.parametrize(
+    "start_pos",
+    [1, 501, 10_001, 100_000],
+)
+def test_candle_request_accepts_bounded_start_pos(
+    start_pos: int,
+):
+    request = decode_request(
+        raw_request(
+            "CANDLES",
+            {
+                "symbol": "XAUUSD",
+                "timeframe": "M1",
+                "count": 500,
+                "start_pos": start_pos,
+            },
+        )
+    )
+
+    assert request.params["start_pos"] == start_pos
+    assert request.params["count"] == 500
+
+
+@pytest.mark.parametrize(
+    "start_pos",
+    [0, 100_001, True],
+)
+def test_candle_request_rejects_invalid_start_pos(
+    start_pos,
+):
+    with pytest.raises(MT5ReadOnlyProtocolError):
+        decode_request(
+            raw_request(
+                "CANDLES",
+                {
+                    "symbol": "XAUUSD",
+                    "timeframe": "M1",
+                    "count": 500,
+                    "start_pos": start_pos,
+                },
+            )
+        )
+
+
 @pytest.mark.parametrize(
     ("timeframe", "count"),
     [

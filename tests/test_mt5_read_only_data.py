@@ -471,6 +471,44 @@ def test_candle_bounds_fail_closed(timeframe: str, count: int):
         )
 
 
+
+def test_candle_start_pos_is_forwarded_to_mt5():
+    fake, _, adapter = make_adapter()
+
+    rows = adapter.candles(
+        "XAUUSD",
+        "M1",
+        2,
+        start_pos=501,
+    )
+
+    assert len(rows) == 2
+    calls = [
+        payload
+        for name, payload in fake.calls
+        if name == "copy_rates_from_pos"
+    ]
+    assert calls == [
+        ("XAUUSD", FakeMT5.TIMEFRAME_M1, 501, 2)
+    ]
+
+
+@pytest.mark.parametrize(
+    "start_pos",
+    [0, 100_001, True],
+)
+def test_candle_start_pos_bounds_fail_closed(start_pos):
+    _, _, adapter = make_adapter()
+
+    with pytest.raises(MT5ReadOnlyDataError):
+        adapter.candles(
+            "XAUUSD",
+            "M1",
+            2,
+            start_pos=start_pos,
+        )
+
+
 def test_history_bounds_fail_closed():
     _, _, adapter = make_adapter()
 
