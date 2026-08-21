@@ -284,6 +284,7 @@ def serve(
             api = create_observation_api(
                 application,
                 verifier,
+                collector_loop=collector_loop,
             )
 
             uvicorn_runner(

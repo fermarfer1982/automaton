@@ -105,6 +105,31 @@ class ObservationServiceSourceTests(
             source,
         )
 
+    def test_health_is_local_and_wired_to_collector(self):
+        service_source = SERVICE.read_text(
+            encoding="utf-8"
+        )
+        api_source = API.read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            'host="127.0.0.1"',
+            service_source,
+        )
+        self.assertIn(
+            "collector_loop=collector_loop",
+            service_source,
+        )
+        self.assertIn(
+            '"/health"',
+            api_source,
+        )
+        self.assertIn(
+            '"execution_capable": False',
+            api_source,
+        )
+
     def test_api_contains_no_mutating_routes(self):
         source = API.read_text(
             encoding="utf-8"

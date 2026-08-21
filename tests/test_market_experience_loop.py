@@ -88,6 +88,58 @@ class MarketExperienceLoopTests(unittest.TestCase):
         self.assertIsNone(recovered.last_error)
         self.assertEqual(1, recovered.experiences_created)
 
+    def test_health_reports_loop_state(self):
+        collector = FakeCollector([
+            CollectorResult(
+                experience_id="e-health",
+                bar_time_utc=(
+                    "2026-08-20T14:30:00+00:00"
+                ),
+                experience_created=True,
+                outcomes_created=2,
+                backfill_experiences_created=1,
+            ),
+        ])
+
+        loop = MarketExperienceLoop(
+            collector,
+            now_provider=lambda: NOW,
+        )
+
+        initial = loop.health()
+        self.assertTrue(initial["running"])
+        self.assertEqual(0, initial["cycles"])
+        self.assertEqual(
+            0,
+            initial["consecutive_errors"],
+        )
+
+        loop.run_cycle()
+
+        healthy = loop.health()
+        self.assertTrue(healthy["running"])
+        self.assertEqual(1, healthy["cycles"])
+        self.assertEqual(
+            2,
+            healthy["experiences_created"],
+        )
+        self.assertEqual(
+            2,
+            healthy["outcomes_created"],
+        )
+        self.assertEqual(
+            "2026-08-20T14:30:00+00:00",
+            healthy["last_bar_time_utc"],
+        )
+        self.assertEqual(
+            NOW.isoformat(),
+            healthy["last_success_at_utc"],
+        )
+
+        loop.stop()
+        stopped = loop.health()
+        self.assertFalse(stopped["running"])
+
     def test_interval_is_bounded(self):
         collector = FakeCollector([])
 

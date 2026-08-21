@@ -97,14 +97,14 @@ class ObservationApiTests(
             encoding="ascii",
         )
 
-        verifier = ApiKeyVerifier(
+        self.verifier = ApiKeyVerifier(
             key_path
         )
 
         self.client = TestClient(
             create_observation_api(
                 FakeApplication(),
-                verifier,
+                self.verifier,
             )
         )
 
@@ -115,6 +115,88 @@ class ObservationApiTests(
 
     def tearDown(self):
         self.tempdir.cleanup()
+
+    def test_health_reports_worker_and_collector(self):
+        class FakeCollectorLoop:
+            def health(self):
+                return {
+                    "running": True,
+                    "cycles": 7,
+                    "experiences_created": 5,
+                    "outcomes_created": 3,
+                    "consecutive_errors": 0,
+                    "last_bar_time_utc": (
+                        "2026-08-20T14:30:00+00:00"
+                    ),
+                    "last_success_at_utc": (
+                        "2026-08-20T14:31:00+00:00"
+                    ),
+                    "last_error_at_utc": None,
+                    "last_error": None,
+                }
+
+        client = TestClient(
+            create_observation_api(
+                FakeApplication(),
+                self.verifier,
+                collector_loop=FakeCollectorLoop(),
+            )
+        )
+
+        response = client.get("/health")
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        payload = response.json()
+
+        self.assertEqual(
+            "HEALTHY",
+            payload["status"],
+        )
+        self.assertEqual(
+            "OBSERVE_ONLY",
+            payload["mode"],
+        )
+        self.assertFalse(
+            payload["execution_capable"]
+        )
+        self.assertEqual(
+            7,
+            payload["collector"]["cycles"],
+        )
+        self.assertTrue(
+            payload["collector"]["running"]
+        )
+
+    def test_health_is_degraded_after_collector_error(self):
+        class FailedCollectorLoop:
+            def health(self):
+                return {
+                    "running": True,
+                    "consecutive_errors": 1,
+                }
+
+        client = TestClient(
+            create_observation_api(
+                FakeApplication(),
+                self.verifier,
+                collector_loop=FailedCollectorLoop(),
+            )
+        )
+
+        response = client.get("/health")
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+        self.assertEqual(
+            "DEGRADED",
+            response.json()["status"],
+        )
 
     def test_missing_key_is_rejected(self):
         response = self.client.get(

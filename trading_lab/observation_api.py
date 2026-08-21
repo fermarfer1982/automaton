@@ -15,6 +15,7 @@ OBSERVATION_HEADER = (
 def create_observation_api(
     application,
     verifier: ApiKeyVerifier,
+    collector_loop=None,
 ) -> FastAPI:
     app = FastAPI(
         title="Automaton MT5 Observation Service",
@@ -125,6 +126,45 @@ def create_observation_api(
                 "observation_unavailable"
             },
         )
+
+    @app.get("/health")
+    def health():
+        worker = application.status()
+
+        collector = (
+            None
+            if collector_loop is None
+            else collector_loop.health()
+        )
+
+        collector_healthy = (
+            collector is None
+            or (
+                collector.get("running") is True
+                and collector.get(
+                    "consecutive_errors"
+                ) == 0
+            )
+        )
+
+        return {
+            "status": (
+                "HEALTHY"
+                if collector_healthy
+                else "DEGRADED"
+            ),
+            "service": worker.get(
+                "service",
+                "automaton-mt5-observation",
+            ),
+            "mode": worker.get(
+                "mode",
+                "OBSERVE_ONLY",
+            ),
+            "execution_capable": False,
+            "worker": worker,
+            "collector": collector,
+        }
 
     @app.get(
         "/v1/status",
