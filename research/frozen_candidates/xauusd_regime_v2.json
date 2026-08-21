@@ -1,0 +1,96 @@
+{
+  "candidate_set_id": "xauusd_regime_v2",
+  "status": "FROZEN",
+  "symbol": "XAUUSD",
+  "feature_version": 2,
+  "direction": "LONG",
+  "frozen_at_utc": "2026-08-21T13:20:00+00:00",
+  "historical_holdout_before_utc": "2026-08-12T00:00:00+00:00",
+  "prospective_oos_cutoff_utc": "2026-08-21T13:20:00+00:00",
+  "evaluation_horizon_minutes": 15,
+  "diagnostic_horizons_minutes": [5, 15, 60],
+  "non_overlap_minutes": 15,
+  "minimum_oos_non_overlap_signals": 30,
+  "minimum_oos_utc_days": 3,
+  "base_episode_rule": {
+    "all": [
+      {
+        "feature": "timeframes.M1.return_3_points",
+        "op": "<=",
+        "threshold": -125.0
+      }
+    ]
+  },
+  "regime_rules": {
+    "F3_M5_RSI_BULLISH_PULLBACK_LONG": {
+      "all": [
+        {
+          "feature": "timeframes.M5.rsi14",
+          "op": ">=",
+          "threshold": 60.5785
+        }
+      ]
+    },
+    "F4_LOW_H1_ATR_PULLBACK_LONG": {
+      "all": [
+        {
+          "feature": "timeframes.H1.atr14_points",
+          "op": "<=",
+          "threshold": 1627.14
+        }
+      ]
+    }
+  },
+  "provenance": {
+    "source_experiment": "xauusd_regime_discovery_v2",
+    "source_dataset_fingerprint": "5ca01cfc592f1ef1285c48308bccfac8651cc88b2083a56eb8268b47b593e4dc",
+    "train_dates_utc": [
+      "2026-08-12",
+      "2026-08-13",
+      "2026-08-14",
+      "2026-08-16"
+    ],
+    "validation_dates_utc": [
+      "2026-08-17"
+    ],
+    "c02_train": {
+      "n": 35,
+      "mean_points": 155.49,
+      "median_points": 127.0,
+      "profit_factor": 2.35
+    },
+    "c02_validation": {
+      "n": 16,
+      "mean_points": 102.06,
+      "median_points": 85.5,
+      "profit_factor": 1.62
+    },
+    "c03_train": {
+      "n": 37,
+      "mean_points": 157.35,
+      "median_points": 28.0,
+      "profit_factor": 2.51
+    },
+    "c03_validation": {
+      "n": 23,
+      "mean_points": 106.39,
+      "median_points": 60.0,
+      "profit_factor": 1.82
+    },
+    "previous_reserved_holdout_dates_utc": [
+      "2026-08-18",
+      "2026-08-19",
+      "2026-08-20"
+    ],
+    "previous_reserved_holdout_status": "SECONDARY_ONLY_PRIOR_BASE_F1_OUTCOMES_WERE_INSPECTED",
+    "new_untouched_historical_holdout": "bar_time_utc strictly before 2026-08-12T00:00:00+00:00"
+  },
+  "methodology": {
+    "episode_order": "Apply frozen F1 base rule to raw bars, select first qualifying signal then suppress all F1 signals for 15 minutes, then apply each regime rule to the retained F1 episode anchor.",
+    "do_not_recompute_non_overlap_after_regime_filter": true,
+    "do_not_combine_f3_f4_after_validation": true,
+    "do_not_change_thresholds": true,
+    "feature_version_1_excluded": true,
+    "long_cost_proxy": "Bid-bar future close minus effective Ask entry using entry spread"
+  }
+}
