@@ -199,9 +199,11 @@ class MarketExperienceCollector:
         self._store = store
         self._symbol = symbol
 
-    @staticmethod
-    def _experience_id(time_msc: int) -> str:
-        material = f"XAUUSD|M1|{time_msc}".encode("utf-8")
+    @classmethod
+    def _experience_id(cls, time_msc: int) -> str:
+        material = (
+            f"XAUUSD|M1|v{cls.FEATURE_VERSION}|{time_msc}"
+        ).encode("utf-8")
         return "exp:" + hashlib.sha256(material).hexdigest()
 
     def _closed_candles(
@@ -235,7 +237,8 @@ class MarketExperienceCollector:
         created = 0
 
         for experience in self._store.pending_market_experiences(
-            limit=1000
+            limit=1000,
+            feature_version=self.FEATURE_VERSION,
         ):
             base = datetime.fromisoformat(
                 str(experience["bar_time_utc"])
@@ -402,6 +405,7 @@ class MarketExperienceCollector:
                     spread_points=spread_points,
                     session=str(context["primary"]),
                     features=features,
+                    feature_version=self.FEATURE_VERSION,
                 )
             )
         except FileExistsError:
@@ -442,46 +446,71 @@ class MarketExperienceCollector:
             is not None
         )
 
-        earliest_stored, _ = (
-            self._store.market_experience_bounds()
-        )
         backfill_rows: list[dict[str, Any]] = []
+        first_m1_time = datetime.fromtimestamp(
+            int(m1[0]["time_msc"]) / 1000,
+            UTC,
+        )
+        backfill_start = first_m1_time
+        backfill_end = bar_time - timedelta(minutes=1)
 
-        if earliest_stored is not None:
-            first_m1_time = datetime.fromtimestamp(
-                int(m1[0]["time_msc"]) / 1000,
-                UTC,
-            )
-            backfill_start = max(
-                earliest_stored + timedelta(minutes=1),
-                first_m1_time,
-            )
-            backfill_end = (
-                bar_time - timedelta(minutes=1)
-            )
-
-            if backfill_start <= backfill_end:
-                existing_times = (
-                    self._store.market_experience_bar_times(
-                        backfill_start,
-                        backfill_end,
-                    )
+        if backfill_start <= backfill_end:
+            existing_times = (
+                self._store.market_experience_bar_times(
+                    backfill_start,
+                    backfill_end,
+                    feature_version=self.FEATURE_VERSION,
                 )
-                missing_rows = []
-                for row in m1[:-1]:
-                    row_time = datetime.fromtimestamp(
-                        int(row["time_msc"]) / 1000,
-                        UTC,
-                    )
-                    if (
-                        backfill_start <= row_time <= backfill_end
-                        and row_time.isoformat()
-                        not in existing_times
-                    ):
-                        missing_rows.append(row)
-                backfill_rows = missing_rows[
+            )
+            earliest_v2, _ = (
+                self._store.market_experience_bounds(
+                    feature_version=self.FEATURE_VERSION,
+                )
+            )
+
+            missing_rows = []
+            for row in m1[:-1]:
+                row_time = datetime.fromtimestamp(
+                    int(row["time_msc"]) / 1000,
+                    UTC,
+                )
+                if (
+                    backfill_start <= row_time <= backfill_end
+                    and row_time.isoformat()
+                    not in existing_times
+                ):
+                    missing_rows.append((row_time, row))
+
+            internal_missing = []
+            if earliest_v2 is not None:
+                internal_missing = [
+                    row
+                    for row_time, row in missing_rows
+                    if row_time >= earliest_v2
+                ]
+
+            if internal_missing:
+                # Repair current-version gaps before expanding
+                # historical coverage. This keeps near-live
+                # evidence contiguous and deterministic.
+                backfill_rows = internal_missing[
                     : self.MAX_BACKFILL_PER_CYCLE
                 ]
+            else:
+                historical_missing = [
+                    row
+                    for row_time, row in missing_rows
+                    if (
+                        earliest_v2 is None
+                        or row_time < earliest_v2
+                    )
+                ]
+                # Reconstruct the most recent eligible history
+                # first so useful v2 coverage becomes available
+                # quickly while remaining bounded per cycle.
+                backfill_rows = list(
+                    reversed(historical_missing)
+                )[: self.MAX_BACKFILL_PER_CYCLE]
 
         if latest_exists and not backfill_rows:
             outcomes_created = self._complete_outcomes(m1)

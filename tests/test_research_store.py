@@ -234,6 +234,7 @@ class ResearchStoreTests(unittest.TestCase):
                     )
                 }
                 self.assertIn(9, versions)
+                self.assertIn(10, versions)
                 with self.assertRaises(sqlite3.DatabaseError):
                     connection.execute(
                         """
@@ -245,6 +246,206 @@ class ResearchStoreTests(unittest.TestCase):
                     connection.execute(
                         "DELETE FROM experience_outcomes"
                     )
+
+    def test_market_experience_versions_can_share_bar(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ResearchStore(
+                Path(directory) / "research.db"
+            )
+            bar_time = datetime(
+                2026, 8, 20, 11, 5, tzinfo=UTC
+            )
+
+            for version in (1, 2):
+                store.record_market_experience(
+                    MarketExperienceRecord(
+                        experience_id=f"same-bar-v{version}",
+                        symbol="XAUUSD",
+                        timeframe="M1",
+                        bar_time_utc=bar_time,
+                        reference_price=4487.47,
+                        point=0.01,
+                        spread_points=10.0,
+                        session="LONDON",
+                        features={
+                            "feature_version": version
+                        },
+                        feature_version=version,
+                    )
+                )
+
+            self.assertEqual(
+                (bar_time, bar_time),
+                store.market_experience_bounds(
+                    feature_version=1
+                ),
+            )
+            self.assertEqual(
+                (bar_time, bar_time),
+                store.market_experience_bounds(
+                    feature_version=2
+                ),
+            )
+            self.assertEqual(
+                {bar_time.isoformat()},
+                store.market_experience_bar_times(
+                    bar_time,
+                    bar_time,
+                    feature_version=1,
+                ),
+            )
+            self.assertEqual(
+                {bar_time.isoformat()},
+                store.market_experience_bar_times(
+                    bar_time,
+                    bar_time,
+                    feature_version=2,
+                ),
+            )
+
+            with self.assertRaises(FileExistsError):
+                store.record_market_experience(
+                    MarketExperienceRecord(
+                        experience_id="duplicate-v2",
+                        symbol="XAUUSD",
+                        timeframe="M1",
+                        bar_time_utc=bar_time,
+                        reference_price=4487.47,
+                        point=0.01,
+                        spread_points=10.0,
+                        session="LONDON",
+                        features={
+                            "feature_version": 2
+                        },
+                        feature_version=2,
+                    )
+                )
+
+    def test_migrates_v9_market_feature_versions_to_v10(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "research.db"
+
+            with closing(sqlite3.connect(path)) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE research_schema (
+                      version INTEGER PRIMARY KEY,
+                      applied_at TEXT NOT NULL
+                        DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO research_schema(version)
+                    VALUES (9);
+
+                    CREATE TABLE market_experiences (
+                      experience_id TEXT PRIMARY KEY,
+                      symbol TEXT NOT NULL
+                        CHECK(symbol = 'XAUUSD'),
+                      timeframe TEXT NOT NULL
+                        CHECK(timeframe = 'M1'),
+                      bar_time_utc TEXT NOT NULL,
+                      reference_price REAL NOT NULL,
+                      point REAL NOT NULL,
+                      spread_points REAL NOT NULL,
+                      session TEXT NOT NULL,
+                      features_json TEXT NOT NULL,
+                      created_at_utc TEXT NOT NULL,
+                      UNIQUE(
+                        symbol,
+                        timeframe,
+                        bar_time_utc
+                      )
+                    );
+
+                    CREATE TABLE experience_outcomes (
+                      experience_id TEXT NOT NULL,
+                      horizon_minutes INTEGER NOT NULL,
+                      future_bar_time_utc TEXT NOT NULL,
+                      future_close REAL NOT NULL,
+                      window_high REAL NOT NULL,
+                      window_low REAL NOT NULL,
+                      return_points REAL NOT NULL,
+                      mfe_long_points REAL NOT NULL,
+                      mae_long_points REAL NOT NULL,
+                      created_at_utc TEXT NOT NULL,
+                      PRIMARY KEY(
+                        experience_id,
+                        horizon_minutes
+                      ),
+                      FOREIGN KEY(experience_id)
+                        REFERENCES market_experiences(
+                          experience_id
+                        )
+                    );
+                    """
+                )
+
+                base = datetime(
+                    2026, 8, 20, 11, 5, tzinfo=UTC
+                )
+                for index, version in enumerate((1, 2)):
+                    at = base + timedelta(minutes=index)
+                    connection.execute(
+                        """
+                        INSERT INTO market_experiences(
+                          experience_id,
+                          symbol,
+                          timeframe,
+                          bar_time_utc,
+                          reference_price,
+                          point,
+                          spread_points,
+                          session,
+                          features_json,
+                          created_at_utc
+                        ) VALUES (
+                          ?, 'XAUUSD', 'M1', ?,
+                          4487.47, 0.01, 10.0,
+                          'LONDON', ?, ?
+                        )
+                        """,
+                        (
+                            f"legacy-v{version}",
+                            at.isoformat(),
+                            (
+                                '{"feature_version":'
+                                f'{version}'
+                                '}'
+                            ),
+                            at.isoformat(),
+                        ),
+                    )
+                connection.commit()
+
+            store = ResearchStore(path)
+
+            v1 = store.get_market_experience(
+                "legacy-v1"
+            )
+            v2 = store.get_market_experience(
+                "legacy-v2"
+            )
+            self.assertEqual(1, v1["feature_version"])
+            self.assertEqual(2, v2["feature_version"])
+
+            with closing(sqlite3.connect(path)) as connection:
+                versions = {
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT version FROM research_schema"
+                    )
+                }
+                self.assertIn(10, versions)
+
+                columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(market_experiences)"
+                    )
+                }
+                self.assertIn(
+                    "feature_version",
+                    columns,
+                )
 
     def test_market_experience_coverage_queries(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

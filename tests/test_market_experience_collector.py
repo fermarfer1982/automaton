@@ -123,8 +123,19 @@ class MarketExperienceCollectorTests(unittest.TestCase):
             now = datetime(2026, 8, 20, 11, 1, tzinfo=UTC)
 
             first = collector.collect_once(now=now)
-            observation.candle_requests.clear()
             second = collector.collect_once(now=now)
+
+            self.assertGreater(
+                first.backfill_experiences_created,
+                0,
+            )
+            self.assertGreater(
+                second.backfill_experiences_created,
+                0,
+            )
+
+            observation.candle_requests.clear()
+            third = collector.collect_once(now=now)
 
             self.assertEqual(
                 ["M1"],
@@ -132,9 +143,14 @@ class MarketExperienceCollectorTests(unittest.TestCase):
             )
             self.assertTrue(first.experience_created)
             self.assertFalse(second.experience_created)
+            self.assertFalse(third.experience_created)
             self.assertEqual(
                 first.experience_id,
                 second.experience_id,
+            )
+            self.assertEqual(
+                first.experience_id,
+                third.experience_id,
             )
 
             saved = store.get_market_experience(
@@ -146,6 +162,10 @@ class MarketExperienceCollectorTests(unittest.TestCase):
             self.assertEqual(
                 12.0,
                 saved["spread_points"],
+            )
+            self.assertEqual(
+                2,
+                saved["feature_version"],
             )
             features = saved["features"]
             self.assertEqual(
@@ -194,6 +214,7 @@ class MarketExperienceCollectorTests(unittest.TestCase):
                     spread_points=12.0,
                     session="LONDON",
                     features={"seed": True},
+                    feature_version=2,
                 )
             )
 
@@ -271,6 +292,7 @@ class MarketExperienceCollectorTests(unittest.TestCase):
                         spread_points=float(row["spread"]),
                         session="LONDON",
                         features={"seed": True},
+                        feature_version=2,
                     )
                 )
 
@@ -428,6 +450,62 @@ class MarketExperienceCollectorTests(unittest.TestCase):
                 9000.0,
             )
 
+    def test_v2_backfill_coexists_with_v1_same_bars(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ResearchStore(Path(directory) / "research.db")
+            rows = self.build_rows()
+            observation = FakeObservation(rows)
+            collector = MarketExperienceCollector(
+                observation,
+                store,
+            )
+
+            v1_time = datetime(
+                2026, 8, 20, 10, 55, tzinfo=UTC
+            )
+            v1_row = next(
+                item for item in rows["M1"]
+                if int(item["time_msc"])
+                == int(v1_time.timestamp() * 1000)
+            )
+            store.record_market_experience(
+                MarketExperienceRecord(
+                    experience_id="legacy-v1",
+                    symbol="XAUUSD",
+                    timeframe="M1",
+                    bar_time_utc=v1_time,
+                    reference_price=float(v1_row["close"]),
+                    point=0.01,
+                    spread_points=float(v1_row["spread"]),
+                    session="LONDON",
+                    features={"feature_version": 1},
+                    feature_version=1,
+                )
+            )
+
+            result = collector.collect_once(
+                now=datetime(
+                    2026, 8, 20, 11, 1, tzinfo=UTC
+                )
+            )
+
+            self.assertGreater(
+                result.backfill_experiences_created,
+                0,
+            )
+            legacy = store.get_market_experience(
+                "legacy-v1"
+            )
+            current = store.get_market_experience(
+                collector._experience_id(
+                    int(v1_time.timestamp() * 1000)
+                )
+            )
+            self.assertIsNotNone(legacy)
+            self.assertIsNotNone(current)
+            self.assertEqual(1, legacy["feature_version"])
+            self.assertEqual(2, current["feature_version"])
+
     def test_does_not_create_outcome_across_missing_m1_bar(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ResearchStore(Path(directory) / "research.db")
@@ -449,6 +527,7 @@ class MarketExperienceCollectorTests(unittest.TestCase):
                     spread_points=12.0,
                     session="LONDON",
                     features={},
+                    feature_version=2,
                 )
             )
 

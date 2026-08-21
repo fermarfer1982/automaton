@@ -96,6 +96,7 @@ class MarketExperienceRecord:
     spread_points: float
     session: str
     features: dict[str, Any]
+    feature_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -475,6 +476,296 @@ class ResearchStore:
             """
         )
 
+        version = int(connection.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM research_schema"
+        ).fetchone()[0])
+
+        if version < 10:
+            connection.commit()
+            foreign_keys_enabled = bool(
+                connection.execute(
+                    "PRAGMA foreign_keys"
+                ).fetchone()[0]
+            )
+            if foreign_keys_enabled:
+                connection.execute(
+                    "PRAGMA foreign_keys=OFF"
+                )
+
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+
+                connection.execute(
+                    """
+                    CREATE TABLE market_experiences_v10 (
+                      experience_id TEXT PRIMARY KEY,
+                      symbol TEXT NOT NULL
+                        CHECK(symbol = 'XAUUSD'),
+                      timeframe TEXT NOT NULL
+                        CHECK(timeframe = 'M1'),
+                      bar_time_utc TEXT NOT NULL,
+                      feature_version INTEGER NOT NULL
+                        CHECK(feature_version >= 1),
+                      reference_price REAL NOT NULL
+                        CHECK(reference_price > 0),
+                      point REAL NOT NULL CHECK(point > 0),
+                      spread_points REAL NOT NULL
+                        CHECK(spread_points >= 0),
+                      session TEXT NOT NULL,
+                      features_json TEXT NOT NULL,
+                      created_at_utc TEXT NOT NULL,
+                      UNIQUE(
+                        symbol,
+                        timeframe,
+                        bar_time_utc,
+                        feature_version
+                      )
+                    )
+                    """
+                )
+
+                connection.execute(
+                    """
+                    CREATE TABLE experience_outcomes_v10 (
+                      experience_id TEXT NOT NULL,
+                      horizon_minutes INTEGER NOT NULL
+                        CHECK(
+                          horizon_minutes IN (5, 15, 60)
+                        ),
+                      future_bar_time_utc TEXT NOT NULL,
+                      future_close REAL NOT NULL
+                        CHECK(future_close > 0),
+                      window_high REAL NOT NULL
+                        CHECK(window_high > 0),
+                      window_low REAL NOT NULL
+                        CHECK(window_low > 0),
+                      return_points REAL NOT NULL,
+                      mfe_long_points REAL NOT NULL
+                        CHECK(mfe_long_points >= 0),
+                      mae_long_points REAL NOT NULL
+                        CHECK(mae_long_points <= 0),
+                      created_at_utc TEXT NOT NULL,
+                      PRIMARY KEY(
+                        experience_id,
+                        horizon_minutes
+                      ),
+                      FOREIGN KEY(experience_id)
+                        REFERENCES
+                          market_experiences_v10(
+                            experience_id
+                          )
+                    )
+                    """
+                )
+
+                rows = connection.execute(
+                    """
+                    SELECT *
+                    FROM market_experiences
+                    ORDER BY bar_time_utc, experience_id
+                    """
+                ).fetchall()
+
+                for row in rows:
+                    features = json.loads(
+                        str(row["features_json"])
+                    )
+                    raw_feature_version = features.get(
+                        "feature_version",
+                        1,
+                    )
+                    if (
+                        not isinstance(
+                            raw_feature_version,
+                            int,
+                        )
+                        or isinstance(
+                            raw_feature_version,
+                            bool,
+                        )
+                        or raw_feature_version < 1
+                    ):
+                        raise ValueError(
+                            "Stored market experience has "
+                            "invalid feature_version"
+                        )
+
+                    connection.execute(
+                        """
+                        INSERT INTO market_experiences_v10(
+                          experience_id,
+                          symbol,
+                          timeframe,
+                          bar_time_utc,
+                          feature_version,
+                          reference_price,
+                          point,
+                          spread_points,
+                          session,
+                          features_json,
+                          created_at_utc
+                        ) VALUES (
+                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        )
+                        """,
+                        (
+                            row["experience_id"],
+                            row["symbol"],
+                            row["timeframe"],
+                            row["bar_time_utc"],
+                            raw_feature_version,
+                            row["reference_price"],
+                            row["point"],
+                            row["spread_points"],
+                            row["session"],
+                            row["features_json"],
+                            row["created_at_utc"],
+                        ),
+                    )
+
+                connection.execute(
+                    """
+                    INSERT INTO experience_outcomes_v10(
+                      experience_id,
+                      horizon_minutes,
+                      future_bar_time_utc,
+                      future_close,
+                      window_high,
+                      window_low,
+                      return_points,
+                      mfe_long_points,
+                      mae_long_points,
+                      created_at_utc
+                    )
+                    SELECT
+                      experience_id,
+                      horizon_minutes,
+                      future_bar_time_utc,
+                      future_close,
+                      window_high,
+                      window_low,
+                      return_points,
+                      mfe_long_points,
+                      mae_long_points,
+                      created_at_utc
+                    FROM experience_outcomes
+                    """
+                )
+
+                connection.execute(
+                    "DROP TABLE experience_outcomes"
+                )
+                connection.execute(
+                    "DROP TABLE market_experiences"
+                )
+                connection.execute(
+                    """
+                    ALTER TABLE market_experiences_v10
+                    RENAME TO market_experiences
+                    """
+                )
+                connection.execute(
+                    """
+                    ALTER TABLE experience_outcomes_v10
+                    RENAME TO experience_outcomes
+                    """
+                )
+
+                connection.execute(
+                    """
+                    CREATE INDEX idx_market_experiences_bar
+                    ON market_experiences(
+                      feature_version,
+                      bar_time_utc,
+                      experience_id
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX idx_experience_outcomes_horizon
+                    ON experience_outcomes(
+                      horizon_minutes,
+                      future_bar_time_utc
+                    )
+                    """
+                )
+
+                connection.execute(
+                    """
+                    CREATE TRIGGER market_experiences_no_update
+                    BEFORE UPDATE ON market_experiences
+                    BEGIN
+                      SELECT RAISE(
+                        ABORT,
+                        'market experiences are append-only'
+                      );
+                    END
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TRIGGER market_experiences_no_delete
+                    BEFORE DELETE ON market_experiences
+                    BEGIN
+                      SELECT RAISE(
+                        ABORT,
+                        'market experiences are append-only'
+                      );
+                    END
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TRIGGER experience_outcomes_no_update
+                    BEFORE UPDATE ON experience_outcomes
+                    BEGIN
+                      SELECT RAISE(
+                        ABORT,
+                        'experience outcomes are append-only'
+                      );
+                    END
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TRIGGER experience_outcomes_no_delete
+                    BEFORE DELETE ON experience_outcomes
+                    BEGIN
+                      SELECT RAISE(
+                        ABORT,
+                        'experience outcomes are append-only'
+                      );
+                    END
+                    """
+                )
+
+                violations = connection.execute(
+                    "PRAGMA foreign_key_check"
+                ).fetchall()
+                if violations:
+                    raise RuntimeError(
+                        "Research schema v10 migration "
+                        "failed foreign key validation"
+                    )
+
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO research_schema(
+                      version
+                    ) VALUES (10)
+                    """
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                if foreign_keys_enabled:
+                    connection.execute(
+                        "PRAGMA foreign_keys=ON"
+                    )
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5.0)
         connection.row_factory = sqlite3.Row
@@ -492,6 +783,24 @@ class ResearchStore:
         if value.tzinfo is None:
             raise ValueError(f"{field_name} must be timezone-aware")
         return value.astimezone(UTC)
+
+    @staticmethod
+    def _validate_feature_version(
+        value: int | None,
+        *,
+        allow_none: bool = False,
+    ) -> int | None:
+        if value is None and allow_none:
+            return None
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 1
+        ):
+            raise ValueError(
+                "Feature version must be a positive integer"
+            )
+        return value
 
     def record_market_experience(
         self,
@@ -517,6 +826,21 @@ class ResearchStore:
         if not isinstance(record.features, dict):
             raise ValueError("Experience features must be an object")
 
+        feature_version = self._validate_feature_version(
+            record.feature_version
+        )
+        embedded_feature_version = record.features.get(
+            "feature_version"
+        )
+        if (
+            embedded_feature_version is not None
+            and embedded_feature_version != feature_version
+        ):
+            raise ValueError(
+                "Experience feature_version does not match "
+                "its feature payload"
+            )
+
         bar_time = self._canonical_utc(
             record.bar_time_utc,
             field_name="bar_time_utc",
@@ -540,15 +864,17 @@ class ResearchStore:
                     """
                     INSERT INTO market_experiences(
                       experience_id, symbol, timeframe, bar_time_utc,
-                      reference_price, point, spread_points, session,
-                      features_json, created_at_utc
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      feature_version, reference_price, point,
+                      spread_points, session, features_json,
+                      created_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record.experience_id,
                         record.symbol,
                         record.timeframe,
                         bar_time.isoformat(),
+                        feature_version,
                         record.reference_price,
                         record.point,
                         record.spread_points,
@@ -559,7 +885,8 @@ class ResearchStore:
                 )
             except sqlite3.IntegrityError as exc:
                 raise FileExistsError(
-                    "A market experience already exists for this closed M1 bar"
+                    "A market experience already exists for this "
+                    "closed M1 bar and feature version"
                 ) from exc
             connection.commit()
 
@@ -585,7 +912,13 @@ class ResearchStore:
 
     def market_experience_bounds(
         self,
+        *,
+        feature_version: int | None = None,
     ) -> tuple[datetime | None, datetime | None]:
+        version = self._validate_feature_version(
+            feature_version,
+            allow_none=True,
+        )
         with closing(self._connect()) as connection:
             row = connection.execute(
                 """
@@ -593,7 +926,12 @@ class ResearchStore:
                   MIN(bar_time_utc) AS first_bar_time_utc,
                   MAX(bar_time_utc) AS last_bar_time_utc
                 FROM market_experiences
-                """
+                WHERE (
+                  ? IS NULL
+                  OR feature_version = ?
+                )
+                """,
+                (version, version),
             ).fetchone()
 
         first_raw = row["first_bar_time_utc"]
@@ -619,6 +957,8 @@ class ResearchStore:
         self,
         start_utc: datetime,
         end_utc: datetime,
+        *,
+        feature_version: int | None = None,
     ) -> set[str]:
         start = self._canonical_utc(
             start_utc,
@@ -632,6 +972,10 @@ class ResearchStore:
             raise ValueError(
                 "Experience coverage end cannot precede start"
             )
+        version = self._validate_feature_version(
+            feature_version,
+            allow_none=True,
+        )
 
         with closing(self._connect()) as connection:
             rows = connection.execute(
@@ -640,11 +984,17 @@ class ResearchStore:
                 FROM market_experiences
                 WHERE bar_time_utc >= ?
                   AND bar_time_utc <= ?
+                  AND (
+                    ? IS NULL
+                    OR feature_version = ?
+                  )
                 ORDER BY bar_time_utc
                 """,
                 (
                     start.isoformat(),
                     end.isoformat(),
+                    version,
+                    version,
                 ),
             ).fetchall()
 
@@ -777,6 +1127,7 @@ class ResearchStore:
         self,
         *,
         limit: int = 1000,
+        feature_version: int | None = None,
     ) -> list[dict[str, Any]]:
         if (
             not isinstance(limit, int)
@@ -786,12 +1137,20 @@ class ResearchStore:
             raise ValueError(
                 "Experience pending limit must be between 1 and 5000"
             )
+        version = self._validate_feature_version(
+            feature_version,
+            allow_none=True,
+        )
         with closing(self._connect()) as connection:
             rows = connection.execute(
                 """
                 SELECT me.*
                 FROM market_experiences me
                 WHERE (
+                  ? IS NULL
+                  OR me.feature_version = ?
+                )
+                AND (
                   SELECT COUNT(*)
                   FROM experience_outcomes eo
                   WHERE eo.experience_id = me.experience_id
@@ -799,7 +1158,7 @@ class ResearchStore:
                 ORDER BY me.bar_time_utc, me.experience_id
                 LIMIT ?
                 """,
-                (limit,),
+                (version, version, limit),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -1576,7 +1935,9 @@ class ResearchStore:
     def health(self) -> bool:
         try:
             with closing(self._connect()) as connection:
-                version = connection.execute("SELECT MAX(version) FROM research_schema").fetchone()[0]
-            return version == 9
+                version = connection.execute(
+                    "SELECT MAX(version) FROM research_schema"
+                ).fetchone()[0]
+            return version == 10
         except sqlite3.Error:
             return False
