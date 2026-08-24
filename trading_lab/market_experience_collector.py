@@ -341,11 +341,26 @@ class MarketExperienceCollector:
             int(row["time_msc"]): row
             for row in m1
         }
+        if not by_time:
+            return 0
+
+        available_times = sorted(by_time)
+        available_start = datetime.fromtimestamp(
+            available_times[0] / 1000,
+            UTC,
+        )
+        available_end = datetime.fromtimestamp(
+            available_times[-1] / 1000,
+            UTC,
+        )
         created = 0
 
         for experience in self._store.pending_market_experiences(
             limit=1000,
             feature_version=self.FEATURE_VERSION,
+            start_utc=available_start,
+            end_utc=available_end,
+            newest_first=True,
         ):
             base = datetime.fromisoformat(
                 str(experience["bar_time_utc"])

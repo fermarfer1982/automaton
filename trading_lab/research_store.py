@@ -1128,6 +1128,9 @@ class ResearchStore:
         *,
         limit: int = 1000,
         feature_version: int | None = None,
+        start_utc: datetime | None = None,
+        end_utc: datetime | None = None,
+        newest_first: bool = False,
     ) -> list[dict[str, Any]]:
         if (
             not isinstance(limit, int)
@@ -1137,13 +1140,47 @@ class ResearchStore:
             raise ValueError(
                 "Experience pending limit must be between 1 and 5000"
             )
+        if not isinstance(newest_first, bool):
+            raise ValueError(
+                "Experience pending newest_first must be boolean"
+            )
+
         version = self._validate_feature_version(
             feature_version,
             allow_none=True,
         )
+        start = (
+            self._canonical_utc(
+                start_utc,
+                field_name="start_utc",
+            )
+            if start_utc is not None
+            else None
+        )
+        end = (
+            self._canonical_utc(
+                end_utc,
+                field_name="end_utc",
+            )
+            if end_utc is not None
+            else None
+        )
+        if (
+            start is not None
+            and end is not None
+            and end < start
+        ):
+            raise ValueError(
+                "Experience pending end cannot precede start"
+            )
+
+        start_iso = start.isoformat() if start is not None else None
+        end_iso = end.isoformat() if end is not None else None
+        direction = "DESC" if newest_first else "ASC"
+
         with closing(self._connect()) as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT me.*
                 FROM market_experiences me
                 WHERE (
@@ -1151,14 +1188,32 @@ class ResearchStore:
                   OR me.feature_version = ?
                 )
                 AND (
+                  ? IS NULL
+                  OR me.bar_time_utc >= ?
+                )
+                AND (
+                  ? IS NULL
+                  OR me.bar_time_utc <= ?
+                )
+                AND (
                   SELECT COUNT(*)
                   FROM experience_outcomes eo
                   WHERE eo.experience_id = me.experience_id
                 ) < 3
-                ORDER BY me.bar_time_utc, me.experience_id
+                ORDER BY
+                  me.bar_time_utc {direction},
+                  me.experience_id {direction}
                 LIMIT ?
                 """,
-                (version, version, limit),
+                (
+                    version,
+                    version,
+                    start_iso,
+                    start_iso,
+                    end_iso,
+                    end_iso,
+                    limit,
+                ),
             ).fetchall()
         return [dict(row) for row in rows]
 
